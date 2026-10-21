@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <title>Task Graph — ClawCode</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #1a1a2e;
+      --bg-panel: #16162a;
+      --bg-card: #1f1f3a;
+      --text: #dcdcdc;
+      --text-dim: #888;
+      --text-faint: #555;
+      --accent: #7f6df2;
+      --accent-dim: rgba(127,109,242,0.15);
+      --border: rgba(255,255,255,0.06);
+      --running: #EAB308;
+      --complete: #22C55E;
+      --failed: #EF4444;
+      --pending: #6B7280;
+      --warning: #F97316;
+    }
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body {
+      font-family: "IBM Plex Sans", sans-serif;
+      background: var(--bg); color: var(--text);
+      height: 100vh; overflow: hidden; display: flex;
+    }
+    .sidebar {
+      width: 240px; flex-shrink: 0; background: var(--bg-panel);
+      border-right: 1px solid var(--border);
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+    .sidebar-header {
+      padding: 16px 16px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .sidebar-logo {
+      font-family: "JetBrains Mono", monospace; font-weight: 700;
+      font-size: 1rem; color: var(--text);
+      text-decoration: none; display: flex; align-items: center; gap: 6px;
+    }
+    .sidebar-logo span { color: var(--accent); }
+    .sidebar-back {
+      display: block; margin-top: 8px;
+      font-size: 0.7rem; color: var(--text-faint);
+      text-decoration: none; transition: color 0.15s;
+    }
+    .sidebar-back:hover { color: var(--accent); }
+    .sidebar-section {
+      padding: 12px 16px 6px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.6rem; text-transform: uppercase;
+      letter-spacing: 0.12em; color: var(--text-faint);
+    }
+    .stats-list { padding: 8px 16px; flex: 1; overflow-y: auto; }
+    .stat-row {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 6px 0; font-size: 0.78rem; color: var(--text-dim);
+      border-bottom: 1px solid var(--border);
+    }
+    .stat-val {
+      font-family: "JetBrains Mono", monospace;
+      font-weight: 600; color: var(--text);
+    }
+    .legend { padding: 12px 16px; border-top: 1px solid var(--border); }
+    .legend-item {
+      display: flex; align-items: center; gap: 8px;
+      padding: 3px 0; font-size: 0.7rem; color: var(--text-dim);
+    }
+    .legend-swatch {
+      width: 12px; height: 3px; border-radius: 2px; flex-shrink: 0;
+    }
+    .graph-area {
+      flex: 1; position: relative; background: var(--bg); min-width: 0;
+    }
+    .graph-area svg { width: 100%; height: 100%; display: block; }
+    .node-circle { cursor: default; }
+    .node-label {
+      font-family: "JetBrains Mono", monospace; font-size: 11px;
+      fill: var(--text); text-anchor: middle; dominant-baseline: central;
+      pointer-events: none;
+    }
+    .edge-line {
+      fill: none; stroke-width: 2;
+      transition: opacity 30s ease-out;
+    }
+    .edge-running {
+      stroke-dasharray: 8 4;
+      animation: dash-flow 0.8s linear infinite;
+    }
+    @keyframes dash-flow {
+      to { stroke-dashoffset: -12; }
+    }
+    .empty-msg {
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      font-family: "JetBrains Mono", monospace; font-size: 0.85rem;
+      color: var(--text-faint); pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <nav class="sidebar">
+    <div class="sidebar-header">
+      <a class="sidebar-logo" href="/"><span>{/}</span> ClawCode</a>
+      <a class="sidebar-back" href="/">&larr; Dashboard</a>
+    </div>
+    <div class="sidebar-section">Task Graph</div>
+    <div class="stats-list" id="stats-list">
+      <div class="stat-row"><span>In-flight</span><span class="stat-val" id="stat-inflight">0</span></div>
+      <div class="stat-row"><span>Agents</span><span class="stat-val" id="stat-agents">0</span></div>
+    </div>
+    <div class="sidebar-section">Per Agent</div>
+    <div class="stats-list" id="agent-breakdown" style="flex:2"></div>
+    <div class="legend">
+      <div class="sidebar-section" style="padding-left:0">Legend</div>
+      <div class="legend-item"><span class="legend-swatch" style="background:var(--running)"></span>Running</div>
+      <div class="legend-item"><span class="legend-swatch" style="background:var(--complete)"></span>Complete</div>
+      <div class="legend-item"><span class="legend-swatch" style="background:var(--failed)"></span>Failed</div>
+      <div class="legend-item"><span class="legend-swatch" style="background:var(--pending)"></span>Pending</div>
+      <div class="legend-item"><span class="legend-swatch" style="background:var(--warning)"></span>Timed out / Cancelled</div>
+    </div>
+  </nav>
+  <div class="graph-area" id="graph-area">
+    <div class="empty-msg" id="empty-msg">No tasks</div>
+    <svg id="graph-svg"></svg>
+  </div>
+
+<script>
+// ── Constants ──
+const STATUS_COLORS = {
+  running: "#EAB308", awaiting_input: "#EAB308",
+  complete: "#22C55E", failed: "#EF4444",
+  pending: "#6B7280", timed_out: "#F97316",
+  cancelled: "#F97316", orphaned: "#F97316",
+};
+const IN_FLIGHT = new Set(["running", "awaiting_input"]);
+const TERMINAL = new Set(["complete", "failed", "cancelled", "timed_out", "orphaned"]);
+const NODE_RADIUS = 30;
+const IDEAL_DIST = 150;
+const REPULSION = 5000;
+const DAMPING = 0.85;
+const MAX_TICKS = 300;
+const MIN_VELOCITY = 0.5;
+
+// ── State ──
+const nodes = new Map(); // name -> { x, y, vx, vy }
+const edges = new Map(); // task_id -> { from, to, status, endedAt, opacity }
+let simRunning = false;
+let tickCount = 0;
+let animFrame = null;
+const svg = document.getElementById("graph-svg");
+const svgNs = "http://www.w3.org/2000/svg";
+
+// ── SVG setup ──
+const defs = document.createElementNS(svgNs, "defs");
+const marker = document.createElementNS(svgNs, "marker");
+marker.setAttribute("id", "arrow");
+marker.setAttribute("viewBox", "0 0 10 6");
+marker.setAttribute("refX", "10");
+marker.setAttribute("refY", "3");
+marker.setAttribute("markerWidth", "10");
+marker.setAttribute("markerHeight", "6");
+marker.setAttribute("orient", "auto-start-reverse");
+const arrowPath = document.createElementNS(svgNs, "path");
+arrowPath.setAttribute("d", "M0,0 L10,3 L0,6 Z");
+arrowPath.setAttribute("fill", "#888");
+marker.appendChild(arrowPath);
+defs.appendChild(marker);
+svg.appendChild(defs);
+
+const edgeGroup = document.createElementNS(svgNs, "g");
+edgeGroup.setAttribute("id", "edges");
+svg.appendChild(edgeGroup);
+const nodeGroup = document.createElementNS(svgNs, "g");
+nodeGroup.setAttribute("id", "nodes");
+svg.appendChild(nodeGroup);
+
+// ── Helpers ──
+function getViewBox() {
+  const area = document.getElementById("graph-area");
+  return { w: area.clientWidth, h: area.clientHeight };
+}
+
+function statusColor(s) { return STATUS_COLORS[s] || "#6B7280"; }
+
+function arrangeCircle() {
+  const { w, h } = getViewBox();
+  const cx = w / 2, cy = h / 2;
+  const names = [...nodes.keys()];
+  const r = Math.min(w, h) * 0.3;
+  names.forEach((name, i) => {
+    const angle = (2 * Math.PI * i) / names.length - Math.PI / 2;
+    const n = nodes.get(name);
+    if (n.placed) return;
+    n.x = cx + r * Math.cos(angle);
+    n.y = cy + r * Math.sin(angle);
+    n.placed = true;
+  });
+}
+
+// ── Force simulation ──
+function applyForces() {
+  const allNodes = [...nodes.values()];
+  const { w, h } = getViewBox();
+
+  // Repulsion between all node pairs
+  for (let i = 0; i < allNodes.length; i++) {
+    for (let j = i + 1; j < allNodes.length; j++) {
+      const a = allNodes[i], b = allNodes[j];
+      let dx = b.x - a.x, dy = b.y - a.y;
+      let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      const force = REPULSION / (dist * dist);
+      const fx = (dx / dist) * force, fy = (dy / dist) * force;
+      a.vx -= fx; a.vy -= fy;
+      b.vx += fx; b.vy += fy;
+    }
+  }
+
+  // Spring forces between connected nodes
+  for (const edge of edges.values()) {
+    const a = nodes.get(edge.from), b = nodes.get(edge.to);
+    if (!a || !b) continue;
+    let dx = b.x - a.x, dy = b.y - a.y;
+    let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+    const displacement = dist - IDEAL_DIST;
+    const force = displacement * 0.05;
+    const fx = (dx / dist) * force, fy = (dy / dist) * force;
+    a.vx += fx; a.vy += fy;
+    b.vx -= fx; b.vy -= fy;
+  }
+
+  // Apply velocity + damping + bounds
+  let maxV = 0;
+  for (const n of allNodes) {
+    n.vx *= DAMPING; n.vy *= DAMPING;
+    n.x += n.vx; n.y += n.vy;
+    n.x = Math.max(NODE_RADIUS + 10, Math.min(w - NODE_RADIUS - 10, n.x));
+    n.y = Math.max(NODE_RADIUS + 10, Math.min(h - NODE_RADIUS - 10, n.y));
+    maxV = Math.max(maxV, Math.abs(n.vx), Math.abs(n.vy));
+  }
+  return maxV;
+}
+
+function simulationTick() {
+  tickCount++;
+  const maxV = applyForces();
+  renderSvg();
+  if (tickCount < MAX_TICKS && maxV > MIN_VELOCITY) {
+    animFrame = requestAnimationFrame(simulationTick);
+  } else {
+    simRunning = false;
+  }
+}
+
+function startSimulation() {
+  if (simRunning) return;
+  simRunning = true;
+  tickCount = 0;
+  animFrame = requestAnimationFrame(simulationTick);
+}
+
+// ── SVG rendering ──
+function renderSvg() {
+  const { w, h } = getViewBox();
+  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+
+  // Clear and re-render edges
+  edgeGroup.innerHTML = "";
+  for (const [tid, edge] of edges) {
+    const a = nodes.get(edge.from), b = nodes.get(edge.to);
+    if (!a || !b) continue;
+    const line = document.createElementNS(svgNs, "line");
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+    const offsetX = (dx / dist) * NODE_RADIUS;
+    const offsetY = (dy / dist) * NODE_RADIUS;
+    line.setAttribute("x1", a.x + offsetX);
+    line.setAttribute("y1", a.y + offsetY);
+    line.setAttribute("x2", b.x - offsetX);
+    line.setAttribute("y2", b.y - offsetY);
+    line.setAttribute("stroke", statusColor(edge.status));
+    line.setAttribute("marker-end", "url(#arrow)");
+    line.classList.add("edge-line");
+    if (edge.status === "running" || edge.status === "awaiting_input") {
+      line.classList.add("edge-running");
+    }
+    if (TERMINAL.has(edge.status)) {
+      line.style.opacity = String(edge.opacity);
+    }
+    edgeGroup.appendChild(line);
+  }
+
+  // Clear and re-render nodes
+  nodeGroup.innerHTML = "";
+  for (const [name, n] of nodes) {
+    const circle = document.createElementNS(svgNs, "circle");
+    circle.setAttribute("cx", n.x);
+    circle.setAttribute("cy", n.y);
+    circle.setAttribute("r", NODE_RADIUS);
+    circle.setAttribute("fill", "#2d2d44");
+    circle.setAttribute("stroke", n.color || "#6B7280");
+    circle.setAttribute("stroke-width", "2");
+    circle.classList.add("node-circle");
+    nodeGroup.appendChild(circle);
+
+    const label = document.createElementNS(svgNs, "text");
+    label.setAttribute("x", n.x);
+    label.setAttribute("y", n.y);
+    label.classList.add("node-label");
+    label.textContent = name.length > 8 ? name.slice(0, 7) + "\u2026" : name;
+    nodeGroup.appendChild(label);
+  }
+}
+
+// ── Data update ──
+function updateGraph(tasks) {
+  const emptyMsg = document.getElementById("empty-msg");
+  if (!tasks || tasks.length === 0) {
+    emptyMsg.style.display = "flex";
+    edgeGroup.innerHTML = "";
+    nodeGroup.innerHTML = "";
+    nodes.clear();
+    edges.clear();
+    updateSidebar(tasks || []);
+    return;
+  }
+  emptyMsg.style.display = "none";
+
+  // Collect unique agent names
+  const agentSet = new Set();
+  for (const t of tasks) {
+    agentSet.add(t.caller_agent);
+    agentSet.add(t.target_agent);
+  }
+
+  // Add new nodes
+  for (const name of agentSet) {
+    if (!nodes.has(name)) {
+      nodes.set(name, { x: 0, y: 0, vx: 0, vy: 0, placed: false, color: "#6B7280" });
+    }
+  }
+
+  // Remove nodes no longer in data
+  for (const name of nodes.keys()) {
+    if (!agentSet.has(name)) nodes.delete(name);
+  }
+
+  // Determine dominant color per agent
+  const agentStatuses = {};
+  for (const t of tasks) {
+    if (!agentStatuses[t.caller_agent]) agentStatuses[t.caller_agent] = [];
+    if (!agentStatuses[t.target_agent]) agentStatuses[t.target_agent] = [];
+    agentStatuses[t.caller_agent].push(t.status);
+    agentStatuses[t.target_agent].push(t.status);
+  }
+  for (const [name, statuses] of Object.entries(agentStatuses)) {
+    const n = nodes.get(name);
+    if (!n) continue;
+    // Priority: running > failed > complete > pending
+    if (statuses.includes("running") || statuses.includes("awaiting_input")) {
+      n.color = STATUS_COLORS.running;
+    } else if (statuses.includes("failed")) {
+      n.color = STATUS_COLORS.failed;
+    } else if (statuses.includes("complete")) {
+      n.color = STATUS_COLORS.complete;
+    } else {
+      n.color = STATUS_COLORS.pending;
+    }
+  }
+
+  // Build current task set and update edges
+  const currentIds = new Set(tasks.map(t => t.task_id));
+  // Remove edges not in current data
+  for (const tid of edges.keys()) {
+    if (!currentIds.has(tid)) edges.delete(tid);
+  }
+  // Update or add edges
+  const now = Date.now();
+  for (const t of tasks) {
+    const existing = edges.get(t.task_id);
+    let opacity = 1;
+    if (TERMINAL.has(t.status) && t.ended_at) {
+      const elapsed = now - t.ended_at;
+      opacity = Math.max(0, 1 - elapsed / 30000);
+    }
+    if (existing) {
+      existing.status = t.status;
+      existing.endedAt = t.ended_at;
+      existing.opacity = opacity;
+    } else {
+      edges.set(t.task_id, {
+        from: t.caller_agent, to: t.target_agent,
+        status: t.status, endedAt: t.ended_at, opacity,
+      });
+    }
+  }
+
+  arrangeCircle();
+  startSimulation();
+  updateSidebar(tasks);
+}
+
+function updateSidebar(tasks) {
+  const inflight = tasks.filter(t => IN_FLIGHT.has(t.status)).length;
+  const agentSet = new Set();
+  for (const t of tasks) {
+    agentSet.add(t.caller_agent);
+    agentSet.add(t.target_agent);
+  }
+  document.getElementById("stat-inflight").textContent = inflight;
+  document.getElementById("stat-agents").textContent = agentSet.size;
+
+  // Per-agent breakdown
+  const counts = {};
+  for (const t of tasks) {
+    counts[t.caller_agent] = (counts[t.caller_agent] || 0) + 1;
+    counts[t.target_agent] = (counts[t.target_agent] || 0) + 1;
+  }
+  const breakdown = document.getElementById("agent-breakdown");
+  breakdown.innerHTML = Object.entries(counts)
+    .sort((a, b) => b[1] - a[1])
+    .map(([name, count]) =>
+      `<div class="stat-row"><span>${name}</span><span class="stat-val">${count}</span></div>`
+    ).join("") || '<div style="padding:8px;color:var(--text-faint);font-size:0.72rem">No agents</div>';
+}
+
+// ── Initial load + SSE ──
+async function init() {
+  try {
+    const res = await fetch("/api/tasks");
+    const data = await res.json();
+    updateGraph(data.tasks || []);
+  } catch { /* daemon may not be running */ }
+
+  const evtSource = new EventSource("/api/events");
+  evtSource.addEventListener("task-state-change", (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      updateGraph(data.tasks || []);
+    } catch { /* ignore parse errors */ }
+  });
+}
+
+// ── Handle resize ──
+window.addEventListener("resize", () => {
+  if (nodes.size > 0) {
+    renderSvg();
+  }
+});
+
+document.addEventListener("DOMContentLoaded", init);
+</script>
+</body>
+</html>

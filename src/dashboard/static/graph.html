@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <title>Knowledge Graph — ClawCode</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <style>
+    :root {
+      --bg: #000;
+      --bg-panel: #111113;
+      --bg-card: #19191d;
+      --bg-hover: #222228;
+      --bg-input: #1c1c22;
+      --text: #dcdcdc;
+      --text-dim: #888;
+      --text-faint: #555;
+      --purple: #7f6df2;
+      --purple-dim: rgba(127, 109, 242, 0.15);
+      --purple-glow: rgba(127, 109, 242, 0.4);
+      --green: #48c774;
+      --red: #e06c75;
+      --border: rgba(255, 255, 255, 0.06);
+      --link-color: rgba(255, 255, 255, 0.06);
+      --link-active: rgba(127, 109, 242, 0.6);
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: "IBM Plex Sans", -apple-system, sans-serif;
+      background: var(--bg); color: var(--text);
+      height: 100vh; overflow: hidden;
+      display: flex;
+    }
+
+    /* ─────── LEFT SIDEBAR ─────── */
+    .sidebar {
+      width: 220px; flex-shrink: 0;
+      background: var(--bg-panel);
+      border-right: 1px solid var(--border);
+      display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+
+    .sidebar-header {
+      padding: 16px 16px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .sidebar-logo {
+      font-family: "JetBrains Mono", monospace; font-weight: 700;
+      font-size: 1rem; color: var(--text);
+      text-decoration: none; display: flex; align-items: center; gap: 6px;
+    }
+    .sidebar-logo span { color: var(--purple); }
+    .sidebar-back {
+      display: block; margin-top: 8px;
+      font-size: 0.7rem; color: var(--text-faint);
+      text-decoration: none; transition: color 0.15s;
+    }
+    .sidebar-back:hover { color: var(--purple); }
+
+    .sidebar-section {
+      padding: 12px 16px 6px;
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.6rem; text-transform: uppercase;
+      letter-spacing: 0.12em; color: var(--text-faint);
+    }
+
+    .sidebar-agents {
+      flex: 1; overflow-y: auto; padding: 4px 8px;
+    }
+    .agent-item {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 10px; border-radius: 6px;
+      cursor: pointer; transition: background 0.12s;
+      font-size: 0.8rem; color: var(--text-dim);
+    }
+    .agent-item:hover { background: var(--bg-hover); color: var(--text); }
+    .agent-item.active { background: var(--purple-dim); color: var(--purple); }
+    .agent-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--purple); flex-shrink: 0;
+    }
+
+    .sidebar-controls {
+      padding: 12px 16px; border-top: 1px solid var(--border);
+    }
+    .sidebar-controls summary {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.65rem; text-transform: uppercase;
+      letter-spacing: 0.1em; color: var(--text-faint);
+      cursor: pointer; user-select: none; padding: 4px 0;
+    }
+    .sidebar-controls summary:hover { color: var(--text-dim); }
+    .ctrl-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 5px 0; font-size: 0.72rem; color: var(--text-dim);
+    }
+    .ctrl-slider {
+      -webkit-appearance: none; width: 80px; height: 3px;
+      border-radius: 2px; background: rgba(255,255,255,0.08); outline: none;
+    }
+    .ctrl-slider::-webkit-slider-thumb {
+      -webkit-appearance: none; width: 10px; height: 10px;
+      border-radius: 50%; background: var(--purple); cursor: pointer;
+    }
+
+    /* ─────── GRAPH CENTER ─────── */
+    .graph-area {
+      flex: 1; position: relative; background: var(--bg);
+      min-width: 0;
+    }
+    .graph-area svg { width: 100%; height: 100%; display: block; }
+
+    .graph-stats {
+      position: absolute; top: 12px; left: 12px;
+      font-family: "JetBrains Mono", monospace; font-size: 0.68rem;
+      color: var(--text-faint); display: flex; gap: 14px;
+      pointer-events: none;
+    }
+    .graph-stats .val { color: var(--purple); font-weight: 600; }
+
+    .graph-loading {
+      position: absolute; inset: 0; display: flex;
+      align-items: center; justify-content: center;
+      background: var(--bg); z-index: 10;
+    }
+    .graph-loading span {
+      font-family: "JetBrains Mono", monospace; font-size: 0.8rem;
+      color: var(--text-faint); animation: blink 1.2s ease-in-out infinite;
+    }
+    @keyframes blink { 0%,100% { opacity:1 } 50% { opacity:0.25 } }
+
+    /* ─────── NODE LABELS ─────── */
+    .node-label {
+      font-family: "IBM Plex Sans", sans-serif; font-size: 10px;
+      fill: var(--text-dim); pointer-events: none;
+      text-anchor: middle; dominant-baseline: hanging;
+    }
+
+    /* ─────── TOOLTIP ─────── */
+    .tooltip {
+      position: fixed; pointer-events: none; z-index: 300;
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: 6px; padding: 10px 14px; max-width: 300px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+      opacity: 0; transition: opacity 0.1s;
+      font-size: 0.75rem;
+    }
+    .tooltip.show { opacity: 1; }
+    .tooltip-title { color: var(--purple); font-family: "JetBrains Mono", monospace; font-size: 0.68rem; margin-bottom: 3px; }
+    .tooltip-body { color: var(--text); line-height: 1.35; max-height: 60px; overflow: hidden; }
+    .tooltip-foot { color: var(--text-faint); font-size: 0.62rem; margin-top: 4px; font-family: "JetBrains Mono", monospace; }
+
+    /* ─────── RIGHT DETAIL PANEL ─────── */
+    .detail {
+      width: 0; flex-shrink: 0; overflow: hidden;
+      background: var(--bg-panel);
+      border-left: 1px solid var(--border);
+      transition: width 0.25s ease;
+      display: flex; flex-direction: column;
+    }
+    .detail.open { width: 40%; min-width: 340px; max-width: 520px; }
+
+    .detail-bar {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 18px; border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .detail-bar-left { display: flex; align-items: center; gap: 8px; }
+    .detail-tier-pill {
+      font-family: "JetBrains Mono", monospace; font-size: 0.6rem;
+      text-transform: uppercase; letter-spacing: 0.05em;
+      padding: 2px 8px; border-radius: 10px;
+      background: var(--purple-dim); color: var(--purple);
+    }
+    .detail-date {
+      font-family: "JetBrains Mono", monospace; font-size: 0.65rem;
+      color: var(--text-faint);
+    }
+    .detail-close {
+      background: none; border: none; color: var(--text-faint);
+      font-size: 1.3rem; cursor: pointer; line-height: 1;
+      transition: color 0.12s;
+    }
+    .detail-close:hover { color: var(--text); }
+
+    .detail-scroll {
+      flex: 1; overflow-y: auto; padding: 0;
+    }
+
+    /* Content area — rendered markdown */
+    .detail-content {
+      padding: 20px 22px 24px;
+      font-size: 0.86rem; line-height: 1.7; color: var(--text);
+    }
+    .detail-content h1 { font-size: 1.25rem; font-weight: 600; margin: 18px 0 8px; color: var(--text); }
+    .detail-content h2 { font-size: 1.05rem; font-weight: 600; margin: 16px 0 6px; color: var(--purple); }
+    .detail-content h3 { font-size: 0.92rem; font-weight: 600; margin: 12px 0 4px; }
+    .detail-content p { margin: 6px 0; }
+    .detail-content strong { color: var(--text); font-weight: 600; }
+    .detail-content em { color: var(--text-dim); }
+    .detail-content code {
+      font-family: "JetBrains Mono", monospace; font-size: 0.78rem;
+      background: rgba(127,109,242,0.1); padding: 1px 5px; border-radius: 3px;
+      color: var(--purple);
+    }
+    .detail-content pre {
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: 6px; padding: 12px 14px; overflow-x: auto;
+      margin: 8px 0; font-family: "JetBrains Mono", monospace; font-size: 0.75rem;
+      line-height: 1.5;
+    }
+    .detail-content ul, .detail-content ol { padding-left: 18px; margin: 4px 0; }
+    .detail-content li { margin: 2px 0; }
+    .detail-content a { color: var(--purple); text-decoration: none; }
+    .detail-content a:hover { text-decoration: underline; }
+    .detail-content hr { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
+    .detail-content blockquote {
+      border-left: 3px solid var(--purple); padding: 4px 12px;
+      margin: 8px 0; color: var(--text-dim); background: rgba(127,109,242,0.04);
+      border-radius: 0 4px 4px 0;
+    }
+
+    /* Metadata section below content */
+    .detail-meta-section {
+      padding: 16px 22px 20px;
+      border-top: 1px solid var(--border);
+    }
+    .detail-meta-title {
+      font-family: "JetBrains Mono", monospace; font-size: 0.6rem;
+      text-transform: uppercase; letter-spacing: 0.1em;
+      color: var(--text-faint); margin-bottom: 10px;
+    }
+
+    .meta-grid {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
+      margin-bottom: 14px;
+    }
+    .meta-cell {
+      background: var(--bg-card); border-radius: 4px; padding: 7px 8px;
+      text-align: center;
+    }
+    .meta-cell-val {
+      font-family: "JetBrains Mono", monospace; font-size: 0.82rem;
+      font-weight: 600; color: var(--text);
+    }
+    .meta-cell-key {
+      font-size: 0.58rem; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--text-faint); margin-top: 2px;
+    }
+
+    .tags-row { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 14px; }
+    .tag-chip {
+      font-family: "JetBrains Mono", monospace; font-size: 0.63rem;
+      padding: 2px 7px; border-radius: 3px;
+      background: rgba(72,199,116,0.1); color: var(--green);
+    }
+
+    .conn-list { display: flex; flex-direction: column; gap: 3px; }
+    .conn-item {
+      display: flex; align-items: center; gap: 7px;
+      padding: 6px 8px; border-radius: 4px; cursor: pointer;
+      transition: background 0.1s; font-size: 0.73rem;
+    }
+    .conn-item:hover { background: var(--bg-hover); }
+    .conn-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--purple); flex-shrink: 0; }
+    .conn-text { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    /* ─── Mobile menu toggle ─── */
+    .mobile-bar {
+      display: none; position: fixed; top: 0; left: 0; right: 0; z-index: 200;
+      height: 44px; background: var(--bg-panel); border-bottom: 1px solid var(--border);
+      align-items: center; justify-content: space-between; padding: 0 14px;
+    }
+    .mobile-bar-logo {
+      font-family: "JetBrains Mono", monospace; font-weight: 700;
+      font-size: 0.9rem; color: var(--text); text-decoration: none;
+    }
+    .mobile-bar-logo span { color: var(--purple); }
+    .mobile-bar-btns { display: flex; gap: 8px; }
+    .mobile-btn {
+      background: none; border: 1px solid var(--border); border-radius: 4px;
+      color: var(--text-dim); font-size: 1rem; width: 32px; height: 32px;
+      display: flex; align-items: center; justify-content: center; cursor: pointer;
+    }
+    .mobile-btn:hover { color: var(--text); border-color: var(--purple); }
+
+    /* Sidebar overlay on mobile */
+    .sidebar-overlay {
+      display: none; position: fixed; inset: 0; z-index: 180;
+      background: rgba(0,0,0,0.6);
+    }
+
+    /* ─── Responsive: Tablet ─── */
+    @media (max-width: 1024px) {
+      .sidebar { width: 180px; }
+      .detail.open { width: 50%; min-width: 280px; }
+    }
+
+    /* ─── Responsive: Mobile ─── */
+    @media (max-width: 768px) {
+      body { flex-direction: column; }
+
+      .mobile-bar { display: flex; }
+
+      .sidebar {
+        position: fixed; top: 44px; left: 0; bottom: 0; z-index: 190;
+        width: 240px; transform: translateX(-100%);
+        transition: transform 0.2s ease;
+      }
+      .sidebar.open { transform: translateX(0); }
+      .sidebar-overlay.open { display: block; }
+
+      .sidebar-header { display: none; } /* logo in mobile bar instead */
+
+      .graph-area { position: fixed; top: 44px; left: 0; right: 0; bottom: 0; }
+      .graph-stats { top: 8px; left: 8px; font-size: 0.6rem; }
+
+      .detail {
+        position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+        width: 100% !important; min-width: 0 !important; max-width: none !important;
+        z-index: 210; transform: translateX(100%);
+        border-left: none;
+      }
+      .detail.open { transform: translateX(0); width: 100% !important; }
+
+      .detail-content { padding: 16px; font-size: 0.84rem; }
+      .meta-grid { grid-template-columns: repeat(2, 1fr); }
+
+      .tooltip { display: none !important; } /* touch devices don't hover */
+
+      .sidebar-controls { padding: 8px 12px; }
+      .ctrl-slider { width: 70px; }
+    }
+
+    /* Phase 999.8 Plan 02 — tier legend overlay (top-right corner of .graph-area).
+       Uses HTML overlay (NOT inside <svg>) so D3's zoom transform doesn't scale it. */
+    .graph-legend {
+      position: absolute; top: 12px; right: 12px;
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: 6px; padding: 8px 12px;
+      font-family: "JetBrains Mono", monospace; font-size: 0.68rem;
+      color: var(--text-dim); width: 150px;
+      pointer-events: auto;
+      z-index: 5;
+    }
+    .graph-legend summary {
+      cursor: pointer; color: var(--text-faint);
+      font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.1em;
+    }
+    .graph-legend .legend-row {
+      display: flex; align-items: center; gap: 8px;
+      padding: 4px 0;
+    }
+    .graph-legend .sw {
+      width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+    }
+    .graph-legend .ct {
+      margin-left: auto; color: var(--text-faint);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- MOBILE TOP BAR -->
+  <div class="mobile-bar">
+    <a class="mobile-bar-logo" href="/"><span>{/}</span> ClawCode</a>
+    <div class="mobile-bar-btns">
+      <button class="mobile-btn" id="mobile-agents" title="Agents">&#9776;</button>
+    </div>
+  </div>
+  <div class="sidebar-overlay" id="sidebar-overlay"></div>
+
+  <!-- LEFT SIDEBAR -->
+  <nav class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <a class="sidebar-logo" href="/"><span>{/}</span> ClawCode</a>
+      <a class="sidebar-back" href="/">&larr; Dashboard</a>
+    </div>
+    <div class="sidebar-section">Agents</div>
+    <div class="sidebar-agents" id="agent-list"></div>
+    <div class="sidebar-controls">
+      <details>
+        <summary>Forces</summary>
+        <div class="ctrl-row"><span>Repel</span><input type="range" class="ctrl-slider" id="sl-repel" min="10" max="400" value="120"></div>
+        <div class="ctrl-row"><span>Distance</span><input type="range" class="ctrl-slider" id="sl-dist" min="20" max="200" value="60"></div>
+        <div class="ctrl-row"><span>Links</span><input type="range" class="ctrl-slider" id="sl-opacity" min="1" max="60" value="8"></div>
+        <div class="ctrl-row"><span>Size</span><input type="range" class="ctrl-slider" id="sl-size" min="2" max="16" value="5"></div>
+      </details>
+    </div>
+  </nav>
+
+  <!-- GRAPH -->
+  <div class="graph-area" id="graph-area">
+    <div class="graph-stats" id="stats"></div>
+    <!-- Phase 999.8 Plan 02 — tier legend (HTML overlay, NOT inside <svg>: D3 zoom would scale it) -->
+    <div class="graph-legend" id="legend">
+      <details open>
+        <summary>Tiers</summary>
+        <div class="legend-row" data-tier="hot"><span class="sw" style="background:#e06c75"></span>Hot <span class="ct" id="ct-hot">0</span></div>
+        <div class="legend-row" data-tier="warm"><span class="sw" style="background:#7f6df2"></span>Warm <span class="ct" id="ct-warm">0</span></div>
+        <div class="legend-row" data-tier="cold"><span class="sw" style="background:#5a8db8"></span>Cold <span class="ct" id="ct-cold">0</span></div>
+        <div class="legend-row" data-tier="orphan"><span class="sw" style="background:#444"></span>Orphan <span class="ct" id="ct-orphan">0</span></div>
+      </details>
+    </div>
+    <div class="graph-loading" id="loading"><span>Loading graph...</span></div>
+  </div>
+
+  <!-- TOOLTIP -->
+  <div class="tooltip" id="tip"></div>
+
+  <!-- RIGHT DETAIL PANEL -->
+  <div class="detail" id="detail">
+    <div class="detail-bar">
+      <div class="detail-bar-left">
+        <span class="detail-tier-pill" id="d-tier"></span>
+        <span class="detail-date" id="d-date"></span>
+      </div>
+      <button class="detail-close" id="d-close">&times;</button>
+    </div>
+    <div class="detail-scroll" id="d-scroll"></div>
+  </div>
+
+<script type="module">
+// Phase 999.8 Plan 02 — nodeClr extracted to its own ESM module for testability.
+import { nodeClr } from "./graph-color.js";
+
+// ─── State ───
+let sim = null, gdata = { nodes: [], links: [] };
+let nodeEls = null, linkEls = null, labelEls = null;
+const S = { repel: 120, dist: 60, opacity: 0.08, size: 5 };
+
+// ─── Helpers ───
+function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+
+function renderMd(raw) {
+  return raw
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+    .replace(/^### (.+)$/gm,'<h3>$1</h3>')
+    .replace(/^## (.+)$/gm,'<h2>$1</h2>')
+    .replace(/^# (.+)$/gm,'<h1>$1</h1>')
+    .replace(/^> (.+)$/gm,'<blockquote>$1</blockquote>')
+    .replace(/^---$/gm,'<hr>')
+    .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g,'<em>$1</em>')
+    .replace(/`([^`]+)`/g,'<code>$1</code>')
+    .replace(/^\- (.+)$/gm,'<li>$1</li>')
+    .replace(/(<li>.*<\/li>\n?)+/gs, m => `<ul>${m}</ul>`)
+    .replace(/\[\[([^\]]+)\]\]/g,'<a href="#" onclick="event.preventDefault()">$1</a>')
+    .replace(/\n{2,}/g,'<br><br>')
+    .replace(/\n/g,'<br>');
+}
+
+function nodeR(d) { return S.size * (0.5 + d.importance * 0.8 + Math.min(d.linkCount||0, 10) * 0.06); }
+// Phase 999.8 Plan 02 — nodeClr now imported from ./graph-color.js (top of script block).
+
+// ─── Sliders ───
+function wire(id, key, fn, cb) {
+  const el = document.getElementById(id); if (!el) return;
+  el.addEventListener("input", () => { S[key] = fn(+el.value); if (cb) cb(); });
+}
+wire("sl-repel","repel",v=>v,()=>{ if(sim){sim.force("charge",d3.forceManyBody().strength(-S.repel).distanceMax(500));sim.alpha(0.3).restart();}});
+wire("sl-dist","dist",v=>v,()=>{ if(sim){sim.force("link").distance(S.dist);sim.alpha(0.3).restart();}});
+wire("sl-opacity","opacity",v=>v/100,()=>{ if(linkEls) linkEls.attr("stroke-opacity",S.opacity); });
+wire("sl-size","size",v=>v,()=>{ if(nodeEls) nodeEls.attr("r",nodeR); });
+
+// ─── Detail panel ───
+function openDetail(d) {
+  const panel = document.getElementById("detail");
+  document.getElementById("d-tier").textContent = d.tier;
+  document.getElementById("d-date").textContent = d.createdAt ? d.createdAt.slice(0,10) : "";
+
+  const conns = gdata.links.filter(l => {
+    const s = typeof l.source==="object"?l.source.id:l.source;
+    const t = typeof l.target==="object"?l.target.id:l.target;
+    return s===d.id||t===d.id;
+  }).map(l => {
+    const s = typeof l.source==="object"?l.source.id:l.source;
+    const t = typeof l.target==="object"?l.target.id:l.target;
+    const oid = s===d.id?t:s;
+    const on = gdata.nodes.find(n=>n.id===oid);
+    return { id:oid, preview: on ? on.content.slice(0,70) : oid };
+  });
+
+  const tags = (d.tags||[]).map(t=>`<span class="tag-chip">${esc(t)}</span>`).join("");
+  const connHtml = conns.length>0
+    ? conns.map(c=>`<div class="conn-item" onclick="navNode('${c.id}')"><span class="conn-dot"></span><span class="conn-text">${esc(c.preview)}</span></div>`).join("")
+    : '<div style="color:var(--text-faint);font-size:0.72rem">No connections</div>';
+
+  document.getElementById("d-scroll").innerHTML = `
+    <div class="detail-content">${renderMd(d.content)}</div>
+    <div class="detail-meta-section">
+      <div class="detail-meta-title">Properties</div>
+      <div class="meta-grid">
+        <div class="meta-cell"><div class="meta-cell-val">${d.importance.toFixed(2)}</div><div class="meta-cell-key">Importance</div></div>
+        <div class="meta-cell"><div class="meta-cell-val">${d.accessCount}</div><div class="meta-cell-key">Accessed</div></div>
+        <div class="meta-cell"><div class="meta-cell-val">${d.source}</div><div class="meta-cell-key">Source</div></div>
+        <div class="meta-cell"><div class="meta-cell-val">${conns.length}</div><div class="meta-cell-key">Links</div></div>
+      </div>
+      ${tags?`<div class="detail-meta-title">Tags</div><div class="tags-row">${tags}</div>`:""}
+      <div class="detail-meta-title">Connections</div>
+      <div class="conn-list">${connHtml}</div>
+    </div>
+  `;
+  panel.classList.add("open");
+}
+
+function closeDetail() { document.getElementById("detail").classList.remove("open"); }
+function navNode(id) { const n=gdata.nodes.find(n=>n.id===id); if(n) openDetail(n); }
+document.getElementById("d-close").addEventListener("click", closeDetail);
+
+// ─── Data ───
+async function getAgents() {
+  try { const r=await fetch("/api/status"); const d=await r.json(); return (d.agents||[]).map(a=>a.name).filter(n=>!n.includes("-thread-")&&!n.includes("-sub-")); } catch { return []; }
+}
+async function getGraph(agent) { const r=await fetch(`/api/graph/${encodeURIComponent(agent)}`); return r.json(); }
+
+// ─── Agent list ───
+let activeAgent = null;
+function renderAgentList(agents) {
+  const el = document.getElementById("agent-list");
+  el.innerHTML = agents.map(n => `
+    <div class="agent-item ${n===activeAgent?"active":""}" data-agent="${esc(n)}">
+      <span class="agent-dot"></span>${esc(n)}
+    </div>
+  `).join("");
+  el.querySelectorAll(".agent-item").forEach(item => {
+    item.addEventListener("click", () => loadAgent(item.dataset.agent));
+  });
+}
+
+// ─── Render graph ───
+function render(data) {
+  const area = document.getElementById("graph-area");
+  area.querySelectorAll("svg").forEach(e=>e.remove());
+  const ld = document.getElementById("loading"); if(ld) ld.style.display="none";
+
+  const nodes = data.nodes||[], links = (data.links||[]).map(l=>({source:l.source,target:l.target,text:l.text}));
+  gdata = { nodes, links };
+
+  if(!nodes.length) {
+    document.getElementById("stats").innerHTML = '<span>No memories</span>';
+    return;
+  }
+
+  // Link counts
+  const lc={};
+  links.forEach(l=>{lc[l.source]=(lc[l.source]||0)+1;lc[l.target]=(lc[l.target]||0)+1;});
+  nodes.forEach(n=>{n.linkCount=lc[n.id]||0;});
+
+  // Phase 999.8 Plan 02 — live tier counts for the legend overlay (recomputed every render).
+  const counts = { hot: 0, warm: 0, cold: 0, orphan: 0 };
+  nodes.forEach(n => {
+    if ((n.linkCount||0) === 0) counts.orphan++;
+    else if (n.tier === "hot") counts.hot++;
+    else if (n.tier === "cold") counts.cold++;
+    else counts.warm++;
+  });
+  document.getElementById("ct-hot").textContent = counts.hot;
+  document.getElementById("ct-warm").textContent = counts.warm;
+  document.getElementById("ct-cold").textContent = counts.cold;
+  document.getElementById("ct-orphan").textContent = counts.orphan;
+
+  document.getElementById("stats").innerHTML = `<span><span class="val">${nodes.length}</span> nodes</span><span><span class="val">${links.length}</span> edges</span>`;
+
+  const w=area.clientWidth, h=area.clientHeight;
+  const svg = d3.select(area).append("svg").attr("viewBox",[0,0,w,h]);
+
+  // Glow
+  const defs=svg.append("defs");
+  const glow=defs.append("filter").attr("id","g").attr("x","-50%").attr("y","-50%").attr("width","200%").attr("height","200%");
+  glow.append("feGaussianBlur").attr("stdDeviation","3.5").attr("result","b");
+  const mg=glow.append("feMerge"); mg.append("feMergeNode").attr("in","b"); mg.append("feMergeNode").attr("in","SourceGraphic");
+
+  const g = svg.append("g");
+  const zoom = d3.zoom().scaleExtent([0.05,10]).on("zoom",e=>g.attr("transform",e.transform));
+  svg.call(zoom);
+  svg.on("click", closeDetail);
+
+  const s0=Math.min(w,h)/900;
+  svg.call(zoom.transform, d3.zoomIdentity.translate(w/2,h/2).scale(Math.max(0.25,Math.min(1,s0))));
+
+  linkEls = g.append("g").selectAll("line").data(links).join("line")
+    .attr("stroke","var(--link-color)").attr("stroke-width",0.5).attr("stroke-opacity",S.opacity);
+
+  nodeEls = g.append("g").selectAll("circle").data(nodes).join("circle")
+    .attr("r",nodeR).attr("fill",nodeClr).attr("stroke","none")
+    .style("cursor","pointer")
+    .on("click",(e,d)=>{e.stopPropagation();openDetail(d);})
+    .on("mouseover",function(e,d){
+      const conn=new Set([d.id]);
+      links.forEach(l=>{const s=typeof l.source==="object"?l.source.id:l.source;const t=typeof l.target==="object"?l.target.id:l.target;if(s===d.id)conn.add(t);if(t===d.id)conn.add(s);});
+      nodeEls.transition().duration(80).attr("opacity",n=>conn.has(n.id)?1:0.06).attr("r",n=>n.id===d.id?nodeR(n)*1.5:nodeR(n));
+      linkEls.transition().duration(80).attr("stroke-opacity",l=>{const s=typeof l.source==="object"?l.source.id:l.source;const t=typeof l.target==="object"?l.target.id:l.target;return(s===d.id||t===d.id)?0.6:0.01;}).attr("stroke",l=>{const s=typeof l.source==="object"?l.source.id:l.source;const t=typeof l.target==="object"?l.target.id:l.target;return(s===d.id||t===d.id)?"var(--link-active)":"var(--link-color)";}).attr("stroke-width",l=>{const s=typeof l.source==="object"?l.source.id:l.source;const t=typeof l.target==="object"?l.target.id:l.target;return(s===d.id||t===d.id)?1.5:0.5;});
+      if(labelEls) labelEls.transition().duration(80).attr("opacity",n=>conn.has(n.id)?0.85:0);
+      // Tooltip
+      const tip=document.getElementById("tip");
+      const preview=d.content.length>120?d.content.slice(0,120)+"...":d.content;
+      tip.innerHTML=`<div class="tooltip-title">${esc(d.tags[0]||d.id.slice(0,10))}</div><div class="tooltip-body">${esc(preview)}</div><div class="tooltip-foot">${d.tier} &middot; ${d.linkCount} links</div>`;
+      tip.style.left=(e.clientX+12)+"px";tip.style.top=(e.clientY-8)+"px";tip.classList.add("show");
+    })
+    .on("mousemove",(e)=>{const tip=document.getElementById("tip");tip.style.left=(e.clientX+12)+"px";tip.style.top=(e.clientY-8)+"px";})
+    .on("mouseout",()=>{
+      nodeEls.transition().duration(180).attr("opacity",1).attr("r",nodeR);
+      linkEls.transition().duration(180).attr("stroke-opacity",S.opacity).attr("stroke","var(--link-color)").attr("stroke-width",0.5);
+      if(labelEls) labelEls.transition().duration(180).attr("opacity",0);
+      document.getElementById("tip").classList.remove("show");
+    })
+    .call(d3.drag()
+      .on("start",(e,d)=>{if(!e.active)sim.alphaTarget(0.3).restart();d.fx=d.x;d.fy=d.y;})
+      .on("drag",(e,d)=>{d.fx=e.x;d.fy=e.y;})
+      .on("end",(e,d)=>{if(!e.active)sim.alphaTarget(0);d.fx=null;d.fy=null;})
+    );
+
+  // Labels — hidden, shown on hover
+  labelEls = g.append("g").selectAll("text").data(nodes).join("text")
+    .attr("class","node-label").attr("dy",d=>nodeR(d)+10).attr("opacity",0)
+    .text(d=>d.tags.length>0?d.tags[0]:d.content.split(/\s+/).slice(0,3).join(" "));
+
+  sim = d3.forceSimulation(nodes)
+    .force("link",d3.forceLink(links).id(d=>d.id).distance(S.dist).strength(0.2))
+    .force("charge",d3.forceManyBody().strength(-S.repel).distanceMax(500))
+    .force("center",d3.forceCenter(0,0).strength(0.25))
+    .force("collision",d3.forceCollide().radius(d=>nodeR(d)+1))
+    .alphaDecay(0.02)
+    .on("tick",()=>{
+      linkEls.attr("x1",d=>d.source.x).attr("y1",d=>d.source.y).attr("x2",d=>d.target.x).attr("y2",d=>d.target.y);
+      nodeEls.attr("cx",d=>d.x).attr("cy",d=>d.y);
+      labelEls.attr("x",d=>d.x).attr("y",d=>d.y);
+    });
+}
+
+// ─── Load ───
+async function loadAgent(name) {
+  if(!name) return;
+  activeAgent = name;
+  closeDetail();
+  renderAgentList(agents);
+  const ld=document.getElementById("loading"); if(ld)ld.style.display="flex";
+  try { render(await getGraph(name)); } catch(err) { if(ld)ld.style.display="none"; }
+}
+
+let agents = [];
+async function init() {
+  agents = await getAgents();
+  if(!agents.length) { document.getElementById("agent-list").innerHTML='<div style="padding:12px;color:var(--text-faint);font-size:0.75rem">No agents</div>'; return; }
+  activeAgent = agents[0];
+  renderAgentList(agents);
+  loadAgent(agents[0]);
+}
+
+// ─── Mobile sidebar toggle ───
+function toggleSidebar() {
+  document.getElementById("sidebar").classList.toggle("open");
+  document.getElementById("sidebar-overlay").classList.toggle("open");
+}
+function closeSidebar() {
+  document.getElementById("sidebar").classList.remove("open");
+  document.getElementById("sidebar-overlay").classList.remove("open");
+}
+document.getElementById("mobile-agents").addEventListener("click", toggleSidebar);
+document.getElementById("sidebar-overlay").addEventListener("click", closeSidebar);
+
+// Close sidebar when agent is selected on mobile
+const origLoadAgent = loadAgent;
+loadAgent = async function(name) {
+  closeSidebar();
+  await origLoadAgent(name);
+};
+
+document.addEventListener("DOMContentLoaded", init);
+</script>
+</body>
+</html>

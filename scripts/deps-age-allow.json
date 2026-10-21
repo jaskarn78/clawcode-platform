@@ -1,0 +1,59 @@
+{
+  "_doc": "Exact name@version packages approved to pass scripts/check-deps-age.cjs before they are 7 days old. Each entry needs a reason and an expiry; expired entries are ignored. Prefer this over ALLOW_FRESH_DEPS=1, which waves through every package. Remove entries once expired.",
+  "entries": [
+    {
+      "package": "@anthropic-ai/claude-agent-sdk@0.3.282",
+      "reason": "999.169 CLI+SDK lockstep bump to the latest matched pair (SDK 0.3.282 = CLI 2.1.282); operator-approved one-time scoped override of the 7-day guard, 2026-09-24",
+      "approvedBy": "operator (example-user) 2026-09-24",
+      "expires": "2026-10-01T16:00:00Z"
+    },
+    {
+      "package": "@anthropic-ai/claude-agent-sdk-darwin-arm64@0.3.282",
+      "reason": "999.169 CLI+SDK lockstep bump to the latest matched pair (SDK 0.3.282 = CLI 2.1.282); operator-approved one-time scoped override of the 7-day guard, 2026-09-24",
+      "approvedBy": "operator (example-user) 2026-09-24",
+      "expires": "2026-10-01T16:00:00Z"
+    },
+    {
+      "package": "@anthropic-ai/claude-agent-sdk-darwin-x64@0.3.282",
+      "reason": "999.169 CLI+SDK lockstep bump to the latest matched pair (SDK 0.3.282 = CLI 2.1.282); operator-approved one-time scoped override of the 7-day guard, 2026-09-24",
+      "approvedBy": "operator (example-user) 2026-09-24",
+      "expires": "2026-10-01T16:00:00Z"
+    },
+    {
+      "package": "@anthropic-ai/claude-agent-sdk-linux-arm64@0.3.282",
+      "reason": "999.169 CLI+SDK lockstep bump to the latest matched pair (SDK 0.3.282 = CLI 2.1.282); operator-approved one-time scoped override of the 7-day guard, 2026-09-24",
+      "approvedBy": "operator (example-user) 2026-09-24",
+      "expires": "2026-10-01T16:00:00Z"
+    },
+    {
+      "package": "@anthropic-ai/claude-agent-sdk-linux-arm64-musl@0.3.282",
+      "reason": "999.169 CLI+SDK lockstep bump to the latest matched pair (SDK 0.3.282 = CLI 2.1.282); operator-approved one-time scoped override of the 7-day guard, 2026-09-24",
+      "approvedBy": "operator (example-user) 2026-09-24",
+      "expires": "2026-10-01T16:00:00Z"
+    },
+    {
+      "package": "@anthropic-ai/claude-agent-sdk-linux-x64@0.3.282",
+      "reason": "999.169 CLI+SDK lockstep bump to the latest matched pair (SDK 0.3.282 = CLI 2.1.282); operator-approved one-time scoped override of the 7-day guard, 2026-09-24",
+      "approvedBy": "operator (example-user) 2026-09-24",
+      "expires": "2026-10-01T16:00:00Z"
+    },
+    {
+      "package": "@anthropic-ai/claude-agent-sdk-linux-x64-musl@0.3.282",
+      "reason": "999.169 CLI+SDK lockstep bump to the latest matched pair (SDK 0.3.282 = CLI 2.1.282); operator-approved one-time scoped override of the 7-day guard, 2026-09-24",
+      "approvedBy": "operator (example-user) 2026-09-24",
+      "expires": "2026-10-01T16:00:00Z"
+    },
+    {
+      "package": "@anthropic-ai/claude-agent-sdk-win32-arm64@0.3.282",
+      "reason": "999.169 CLI+SDK lockstep bump to the latest matched pair (SDK 0.3.282 = CLI 2.1.282); operator-approved one-time scoped override of the 7-day guard, 2026-09-24",
+      "approvedBy": "operator (example-user) 2026-09-24",
+      "expires": "2026-10-01T16:00:00Z"
+    },
+    {
+      "package": "@anthropic-ai/claude-agent-sdk-win32-x64@0.3.282",
+      "reason": "999.169 CLI+SDK lockstep bump to the latest matched pair (SDK 0.3.282 = CLI 2.1.282); operator-approved one-time scoped override of the 7-day guard, 2026-09-24",
+      "approvedBy": "operator (example-user) 2026-09-24",
+      "expires": "2026-10-01T16:00:00Z"
+    }
+  ]
+}

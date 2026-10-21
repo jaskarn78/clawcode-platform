@@ -1,0 +1,26 @@
+{
+  "description": "Phase 125 Plan 04 SC-5 — A/B fuzzy corpus, POST-compaction view. Mirrors ab-pre.json prompts 1:1. The actual post-compaction context is computed deterministically at test time by piping the synthetic 6-hour replay fixture through buildTieredExtractor with canned tier2/tier3 outputs (offline; no Haiku). This file documents the contract: the same 20 prompts, the same expected_keywords. The test asserts >=18/20 (>=90%) keyword-survival agreement between pre (raw fixture text) and post (post-pipeline chunks).",
+  "version": "1.0",
+  "prompts": [
+    { "id": "p01", "category": "client-name", "prompt": "Which client did Client A mention this morning?", "expected_keywords": ["Acme"] },
+    { "id": "p02", "category": "client-name", "prompt": "What client are we doing the term-sheet for?", "expected_keywords": ["Acme", "term-sheet"] },
+    { "id": "p03", "category": "client-name", "prompt": "Whose AUM update went into the deck?", "expected_keywords": ["Acme", "AUM"] },
+    { "id": "p04", "category": "client-name", "prompt": "Which client is in clients/Acme/?", "expected_keywords": ["Acme", "clients/Acme/"] },
+    { "id": "p05", "category": "client-name", "prompt": "Which client's tranche needs to be wired?", "expected_keywords": ["Acme", "tranche"] },
+    { "id": "p06", "category": "client-name", "prompt": "Who is the primary client today?", "expected_keywords": ["Acme"] },
+    { "id": "p07", "category": "task-state", "prompt": "What's the status of the $45M close note?", "expected_keywords": ["$45M", "close note"] },
+    { "id": "p08", "category": "task-state", "prompt": "What state is the term-sheet in?", "expected_keywords": ["term-sheet"] },
+    { "id": "p09", "category": "task-state", "prompt": "What did the lawyer respond about?", "expected_keywords": ["lawyer", "closing date"] },
+    { "id": "p10", "category": "task-state", "prompt": "Is the AUM update pushed?", "expected_keywords": ["AUM"] },
+    { "id": "p11", "category": "task-state", "prompt": "What's pending for the $45M close?", "expected_keywords": ["$45M"] },
+    { "id": "p12", "category": "task-state", "prompt": "Has the tranche been wired?", "expected_keywords": ["tranche", "$45M"] },
+    { "id": "p13", "category": "task-state", "prompt": "What was the state of the Client A sync?", "expected_keywords": ["Client A", "term-sheet"] },
+    { "id": "p14", "category": "feedback-rule", "prompt": "What rule did Client A add about deploy?", "expected_keywords": ["never deploy"] },
+    { "id": "p15", "category": "feedback-rule", "prompt": "What rule was added about Friday deploys?", "expected_keywords": ["never deploy", "fri"] },
+    { "id": "p16", "category": "feedback-rule", "prompt": "What standing rule did Client A set?", "expected_keywords": ["never deploy"] },
+    { "id": "p17", "category": "feedback-rule", "prompt": "What's the latest feedback rule on charts?", "expected_keywords": ["chart", "axis"] },
+    { "id": "p18", "category": "feedback-rule", "prompt": "Did Client A add any new chart rules?", "expected_keywords": ["chart", "axis"] },
+    { "id": "p19", "category": "feedback-rule", "prompt": "Did Client A give any deploy-window rules?", "expected_keywords": ["never deploy"] },
+    { "id": "p20", "category": "feedback-rule", "prompt": "What rules did Client A add today?", "expected_keywords": ["never deploy", "chart"] }
+  ]
+}

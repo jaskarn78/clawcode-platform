@@ -1,0 +1,51 @@
+/**
+ * Graph-route-local motion. Kept here (not in the global stylesheet, and with
+ * no tailwindcss-animate dependency) so it ships in the lazy graph chunk and
+ * can't ripple into the other 12 dashboard views.
+ *
+ * Restraint by design — a quiet reveal for the canvas, a gentle rise for the
+ * detail panel, a soft backdrop fade. The signature motion (eased hover-focus)
+ * is rendered on the canvas itself, in ForceGraphCanvas.
+ */
+@keyframes graph-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes graph-rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Canvas reveal — slow, calm. */
+.graph-fade-in {
+  animation: graph-fade-in 900ms ease-out both;
+}
+
+/* Detail panel / sheet entrance — gentle rise + fade. */
+.graph-rise-in {
+  animation: graph-rise-in 320ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Mobile backdrop fade. */
+.graph-backdrop-in {
+  animation: graph-fade-in 200ms ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .graph-fade-in,
+  .graph-rise-in,
+  .graph-backdrop-in {
+    animation: none;
+  }
+}

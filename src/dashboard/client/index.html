@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClawCode dashboard</title>
+    <!--
+      Phase 116-06 F21 — pre-React FOUC guard for the theme toggle.
+      Runs synchronously BEFORE the React bundle hydrates, so the
+      <html> element carries .dark before the first paint. Without this
+      guard, an operator whose preference is "dark" (or "system" on a
+      dark-OS) would see a light flash for ~50-200ms while the React
+      bundle parses + ThemeToggle's useEffect runs.
+
+      Preference is stored in localStorage under the key
+      `clawcode:theme` with values "system" | "light" | "dark".
+      Absence = "system". "system" resolves via prefers-color-scheme.
+    -->
+    <script>
+      (function () {
+        try {
+          var pref = localStorage.getItem('clawcode:theme') || 'system';
+          var isDark =
+            pref === 'dark' ||
+            (pref === 'system' &&
+              window.matchMedia &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          if (isDark) document.documentElement.classList.add('dark');
+        } catch (e) {
+          // localStorage / matchMedia may throw under hostile environments
+          // (private mode, sandbox). Failing silently leaves the default
+          // light theme in place — the toggle still works post-hydration.
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

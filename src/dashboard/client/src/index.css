@@ -1,0 +1,323 @@
+/*
+ * Phase 116 — ClawCode dashboard v2 base stylesheet.
+ *
+ * Loads Tailwind layers + self-hosted WOFF2 fonts. Font URLs point at
+ * /dashboard/v2/fonts/<name>.woff2 — the daemon's static route handler
+ * (Plan 116-00 T05) maps that prefix to dist/dashboard/spa/fonts/, which
+ * Vite copies from src/dashboard/client/public/fonts/ during build.
+ *
+ * font-display: swap → render fallback (system-ui) while WOFF2 streams
+ * in. Acceptable for a local-tool dashboard; eliminates FOIT.
+ */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ---------------------------------------------------------------------- */
+/* Cabinet Grotesk — display / heading face (Fontshare CDN, Indian Type   */
+/* Foundry). Fontshare ships 400/500/700 only; the 600 weight from the    */
+/* original design lock is not available — Tailwind `font-medium` (500)   */
+/* and `font-bold` (700) cover the typical headline cases.                */
+/* ---------------------------------------------------------------------- */
+@font-face {
+  font-family: 'Cabinet Grotesk';
+  src: url('/fonts/CabinetGrotesk-400.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Cabinet Grotesk';
+  src: url('/fonts/CabinetGrotesk-500.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Cabinet Grotesk';
+  src: url('/fonts/CabinetGrotesk-700.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Geist — body / sans face (Vercel, OFL).                                */
+/* ---------------------------------------------------------------------- */
+@font-face {
+  font-family: 'Geist';
+  src: url('/fonts/Geist-Light.woff2') format('woff2');
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Geist';
+  src: url('/fonts/Geist-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Geist';
+  src: url('/fonts/Geist-Medium.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Geist';
+  src: url('/fonts/Geist-SemiBold.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ---------------------------------------------------------------------- */
+/* JetBrains Mono — numerals / data / code face (JetBrains, OFL).          */
+/* ---------------------------------------------------------------------- */
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/fonts/JetBrainsMono-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/fonts/JetBrainsMono-Medium.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('/fonts/JetBrainsMono-SemiBold.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ---------------------------------------------------------------------- */
+/* shadcn/ui CSS variable layer. Phase 116-06 F21 — theme toggle.         */
+/*                                                                        */
+/* `:root` carries the LIGHT theme values; `.dark` (class on <html>) flips */
+/* every variable to its dark counterpart. The Tailwind config has        */
+/* darkMode: 'class' so utilities like `dark:bg-foo` also respect the     */
+/* class. The pre-React FOUC guard in `index.html` sets `.dark` on        */
+/* <html> BEFORE the React bundle hydrates — that prevents the light-     */
+/* then-dark flash on initial paint when the operator's last selection    */
+/* was "dark" (or "system" + OS dark mode).                                */
+/*                                                                        */
+/* Dark theme is RETAINED as the historical default for operators who     */
+/* never visited the theme toggle (the FOUC guard treats absence-of-      */
+/* preference as `system`, which on most operator OS configs resolves    */
+/* to dark — same effective behavior as pre-F21).                         */
+/* ---------------------------------------------------------------------- */
+@layer base {
+  :root {
+    /* LIGHT theme — operator opts in by selecting "Light" in the toggle. */
+    /* Editorial / refined: warm near-white base, pure-white elevated     */
+    /* (Linear × Vercel × Cal.com lineage) with near-black foreground.    */
+    /* AA-validated contrast: fg-1 (#0e0e12) on bg-base (#fafaf8) → 17:1. */
+
+    /* shadcn primitives — HSL channels (no commas) so opacity modifiers
+       like `bg-background/80` work. */
+    --background: 50 14% 98%; /* #fafaf8 warm near-white */
+    --foreground: 240 14% 8%;
+
+    --card: 0 0% 100%; /* pure white — elevated surfaces lift visibly */
+    --card-foreground: 240 14% 8%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 14% 8%;
+
+    --primary: 158 64% 32%; /* darker emerald — AA contrast on white */
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 240 5% 95%;
+    --secondary-foreground: 240 14% 8%;
+
+    --muted: 50 10% 96%;
+    --muted-foreground: 240 5% 40%;
+
+    --accent: 240 5% 95%;
+    --accent-foreground: 240 14% 8%;
+
+    --destructive: 0 72% 45%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 240 6% 88%;
+    --input: 240 6% 88%;
+    --ring: 158 64% 32%;
+
+    --radius: 0.5rem;
+
+    /* 116-UI custom surface tokens — `bg-bg-*` / `text-fg-*` consume
+       these via Tailwind's `rgb(var(--bg-base) / <alpha-value>)`. RGB
+       channels (space-separated) for the rgb() form. Hex hints below. */
+    --bg-base: 250 250 248; /* #fafaf8 warm near-white */
+    --bg-elevated: 255 255 255; /* #ffffff pure white — cards lift */
+    --bg-muted: 245 245 242; /* #f5f5f2 subtle muted surface */
+    --bg-s3: 240 240 235; /* #f0f0eb panel / drawer */
+    --fg-1: 14 14 18; /* #0e0e12 near-black — primary text */
+    --fg-2: 75 75 85; /* #4b4b55 secondary text */
+    --fg-3: 130 130 140; /* #82828c muted metadata */
+
+    /* 116-postdeploy fix-pass — `warn` + `danger` upgraded from hex
+       literals in tailwind.config.js to HSL CSS vars so they flip
+       with theme. Same channel-format convention as shadcn's primary /
+       destructive (HSL space-separated, no commas) so opacity modifiers
+       like `bg-warn/10` keep working.
+
+       LIGHT theme — darker shades for AA contrast on warm-white bg. */
+    --warn: 32 95% 44%;    /* darker amber — AA on white */
+    --danger: 0 72% 45%;   /* darker red — matches --destructive */
+
+    /* dash-redesign (Mission Control) — new tokens, LIGHT theme.
+       Prefixed `--mc-*` to avoid colliding with shadcn's `--accent` slot
+       (used by Popover/Dialog/Button hovers). The kit's amber accent is
+       semantically different from shadcn's neutral hover-accent. */
+    --mc-accent:        #b6770a;          /* warm copper for "live" warmth (light) */
+    --mc-accent-fg:     #ffffff;
+    --mc-accent-soft:   #b6770a18;
+    --mc-primary-soft:  #0d8a611a;        /* 10% tint emerald wash (light) */
+    --mc-primary-ring:  #0d8a6147;        /* 28% tint emerald ring (light) */
+    --mc-bg-line:       #dedcd2;          /* hairline borders on tiles */
+    --mc-bg-inset:      #f0eee6;          /* inset wells / code blocks */
+    --mc-shadow-1: 0 1px 2px rgba(15, 15, 20, 0.06);
+    --mc-shadow-2: 0 6px 18px rgba(15, 15, 20, 0.08);
+    --mc-shadow-3: 0 16px 48px rgba(15, 15, 20, 0.12);
+    --mc-shadow-glow-primary: 0 0 0 1px var(--mc-primary-ring), 0 0 24px -6px rgb(var(--primary-soft, 13 138 97));
+    --mc-shadow-glow-accent:  0 0 0 1px var(--mc-accent-soft), 0 0 18px -6px var(--mc-accent);
+    --mc-ease-out:  cubic-bezier(0.16, 1, 0.3, 1);
+    --mc-ease-in:   cubic-bezier(0.7, 0, 0.84, 0);
+    --mc-t-fast:    120ms;
+    --mc-t-base:    180ms;
+    --mc-t-slow:    320ms;
+    --mc-space-1: 4px;
+    --mc-space-2: 8px;
+    --mc-space-3: 12px;
+    --mc-space-4: 16px;
+    --mc-space-5: 20px;
+    --mc-space-6: 24px;
+    --mc-space-8: 32px;
+    --mc-space-10: 40px;
+    --mc-space-12: 48px;
+    --mc-space-16: 64px;
+    --mc-radius-xs: 4px;
+    --mc-radius-sm: 6px;
+    --mc-radius:    10px;
+    --mc-radius-lg: 14px;
+    --mc-radius-xl: 20px;
+    --mc-radius-pill: 999px;
+  }
+
+  .dark {
+    /* DARK theme — historical default. Hex aliases (see token table):    */
+    /*   #0e0e12 ≈ 240 14% 6.3%  → background                             */
+    /*   #16161c ≈ 240 11% 9.8%  → card / popover                         */
+    /*   #1c1c24 ≈ 240 13% 12.5% → muted / secondary                      */
+    /*   #252530 ≈ 240 11% 17%   → input / border                         */
+    --background: 240 14% 6%;
+    --foreground: 240 6% 96%;
+
+    --card: 240 11% 10%;
+    --card-foreground: 240 6% 96%;
+
+    --popover: 240 11% 10%;
+    --popover-foreground: 240 6% 96%;
+
+    --primary: 158 64% 39%; /* #10b981 emerald */
+    --primary-foreground: 240 14% 6%;
+
+    --secondary: 240 13% 13%;
+    --secondary-foreground: 240 6% 96%;
+
+    --muted: 240 13% 13%;
+    --muted-foreground: 240 5% 65%;
+
+    --accent: 240 13% 13%;
+    --accent-foreground: 240 6% 96%;
+
+    --destructive: 0 84% 60%; /* #ef4444 red */
+    --destructive-foreground: 240 6% 96%;
+
+    --border: 240 11% 17%;
+    --input: 240 11% 17%;
+    --ring: 158 64% 39%;
+
+    --radius: 0.5rem;
+
+    /* 116-UI custom surface tokens — dark palette. RGB channels (space). */
+    --bg-base: 14 14 18; /* #0e0e12 */
+    --bg-elevated: 22 22 28; /* #16161c */
+    --bg-muted: 28 28 36; /* #1c1c24 */
+    --bg-s3: 37 37 48; /* #252530 */
+    --fg-1: 244 244 245; /* #f4f4f5 */
+    --fg-2: 161 161 170; /* #a1a1aa */
+    --fg-3: 113 113 122; /* #71717a */
+
+    /* 116-postdeploy fix-pass — DARK theme warn/danger. Matches the
+       historical hex values (#f59e0b amber, #ef4444 red) re-expressed
+       as HSL channels so theme-toggle flips the tokens. */
+    --warn: 38 92% 50%;    /* #f59e0b amber */
+    --danger: 0 84% 60%;   /* #ef4444 red — matches --destructive */
+
+    /* dash-redesign (Mission Control) — DARK theme overrides. The kit's
+       canonical direction: dark-first emerald + warm amber. `--mc-*` so
+       shadcn `--accent` keeps its neutral-hover semantics. */
+    --mc-accent:        #f4b942;          /* warm amber for "live" warmth */
+    --mc-accent-fg:     #2a1f06;
+    --mc-accent-soft:   #f4b94220;
+    --mc-primary-soft:  #10b9811f;        /* 12% tint emerald wash */
+    --mc-primary-ring:  #10b9814d;        /* 30% tint emerald ring */
+    --mc-bg-line:       #2a2c38;          /* hairline borders on tiles */
+    --mc-bg-inset:      #060608;          /* inset wells */
+    --mc-shadow-1: 0 1px 0 0 rgba(255,255,255,0.03) inset, 0 1px 2px rgba(0,0,0,0.5);
+    --mc-shadow-2: 0 4px 16px rgba(0,0,0,0.45), 0 1px 0 0 rgba(255,255,255,0.04) inset;
+    --mc-shadow-3: 0 12px 40px rgba(0,0,0,0.55), 0 1px 0 0 rgba(255,255,255,0.05) inset;
+    --mc-shadow-glow-primary: 0 0 0 1px var(--mc-primary-ring), 0 0 24px -6px #10b981;
+    --mc-shadow-glow-accent:  0 0 0 1px var(--mc-accent-soft), 0 0 18px -6px var(--mc-accent);
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+/* App-wide base layer overrides (dark theme is the default; theme toggle */
+/* lands in Plan 116-06 F21).                                              */
+/* ---------------------------------------------------------------------- */
+@layer base {
+  html,
+  body,
+  #root {
+    @apply min-h-screen;
+  }
+
+  body {
+    /* 116-06 F21 — bg-background / text-foreground resolve from the
+       active theme's CSS variables (light by default, dark via .dark
+       on <html>). The 116-00..116-05 era used the literal `bg-bg-base
+       text-fg-1` tokens which were dark-only; flipped here so the body
+       follows the operator's selected theme. */
+    @apply bg-background text-foreground font-sans antialiased;
+    font-feature-settings: 'cv11', 'ss01', 'ss03';
+  }
+
+  /* Headlines use the display face; body inherits the sans face. */
+  h1,
+  h2,
+  h3,
+  h4 {
+    @apply font-display tracking-tight;
+  }
+
+  /* Numerals + data should land in the mono face by default in any
+     element flagged with class="data". Tier 1 metric values use this. */
+  .data,
+  code,
+  pre,
+  kbd {
+    @apply font-mono;
+  }
+}

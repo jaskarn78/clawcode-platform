@@ -1,0 +1,44 @@
+node_modules/
+node_modules
+dist/
+*.tsbuildinfo
+.claude/settings.local.json
+.claude/settings.json
+.claude/scheduled_tasks.lock
+.claude/worktrees/
+
+# Phase 51 bench reports (transient, not git-tracked)
+.planning/benchmarks/reports/
+
+# Phase 76+ migration ledger (runtime state, per-host, not git-tracked)
+.planning/migration/
+
+# Playwright MCP traces (transient, large)
+.playwright-mcp/
+
+# Local screenshots / image clutter (operator's local files, not project assets)
+Screenshot*.png
+amazon-*.png
+reuzel-*.png
+*-product.png
+
+# Git bundle transfer artifacts (transient — used to hand commits between
+# environments / remote-ultraplan sessions; never project content).
+*.bundle
+
+clawcode.yaml
+
+# Block any captured copies of clawcode.yaml under .planning/ (before/after
+# snapshots, audit dumps, migration artifacts). Production yaml carries
+# literal Discord bot + 1Password service-account tokens; capturing them
+# into planning artifacts silently exposes both. Refs in committed docs
+# MUST stay as op:// URIs — never resolved literals.
+.planning/**/clawcode.yaml*
+.planning/**/*.yaml.before
+.planning/**/*.yaml.after
+.planning/**/*-snapshot.yaml
+.planning/**/*-snapshot.yml
+
+# Never track compiled Python
+**/__pycache__/
+*.pyc

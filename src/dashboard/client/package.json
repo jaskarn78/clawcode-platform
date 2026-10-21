@@ -1,0 +1,12 @@
+{
+  "name": "clawcode-dashboard-client",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "_comment": "Phase 116 — ClawCode dashboard v2 SPA. ALL dependencies live in the repo-root package.json (single node_modules). This manifest has scripts + identity ONLY — no deps block. shadcn `add` commands historically appended deps here; if that happens again, MOVE them to root package.json and clear this block. Duplicate React copies break hooks (Vite resolves react from nearest node_modules; if a sub-node_modules exists, you get TWO React instances and useEffect=null).",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  }
+}

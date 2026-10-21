@@ -1,0 +1,18 @@
+#!/bin/sh
+# Pre-commit: supply-chain age guard.
+#
+# Activated by: git config core.hooksPath scripts/git-hooks
+# (one-time setup; run scripts/git-hooks/install.sh)
+#
+# Only runs when package-lock.json is staged. Blocks the commit if any
+# newly-resolved (name, version) is younger than MIN_AGE_DAYS (default 7).
+#
+# Bypass (emergency): ALLOW_FRESH_DEPS=1 git commit ...
+# Or: git commit --no-verify  (skips ALL hooks — last resort)
+
+set -e
+
+if git diff --cached --name-only | grep -qE '^package-lock\.json$'; then
+  echo "pre-commit: package-lock.json changed — running age guard..."
+  node scripts/check-deps-age.cjs
+fi

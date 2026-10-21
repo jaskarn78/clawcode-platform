@@ -1,0 +1,52 @@
+# clawcode.yaml — v2.0 endpoint
+version: 1
+mcpServers:
+  finnhub:
+    name: finnhub
+    command: node
+    args:
+      - /path/to/finnhub.js
+    env:
+      FINNHUB_API_KEY: op://example-vault-21/Finnhub/api-key # op:// reference — safe
+  acme-db:
+    name: acme-db
+    command: mcporter
+    args:
+      - serve
+      - mysql
+    env:
+      MYSQL_HOST: op://example-vault-21/MySQL/host
+  clawcode:
+    name: clawcode
+    command: node
+    args:
+      - /path/to/clawcode-mcp.js
+  1password:
+    name: 1password
+    command: op
+    args:
+      - plugin
+      - run
+discord:
+  botToken: op://example-vault-21/Clawdbot Discord Token/credential # operator-edited line
+defaults:
+  model: sonnet
+  basePath: ~/.clawcode/agents
+agents:
+  - name: existing-alpha
+    workspace: ~/.clawcode/agents/existing-alpha
+    model: sonnet
+    channels:
+      - "000000000000000100"
+    mcpServers:
+      - clawcode
+      - 1password
+  - name: existing-beta
+    workspace: ~/.clawcode/agents/existing-beta
+    model: haiku
+    channels:
+      - "000000000000000101"
+    mcpServers:
+      - clawcode
+      - 1password
+      - finnhub

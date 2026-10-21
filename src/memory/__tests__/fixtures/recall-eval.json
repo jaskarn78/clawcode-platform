@@ -1,0 +1,193 @@
+{
+  "_doc": "Phase 999.187 recall eval. files: path relative to <ws>/memory, ageDays sets mtime. memories: saved via memory_save. queries: expect = chunk heading (files) or memory key; lazyOnly = answer is older than the pre-turn window by design. Extend freely; the test asserts recall@5 floors.",
+  "files": [
+    {
+      "path": "2026-07-01-remember-a1b2.md",
+      "ageDays": 90,
+      "content": "---\ntype: cue\n---\n\n## Standing note\n\nRemember this: never redeploy clawdy without explicit operator confirmation in the same turn."
+    },
+    {
+      "path": "2026-07-03-remember-c3d4.md",
+      "ageDays": 88,
+      "content": "---\ntype: cue\n---\n\n## Standing note\n\nRemember: Client A's client statements go through the figure-trace gate before any number is quoted."
+    },
+    {
+      "path": "vault/rules.md",
+      "ageDays": 200,
+      "content": "## Deploy rule\n\nUse scripts/deploy-clawdy.sh, never copy bytes ad hoc.\n\n## Screener rule\n\nA single-stock buy needs a same-day screener CANDIDATE runId."
+    },
+    {
+      "path": "procedures/1password.md",
+      "ageDays": 150,
+      "content": "## Rotating the MySQL password\n\nRotate in 1Password first, then restart the acme MCP server, then verify with the smoke query."
+    },
+    {
+      "path": "digests/weekly-2026-W27.md",
+      "ageDays": 80,
+      "content": "## Week 27 summary\n\nDecided on sqlite-vec over faiss for vector search. Client A asked for shorter replies on the phone. The Zwift workout push was postponed."
+    },
+    {
+      "path": "2026-09-27.md",
+      "ageDays": 2,
+      "content": "## Session log\n\nJas asked whether to add miles to today's run; TSB was -2.9 so the answer was one or two easy miles.\n\n## Shopping\n\nCompared the Garmin Forerunner 265 and 965; the 965 has maps."
+    },
+    {
+      "path": "2026-09-25.md",
+      "ageDays": 4,
+      "content": "## BSX incident\n\nThe agent quoted BSXX figures for BSX. Correction posted; suitability gate now requires the ticker to match the DATA block."
+    },
+    {
+      "path": "2026-06-10.md",
+      "ageDays": 111,
+      "content": "## Old session\n\nRenamed the projects channel and moved the tmux session to the Mac mini."
+    },
+    {
+      "path": "2026-08-14-1430.md",
+      "ageDays": 46,
+      "content": "## Flush\n\nMid-session: the fin-client workspace revamp was planned in six phases, P0 security first."
+    },
+    {
+      "path": "2026-09-28.md",
+      "ageDays": 1,
+      "content": "## Trip\n\nJas is flying to Lisbon on October 12 and wants a three-day itinerary for Principe Real."
+    },
+    {
+      "path": "2026-09-26.md",
+      "ageDays": 3,
+      "content": "## Lunch\n\nTacos on Tuesday; the taqueria on 5th closes at three."
+    },
+    {
+      "path": "2026-09-24.md",
+      "ageDays": 5,
+      "content": "## Account swap\n\nThe /clawcode-account swap restarted the fleet; fin-client held the boot for six minutes."
+    }
+  ],
+  "memories": [
+    {
+      "key": "brief",
+      "content": "Operator prefers brief answers with the verdict in the first line.",
+      "tags": [
+        "preference"
+      ]
+    },
+    {
+      "key": "miles",
+      "content": "Operator runs about 40 miles a week and races a half marathon in November.",
+      "tags": [
+        "training"
+      ]
+    },
+    {
+      "key": "tickers",
+      "content": "Ticker BSXX is the leveraged fund; BSX is the plain Boston Scientific stock.",
+      "tags": [
+        "fin"
+      ]
+    },
+    {
+      "key": "coffee",
+      "content": "Client A drinks decaf after 2pm.",
+      "tags": [
+        "client_a"
+      ]
+    }
+  ],
+  "queries": [
+    {
+      "q": "can I redeploy clawdy right now?",
+      "expect": [
+        "Standing note"
+      ],
+      "lazyOnly": true
+    },
+    {
+      "q": "what is the rule about quoting client numbers for Client A?",
+      "expect": [
+        "Standing note"
+      ],
+      "lazyOnly": true
+    },
+    {
+      "q": "how do we deploy to clawdy",
+      "expect": [
+        "Deploy rule"
+      ]
+    },
+    {
+      "q": "steps to rotate the mysql password",
+      "expect": [
+        "Rotating the MySQL password"
+      ]
+    },
+    {
+      "q": "which vector search library did we pick?",
+      "expect": [
+        "Week 27 summary"
+      ],
+      "lazyOnly": true
+    },
+    {
+      "q": "should I add miles to my run today",
+      "expect": [
+        "Session log",
+        "miles"
+      ]
+    },
+    {
+      "q": "which garmin watch has maps",
+      "expect": [
+        "Shopping"
+      ]
+    },
+    {
+      "q": "what happened with the BSX numbers",
+      "expect": [
+        "BSX incident",
+        "tickers"
+      ]
+    },
+    {
+      "q": "what is BSXX",
+      "expect": [
+        "tickers"
+      ]
+    },
+    {
+      "q": "when is the Lisbon trip",
+      "expect": [
+        "Trip"
+      ]
+    },
+    {
+      "q": "how does Operator like his answers",
+      "expect": [
+        "brief"
+      ]
+    },
+    {
+      "q": "why did the account swap take so long",
+      "expect": [
+        "Account swap"
+      ]
+    },
+    {
+      "q": "does a single stock buy need a screener run",
+      "expect": [
+        "Screener rule"
+      ]
+    },
+    {
+      "q": "what did we do with the tmux session",
+      "expect": [
+        "Old session"
+      ],
+      "lazyOnly": true
+    },
+    {
+      "q": "what does Client A drink in the afternoon",
+      "expect": [
+        "coffee"
+      ]
+    }
+  ]
+}

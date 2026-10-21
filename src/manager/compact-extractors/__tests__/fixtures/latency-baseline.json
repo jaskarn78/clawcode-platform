@@ -1,0 +1,10 @@
+{
+  "recorded_at": "2026-05-14",
+  "fixture_path": "synthetic-6h-replay.json",
+  "raw_text_bytes": 20670,
+  "post_extraction_bytes": 2834,
+  "reduction_pct": 86,
+  "production_baseline_first_token_ms": 30000,
+  "production_target_first_token_ms": 8000,
+  "note": "Production first-token measurements deferred to deploy window. Local pipeline overhead < 500ms is the in-process budget; production measurement via `clawcode usage` against fin-client agent post-deploy. raw_text_bytes / post_extraction_bytes / reduction_pct are dynamically recomputed by latency-sentinel.test.ts on every run and the test asserts reduction_pct >= 40 against the live fixture. The 30000 / 8000 ms fields are the OPERATOR-OBSERVED 2026-05-13 baseline (6h-deep session, 30-60s first-token) and the SC-6 target (< 8s). These two values are the regression sentinel."
+}

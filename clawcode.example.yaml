@@ -1,0 +1,134 @@
+# ClawCode example configuration.
+#
+# Copy this file to `clawcode.yaml` and edit it. `clawcode.yaml` is gitignored:
+# it will contain references to secrets, so never commit it.
+#
+# Secrets
+# -------
+# Keep tokens out of this file:
+#   - `op://example-vault/<item>/<field>` is read from 1Password through the `op`
+#     CLI. Substitute your own vault name for `example-vault`. The loader
+#     resolves these in discord.botToken, mcpServers[].env values and the other
+#     fields that accept a secret.
+#   - `${ENV_VAR}` is expanded from the daemon's environment in
+#     mcpServers[].env values.
+# Do not paste literal tokens into this file.
+#
+# Every Discord id below is a placeholder (18 zeros). Replace them with the ids
+# of your own server channels.
+
+version: 1
+
+discord:
+  # Bot token for the gateway bot that receives messages and posts replies.
+  botToken: op://example-vault/discord-bot/credential
+
+defaults:
+  # Model alias: sonnet | opus | haiku (see src/shared/model-catalog.ts for the
+  # full list of pinned and `@latest` aliases).
+  model: sonnet
+  # Each agent gets <basePath>/<agent-name>/ unless it sets `workspace`.
+  basePath: ~/.clawcode/agents
+
+  memory:
+    compactionThreshold: 0.75
+    searchTopK: 10
+
+  heartbeat:
+    enabled: true
+    intervalSeconds: 60
+    timeoutSeconds: 10
+    contextFill:
+      warningThreshold: 0.6
+      criticalThreshold: 0.75
+
+  # Advisor: a stronger model the executor can consult mid-turn.
+  # The values below are the baseline; omit the block to inherit them.
+  # advisor:
+  #   backend: native         # "native" (default) | "fork" (rollback path)
+  #   model: opus
+  #   maxUsesPerRequest: 3
+
+  # Agent-to-agent loop governance. Omit the block to inherit the defaults.
+  # Not hot-reloadable: a change needs a daemon restart.
+  # a2a:
+  #   governor:
+  #     mode: enforce          # enforce (default) | shadow | off
+  #     maxHops: 6
+  #     maxConsecutiveAutoReplies: 3
+  #     pairWindowMax: 5
+  #     conversationCap: 12
+
+# MCP servers an agent may use. Reference them by name from `agents[].mcpServers`.
+mcpServers:
+  brave-search:
+    name: brave-search
+    command: python3
+    args:
+      - /opt/clawcode-mcp-servers/python/brave_search.py
+    env:
+      BRAVE_API_KEY: "${BRAVE_API_KEY}"
+
+agents:
+  # A general-purpose assistant bound to one Discord channel.
+  - name: general
+    autoStart: true
+    model: sonnet
+    channels:
+      - "000000000000000000"
+    skills:
+      - subagent-thread
+    mcpServers:
+      - brave-search
+    # Heartbeat: a periodic, cheap check of context usage. Auto-reset and
+    # auto-compact are deliberately separate blocks so one policy cannot be
+    # read as the other.
+    heartbeat:
+      every: 50m
+      model: haiku
+      prompt: |
+        # Context Health Monitor
+
+        ## AUTO-RESET: DISABLED
+        Never send `/clear` and never recommend a reset, at any context level.
+        The user decides when to reset.
+
+        ## AUTO-COMPACT: ALLOWED
+        Compaction is permitted. Suggest it in the orange and red zones.
+
+        ## Every heartbeat
+        1. Call `session_status` for current token usage.
+        2. Act on the zone:
+           - Green, 0-50%: nothing to do.
+           - Yellow, 50-70%: route heavy work to sub-agents and keep replies short.
+           - Orange, 70-85%: post a brief note to the channel and save a snapshot
+             to today's daily notes.
+           - Red, 85% and above: save full state to the daily notes and post an
+             alert that context is nearly full.
+    soul: |
+      # SOUL.md
+
+      Be genuinely helpful, not performatively helpful. Skip filler and just help.
+      Have opinions. Be resourceful before asking: read the file, check the
+      context, search for it, then ask if you are still stuck.
+      Private things stay private. Ask before acting externally.
+    identity: |
+      Name: Assistant
+      Vibe: Competent, concise, dry wit. Never sycophantic.
+
+  # A second agent. It starts only when you run `clawcode start research`.
+  - name: research
+    autoStart: false
+    model: opus
+    channels:
+      - "000000000000000001"
+    mcpServers:
+      - brave-search
+    soul: |
+      # SOUL.md
+
+      You research questions and report what you found with sources and dates.
+      State uncertainty once, next to the claim it affects.
+    identity: |
+      Name: Researcher
+      Vibe: Careful, specific, numbers over adjectives.

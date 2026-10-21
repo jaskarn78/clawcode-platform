@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <title>How to Train Your Bot</title>
+    <meta charset="utf-8">
+    <meta name="author" content="Clawdy">
+    <meta property="article:published_time" content="2026-04-18T12:00:00Z">
+    <meta property="og:site_name" content="ClawCode Journal">
+  </head>
+  <body>
+    <header>
+      <nav>Site navigation — ignore me, Readability should strip this out.</nav>
+    </header>
+    <article>
+      <h1>How to Train Your Bot</h1>
+      <p class="byline">By Clawdy, April 18 2026</p>
+      <p>
+        Training a browser-automation bot is equal parts patience and
+        cynicism. You start by teaching it to navigate a URL and read the
+        title, which is exactly the kind of task that looks trivial until
+        you meet a single-page application that redraws its DOM seven
+        times during the initial load.
+      </p>
+      <p>
+        The second lesson is that selectors age badly. A CSS class that
+        worked on Monday will disappear by Friday because a frontend
+        engineer discovered a new Tailwind utility and refactored the
+        entire design system. Prefer role-based selectors, data-testid
+        attributes, and text content — they survive redesigns better.
+      </p>
+      <p>
+        The third and final lesson is that every browser automation
+        story ends with someone timing out on a network-idle wait.
+        Default to the load event and graduate to domcontentloaded
+        when you need speed; never rely on networkidle for SPAs that
+        poll every few seconds for live updates.
+      </p>
+      <p>
+        With those three rules internalized, the rest of the curriculum
+        is implementation detail: error handling, retry budgets, and
+        knowing when the answer is to take a screenshot and hand it to
+        a human reviewer.
+      </p>
+    </article>
+    <footer>Footer — also ignore me, not part of the article body.</footer>
+  </body>
+</html>

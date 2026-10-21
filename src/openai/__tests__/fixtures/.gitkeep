@@ -1,0 +1,3 @@
+# Fixture directory — Plan 02 will populate with recorded Claude Agent SDK stream
+# messages for translator / stream tests. Kept tracked via .gitkeep so the
+# directory survives `git clean`.

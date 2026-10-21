@@ -1,0 +1,1155 @@
+/* ============================================================
+   ClawCode Dashboard — Bold Dark Aesthetic
+   Fonts: JetBrains Mono (headings/data), IBM Plex Sans (body)
+   Accent: Hot pink #ff3366, Electric cyan #00e5ff
+   ============================================================ */
+
+:root {
+  --bg-deep: #0a0a0f;
+  --bg-surface: #12121a;
+  --bg-elevated: #1a1a2e;
+  --text-primary: #e8e6e3;
+  --text-secondary: #8a8a9a;
+  --accent-primary: #ff3366;
+  --accent-secondary: #00e5ff;
+  --status-running: #00e676;
+  --status-stopped: #616161;
+  --status-error: #ff1744;
+  --status-warning: #ffc400;
+  --zone-green: #00e676;
+  --zone-yellow: #ffc400;
+  --zone-orange: #ff9100;
+  --zone-red: #ff1744;
+  --radius: 8px;
+  --transition: 0.2s ease;
+}
+
+/* ---------- Reset & Base ---------- */
+
+*,
+*::before,
+*::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  font-size: 15px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: "IBM Plex Sans", system-ui, sans-serif;
+  background: var(--bg-deep);
+  color: var(--text-primary);
+  min-height: 100vh;
+  /* Subtle radial noise texture */
+  background-image:
+    radial-gradient(ellipse at 20% 50%, rgba(255, 51, 102, 0.03) 0%, transparent 50%),
+    radial-gradient(ellipse at 80% 20%, rgba(0, 229, 255, 0.02) 0%, transparent 50%),
+    radial-gradient(circle at 50% 50%, rgba(26, 26, 46, 0.4) 0%, transparent 100%);
+  background-attachment: fixed;
+}
+
+/* ---------- Scrollbar ---------- */
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-elevated);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--accent-primary);
+  border-radius: 3px;
+}
+
+/* ---------- Header ---------- */
+
+.top-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 100;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid rgba(255, 51, 102, 0.2);
+  backdrop-filter: blur(12px);
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-family: "JetBrains Mono", monospace;
+  font-weight: 700;
+  font-size: 1.3rem;
+  user-select: none;
+}
+
+.logo-bracket {
+  color: var(--accent-primary);
+}
+
+.logo-slash {
+  color: var(--accent-secondary);
+}
+
+.logo-text {
+  color: var(--text-primary);
+  margin-left: 6px;
+  letter-spacing: -0.02em;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.connection-label {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.connection-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.connection-dot.connected {
+  background: var(--status-running);
+  box-shadow: 0 0 8px rgba(0, 230, 118, 0.6);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.connection-dot.disconnected {
+  background: var(--status-error);
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* ---------- Layout ---------- */
+
+.dashboard {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 20px;
+  padding: 76px 24px 24px;
+  max-width: 1600px;
+  margin: 0 auto;
+}
+
+@media (max-width: 900px) {
+  .dashboard {
+    grid-template-columns: 1fr;
+  }
+}
+
+.side-panels {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* ---------- Panels ---------- */
+
+.panel {
+  background: var(--bg-surface);
+  border: 1px solid rgba(255, 51, 102, 0.1);
+  border-radius: var(--radius);
+  padding: 20px;
+}
+
+.panel-heading {
+  font-family: "JetBrains Mono", monospace;
+  font-weight: 700;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-secondary);
+  padding-left: 12px;
+  border-left: 3px solid var(--accent-primary);
+  margin-bottom: 16px;
+}
+
+.panel-placeholder {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  text-align: center;
+  padding: 24px 0;
+}
+
+/* ---------- Agent Grid ---------- */
+
+.agent-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 14px;
+}
+
+/* ---------- Agent Card ---------- */
+
+.agent-card {
+  background: var(--bg-surface);
+  border: 1px solid rgba(255, 51, 102, 0.15);
+  border-radius: var(--radius);
+  padding: 16px;
+  transition: transform var(--transition), border-color var(--transition), box-shadow var(--transition);
+  animation: fadeSlideUp 0.4s ease forwards;
+  opacity: 0;
+}
+
+.agent-card:hover {
+  border-color: rgba(255, 51, 102, 0.4);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3), 0 0 12px rgba(255, 51, 102, 0.08);
+}
+
+/* Staggered entrance */
+.agent-card:nth-child(1) { animation-delay: 0.05s; }
+.agent-card:nth-child(2) { animation-delay: 0.1s; }
+.agent-card:nth-child(3) { animation-delay: 0.15s; }
+.agent-card:nth-child(4) { animation-delay: 0.2s; }
+.agent-card:nth-child(5) { animation-delay: 0.25s; }
+.agent-card:nth-child(6) { animation-delay: 0.3s; }
+.agent-card:nth-child(7) { animation-delay: 0.35s; }
+.agent-card:nth-child(8) { animation-delay: 0.4s; }
+.agent-card:nth-child(9) { animation-delay: 0.45s; }
+.agent-card:nth-child(10) { animation-delay: 0.5s; }
+.agent-card:nth-child(11) { animation-delay: 0.55s; }
+.agent-card:nth-child(12) { animation-delay: 0.6s; }
+.agent-card:nth-child(13) { animation-delay: 0.65s; }
+.agent-card:nth-child(14) { animation-delay: 0.7s; }
+
+@keyframes fadeSlideUp {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.agent-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.agent-name {
+  font-family: "JetBrains Mono", monospace;
+  font-weight: 700;
+  font-size: 1rem;
+  color: var(--text-primary);
+}
+
+/* ---------- Status Badge ---------- */
+
+.status-badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 12px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.7rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.status-badge.running {
+  background: rgba(0, 230, 118, 0.15);
+  color: var(--status-running);
+  border: 1px solid rgba(0, 230, 118, 0.3);
+}
+
+.status-badge.stopped {
+  background: rgba(97, 97, 97, 0.15);
+  color: var(--status-stopped);
+  border: 1px solid rgba(97, 97, 97, 0.3);
+}
+
+.status-badge.crashed,
+.status-badge.failed {
+  background: rgba(255, 23, 68, 0.15);
+  color: var(--status-error);
+  border: 1px solid rgba(255, 23, 68, 0.3);
+}
+
+.status-badge.starting,
+.status-badge.restarting {
+  background: rgba(255, 196, 0, 0.15);
+  color: var(--status-warning);
+  border: 1px solid rgba(255, 196, 0, 0.3);
+}
+
+.status-badge.stopping {
+  background: rgba(255, 145, 0, 0.15);
+  color: var(--zone-orange);
+  border: 1px solid rgba(255, 145, 0, 0.3);
+}
+
+/* ---------- Agent Details ---------- */
+
+.agent-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.agent-meta-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.8rem;
+}
+
+.meta-label {
+  color: var(--text-secondary);
+  font-family: "IBM Plex Sans", sans-serif;
+}
+
+.meta-value {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.78rem;
+  color: var(--text-primary);
+}
+
+/* ---------- Zone Bar ---------- */
+
+.zone-bar-container {
+  margin: 8px 0;
+}
+
+.zone-bar-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.72rem;
+  margin-bottom: 4px;
+}
+
+.zone-bar-label-text {
+  color: var(--text-secondary);
+  font-family: "IBM Plex Sans", sans-serif;
+}
+
+.zone-bar-pct {
+  font-family: "JetBrains Mono", monospace;
+  font-weight: 500;
+}
+
+.zone-bar {
+  height: 6px;
+  background: var(--bg-elevated);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.zone-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.6s ease, background-color 0.4s ease;
+}
+
+/* ---------- Channel Tags ---------- */
+
+.channel-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.channel-tag {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.68rem;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  color: var(--accent-secondary);
+  border: 1px solid rgba(0, 229, 255, 0.15);
+}
+
+/* ---------- Agent Error ---------- */
+
+.agent-error {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.72rem;
+  color: var(--status-error);
+  background: rgba(255, 23, 68, 0.08);
+  border-left: 2px solid var(--status-error);
+  padding: 4px 8px;
+  margin-top: 6px;
+  border-radius: 0 4px 4px 0;
+  word-break: break-all;
+  max-height: 40px;
+  overflow: hidden;
+}
+
+/* ---------- Action Buttons ---------- */
+
+.agent-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  padding-top: 10px;
+}
+
+.action-btn {
+  flex: 1;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.72rem;
+  font-weight: 500;
+  padding: 5px 0;
+  border: 1px solid rgba(0, 229, 255, 0.3);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--accent-secondary);
+  cursor: pointer;
+  transition: background var(--transition), border-color var(--transition);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.action-btn:hover {
+  background: rgba(0, 229, 255, 0.1);
+  border-color: var(--accent-secondary);
+}
+
+.action-btn:active {
+  background: rgba(0, 229, 255, 0.2);
+}
+
+.action-btn.danger {
+  border-color: rgba(255, 23, 68, 0.3);
+  color: var(--status-error);
+}
+
+.action-btn.danger:hover {
+  background: rgba(255, 23, 68, 0.1);
+  border-color: var(--status-error);
+}
+
+/* ---------- Schedules Panel ---------- */
+
+.schedules-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+
+.schedules-table th {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.7rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid rgba(255, 51, 102, 0.1);
+}
+
+.schedules-table td {
+  padding: 6px 8px;
+  font-family: "IBM Plex Sans", sans-serif;
+  color: var(--text-primary);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+.schedule-row:nth-child(even) {
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.schedule-row.schedule-disabled {
+  opacity: 0.4;
+}
+
+.schedule-cron code {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.72rem;
+  color: var(--accent-secondary);
+  background: var(--bg-elevated);
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+
+.schedule-next {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.72rem;
+}
+
+/* ---------- Status Dots ---------- */
+
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dot-success {
+  background: var(--status-running);
+  box-shadow: 0 0 4px rgba(0, 230, 118, 0.4);
+}
+
+.dot-warning {
+  background: var(--status-warning);
+  box-shadow: 0 0 4px rgba(255, 196, 0, 0.4);
+}
+
+.dot-error {
+  background: var(--status-error);
+  box-shadow: 0 0 4px rgba(255, 23, 68, 0.4);
+}
+
+.dot-pending {
+  background: var(--text-secondary);
+}
+
+/* ---------- Health Panel ---------- */
+
+.health-card {
+  background: var(--bg-elevated);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin-bottom: 10px;
+}
+
+.health-card:last-child {
+  margin-bottom: 0;
+}
+
+.health-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.health-agent-name {
+  font-family: "JetBrains Mono", monospace;
+  font-weight: 700;
+  font-size: 0.85rem;
+  color: var(--text-primary);
+}
+
+.zone-bar-lg {
+  height: 8px;
+}
+
+.health-checks {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.health-check-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.72rem;
+}
+
+.health-check-name {
+  font-family: "JetBrains Mono", monospace;
+  color: var(--text-primary);
+  min-width: 80px;
+}
+
+.health-check-msg {
+  color: var(--text-secondary);
+  font-family: "IBM Plex Sans", sans-serif;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- Delivery Queue Panel ---------- */
+
+.delivery-stats,
+.messages-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.stat-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 10px 8px;
+  background: var(--bg-elevated);
+  border-radius: var(--radius);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.stat-number {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 2rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1;
+}
+
+.stat-number.stat-delivered {
+  color: var(--accent-secondary);
+}
+
+.stat-number.stat-failed {
+  color: var(--status-error);
+}
+
+.stat-label {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+/* Failed entries table */
+
+.failed-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.72rem;
+}
+
+.failed-table th {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.65rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+  text-align: left;
+  padding: 4px 6px;
+  border-bottom: 1px solid rgba(255, 51, 102, 0.1);
+}
+
+.failed-table td {
+  padding: 4px 6px;
+  color: var(--text-primary);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+.failed-id code {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.68rem;
+  color: var(--accent-secondary);
+}
+
+.failed-error {
+  color: var(--status-error);
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.failed-time {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.68rem;
+}
+
+/* ---------- Memory Panel ---------- */
+
+.memory-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--bg-elevated);
+  border-radius: var(--radius);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  margin-bottom: 6px;
+}
+
+.memory-card:last-child {
+  margin-bottom: 0;
+}
+
+.memory-agent-name {
+  font-family: "JetBrains Mono", monospace;
+  font-weight: 700;
+  font-size: 0.78rem;
+  color: var(--text-primary);
+  min-width: 80px;
+}
+
+.memory-stats-row {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  font-size: 0.72rem;
+}
+
+.memory-entry-count,
+.memory-episode-count {
+  font-family: "JetBrains Mono", monospace;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.memory-stat-label {
+  color: var(--text-secondary);
+  font-family: "IBM Plex Sans", sans-serif;
+  font-size: 0.65rem;
+  margin-right: 6px;
+}
+
+/* Tier distribution bar */
+
+.tier-bar {
+  display: flex;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--bg-deep);
+  flex: 1;
+  min-width: 40px;
+}
+
+.tier-segment {
+  height: 100%;
+  transition: width 0.4s ease;
+}
+
+.tier-hot {
+  background: var(--accent-primary);
+}
+
+.tier-warm {
+  background: var(--status-warning);
+}
+
+.tier-cold {
+  background: var(--text-secondary);
+}
+
+/* ---------- Latency Panel (per-agent card) ---------- */
+
+.latency-panel {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.latency-heading {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.68rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.latency-body {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.72rem;
+}
+
+.latency-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.72rem;
+}
+
+.latency-table th {
+  text-align: left;
+  padding: 3px 6px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  border-bottom: 1px solid rgba(255, 51, 102, 0.15);
+}
+
+.latency-table td {
+  padding: 3px 6px;
+  color: var(--text-primary);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+.latency-table th:not(:first-child),
+.latency-table td:not(:first-child) {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.latency-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+/* Phase 51 Plan 03: SLO status highlights. The SLO-metric cell is tinted
+   per status. Cyan = healthy, red = breach, gray = no_data. Colors pulled
+   from the existing --accent-* / --status-* / --text-secondary tokens so
+   the panel stays on-palette with the rest of the dashboard. The subtitle
+   renders under each segment name, showing the server-emitted
+   slo_threshold_ms + slo_metric — per-agent overrides surface here
+   because the daemon already merged them into the response. */
+.latency-cell-healthy {
+  background: rgba(0, 229, 255, 0.08);
+  color: var(--accent-secondary, #00e5ff);
+  font-weight: 600;
+}
+
+.latency-cell-breach {
+  background: rgba(255, 51, 102, 0.12);
+  color: var(--status-error, #ff3366);
+  font-weight: 700;
+}
+
+.latency-cell-no-data {
+  color: var(--text-secondary, #888);
+}
+
+.latency-segment-name {
+  font-weight: 600;
+}
+
+.latency-subtitle {
+  margin-top: 2px;
+  font-size: 0.70rem;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  color: var(--text-secondary, #888);
+  letter-spacing: 0.02em;
+}
+
+/* ---------- Prompt Cache Panel (Phase 52 Plan 03, per-agent card) ---------- */
+
+/* Mirrors .latency-panel structure so the two observability panels sit as
+   visual siblings in each agent card. Colors pulled from the existing
+   --accent-secondary / --status-error / --text-secondary tokens — no new
+   token names introduced (per Phase 51 Plan 03 single-source-of-truth rule). */
+.cache-panel {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.cache-heading {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.68rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.cache-body {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.72rem;
+}
+
+.cache-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.cache-table th {
+  text-align: right;
+  padding: 3px 6px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  border-bottom: 1px solid rgba(0, 229, 255, 0.15);
+}
+
+.cache-table td {
+  padding: 3px 6px;
+  text-align: right;
+  color: var(--text-primary);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+.cache-table th:first-child,
+.cache-table td:first-child {
+  text-align: left;
+}
+
+.cache-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+/* SLO tinting: cyan = healthy (hit rate ≥ 60%), red = breach (< 30%),
+   gray = no_data (warming up / gray zone). Matches the latency panel's
+   visual language so operators scan both panels with the same color
+   vocabulary. */
+.cache-cell-healthy {
+  background: rgba(0, 229, 255, 0.08);
+  color: var(--accent-secondary, #00e5ff);
+  font-weight: 600;
+}
+
+.cache-cell-breach {
+  background: rgba(255, 51, 102, 0.12);
+  color: var(--status-error, #ff3366);
+  font-weight: 700;
+}
+
+.cache-cell-no-data {
+  color: var(--text-secondary, #888);
+}
+
+/* Three stacked subtitle lines below the single-row table:
+   (1) formula disclosure, (2) SLO band + p50/p95, (3) cache-effect delta. */
+.cache-subtitle {
+  margin-top: 4px;
+  font-size: 0.70rem;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  color: var(--text-secondary, #888);
+  letter-spacing: 0.02em;
+}
+
+/* Tiny eviction dot appended to the hit-rate cell when a day-over-day drop
+   exceeds 30% (indicates the stable prefix changed). Tooltip surfaces the
+   date of the drop so operators can correlate with config edits. */
+.cache-eviction-marker {
+  display: inline-block;
+  margin-left: 4px;
+  color: var(--status-error, #ff3366);
+  font-size: 0.6rem;
+  vertical-align: middle;
+}
+
+/* ── Phase 54 Plan 04 — First Token headline card ────────────────────────
+   Sits at the top of each agent tile, above the Latency (24h) panel. Shows
+   the server-emitted first_token_headline.p50 value large, colored by
+   slo_status (healthy=cyan, breach=red, no_data/warming-up=gray). */
+.first-token-card {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.25rem;
+  padding: 0.75rem 1rem;
+  margin-bottom: 0.75rem;
+  border-radius: 6px;
+  background: var(--bg-secondary, rgba(255, 255, 255, 0.02));
+  border: 1px solid var(--border-color, rgba(255, 255, 255, 0.06));
+}
+
+.first-token-heading {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-secondary, #888);
+  font-weight: 600;
+}
+
+.first-token-value {
+  font-size: 1.75rem;
+  font-weight: 700;
+  font-family: "JetBrains Mono", "SF Mono", Menlo, monospace;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
+}
+
+.first-token-subtitle {
+  font-size: 0.75rem;
+  color: var(--text-secondary, #888);
+  font-family: "JetBrains Mono", "SF Mono", Menlo, monospace;
+}
+
+.first-token-card.latency-cell-healthy .first-token-value {
+  color: var(--accent-secondary, #00e5ff);
+}
+
+.first-token-card.latency-cell-breach .first-token-value {
+  color: var(--status-error, #ff3366);
+}
+
+.first-token-card.latency-cell-breach {
+  border-color: rgba(255, 51, 102, 0.4);
+  background: rgba(255, 51, 102, 0.06);
+}
+
+.first-token-card.latency-cell-no-data .first-token-value {
+  color: var(--text-secondary, #888);
+}
+
+/* ---------- Tool Call Latency Panel (Phase 55 Plan 03, per-agent card) ---------- */
+
+/* Sibling of .cache-panel — shares the same margin / border-top treatment so
+   the three observability panels (Latency / Prompt Cache / Tool Call Latency)
+   stack as visual siblings in each agent card. */
+.tools-panel {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.tools-heading {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.68rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+.tools-body {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.72rem;
+}
+
+.tools-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.tools-table th {
+  text-align: right;
+  padding: 3px 6px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  border-bottom: 1px solid rgba(0, 229, 255, 0.15);
+}
+
+.tools-table td {
+  padding: 3px 6px;
+  text-align: right;
+  color: var(--text-primary);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+.tools-table th:first-child,
+.tools-table td:first-child {
+  text-align: left;
+}
+
+.tools-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+/* Row-state tinting — breach = red, healthy = cyan, no_data = gray. Matches
+   the Prompt Cache panel cell-state color vocabulary so operators scan all
+   three panels with the same mental model. Tints only the tool_name column
+   so the numbers stay monochrome (eye goes to the slow name first). */
+.tool-row-slow td:first-child {
+  background: rgba(255, 51, 102, 0.12);
+  color: var(--status-error, #ff3366);
+  font-weight: 700;
+}
+
+.tool-row-healthy td:first-child {
+  color: var(--accent-secondary, #00e5ff);
+}
+
+.tool-row-no-data td:first-child {
+  color: var(--text-secondary, #888);
+}
+
+.tool-slow-sigil {
+  margin-left: 6px;
+  color: var(--status-error, #ff3366);
+  font-size: 0.66rem;
+  font-weight: 700;
+}
+
+.tools-expand {
+  margin-top: 6px;
+  text-align: center;
+}
+
+.tools-expand button {
+  background: transparent;
+  border: 1px solid var(--text-secondary, #888);
+  color: var(--text-secondary, #888);
+  padding: 3px 10px;
+  cursor: pointer;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.68rem;
+  border-radius: 3px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.tools-expand button:hover {
+  border-color: var(--accent-secondary, #00e5ff);
+  color: var(--accent-secondary, #00e5ff);
+}
+
+/* -------------------------------------------------------------------------
+ * Phase 56 Plan 02 — warm-path badge
+ *
+ * Appears in the agent-card-header next to the status-badge. States map
+ * directly to server-emitted fields (warm_path_ready + warm_path_readiness_ms);
+ * the dashboard renders them verbatim — no client-side threshold logic.
+ * ------------------------------------------------------------------------- */
+.warm-path-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  margin-left: 6px;
+  border-radius: 10px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  font-family: "JetBrains Mono", monospace;
+  letter-spacing: 0.02em;
+  vertical-align: middle;
+}
+
+.warm-path-badge.warm {
+  background: rgba(6, 182, 212, 0.18);
+  color: #06b6d4;
+  border: 1px solid rgba(6, 182, 212, 0.35);
+}
+
+.warm-path-badge.warming {
+  background: rgba(234, 179, 8, 0.18);
+  color: #eab308;
+  border: 1px solid rgba(234, 179, 8, 0.35);
+}
+
+.warm-path-badge.cold {
+  background: rgba(239, 68, 68, 0.18);
+  color: #ef4444;
+  border: 1px solid rgba(239, 68, 68, 0.35);
+}
+
+.warm-path-badge.unknown {
+  background: rgba(107, 114, 128, 0.12);
+  color: #9ca3af;
+  border: 1px solid rgba(107, 114, 128, 0.25);
+}

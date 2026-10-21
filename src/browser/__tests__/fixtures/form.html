@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Sign Up</title>
+  </head>
+  <body>
+    <form id="signup" aria-label="Sign up form">
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" placeholder="you@example.com" required>
+      <button id="submit" type="submit">Submit</button>
+    </form>
+    <div id="result" role="status"></div>
+    <script>
+      document.getElementById("submit").addEventListener("click", function (e) {
+        e.preventDefault();
+        var email = document.getElementById("email").value;
+        document.getElementById("result").textContent = "submitted: " + email;
+      });
+    </script>
+  </body>
+</html>

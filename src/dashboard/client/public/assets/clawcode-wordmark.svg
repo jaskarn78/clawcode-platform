@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 48" fill="none" aria-label="ClawCode wordmark">
+  
+  <rect x="0" y="0" width="48" height="48" rx="10" fill="#12131a"></rect>
+  <rect x="0.5" y="0.5" width="47" height="47" rx="9.5" stroke="#2a2c38"></rect>
+  <g stroke="#10b981" stroke-width="3.6" stroke-linecap="round" fill="none">
+    <path d="M12 14 C 16.4 22.6, 19.4 28.6, 21 35.6"></path>
+    <path d="M21 12 C 25.4 21, 26.9 26.4, 28.4 35.6"></path>
+    <path d="M30 11 C 34.6 20, 35.8 25.6, 35.8 34.6"></path>
+  </g>
+  <circle cx="37.6" cy="11" r="2.2" fill="#f4b942"></circle>
+  
+  <text x="60" y="32" font-family="&#39;Cabinet Grotesk&#39;, system-ui, sans-serif" font-weight="700" font-size="22" letter-spacing="-0.5" fill="#f3f4f6">clawcode</text>
+</svg>

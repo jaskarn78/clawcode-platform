@@ -1,0 +1,442 @@
+/*
+ * dashboard-rework — Refined Command Center shell.
+ *
+ * Persistent left sidebar + nested nav + slim topbar. Built ON the existing
+ * --mc-* / --bg-* / --fg-* token system (src/index.css), not a new palette.
+ * Light + dark both inherit through the CSS vars. Emerald = active/primary,
+ * copper/amber (--mc-accent) = sparing warmth.
+ */
+
+.app-shell {
+  --sb-w: 248px;
+  display: grid;
+  grid-template-columns: var(--sb-w) 1fr;
+  min-height: 100vh;
+  background: rgb(var(--bg-base));
+  color: rgb(var(--fg-1));
+  transition: grid-template-columns var(--mc-t-base) var(--mc-ease-out);
+}
+.app-shell[data-collapsed='true'] {
+  --sb-w: 68px;
+}
+
+/* ---- Sidebar ---------------------------------------------------------- */
+
+.sb {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background:
+    linear-gradient(
+      180deg,
+      rgb(var(--bg-elevated)) 0%,
+      rgb(var(--bg-muted)) 100%
+    );
+  border-right: 1px solid var(--mc-bg-line);
+  overflow: hidden;
+  z-index: 40;
+}
+
+.sb-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--mc-space-3);
+  height: 60px;
+  padding: 0 var(--mc-space-4);
+  border-bottom: 1px solid var(--mc-bg-line);
+  flex: 0 0 auto;
+}
+.sb-brand .mark {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+}
+.sb-brand .wmark {
+  font-family: 'Cabinet Grotesk', system-ui, sans-serif;
+  font-weight: 700;
+  font-size: 1.05rem;
+  letter-spacing: -0.02em;
+  color: rgb(var(--fg-1));
+  white-space: nowrap;
+  opacity: 1;
+  transition: opacity var(--mc-t-fast) var(--mc-ease-out);
+}
+.app-shell[data-collapsed='true'] .sb-brand .wmark {
+  opacity: 0;
+  pointer-events: none;
+}
+.sb-collapse {
+  margin-left: auto;
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--mc-radius-sm);
+  color: rgb(var(--fg-3));
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: background var(--mc-t-fast), color var(--mc-t-fast);
+}
+.sb-collapse:hover {
+  background: rgb(var(--bg-s3));
+  color: rgb(var(--fg-1));
+}
+.sb-collapse:focus-visible,
+.tb-icon-btn:focus-visible {
+  outline: 2px solid rgb(var(--primary));
+  outline-offset: 2px;
+}
+.app-shell[data-collapsed='true'] .sb-collapse {
+  margin-left: 0;
+}
+
+.sb-nav {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: var(--mc-space-3) var(--mc-space-2);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.sb-nav::-webkit-scrollbar {
+  width: 8px;
+}
+.sb-nav::-webkit-scrollbar-thumb {
+  background: var(--mc-bg-line);
+  border-radius: var(--mc-radius-xs);
+}
+
+.sb-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--mc-space-3);
+  height: 38px;
+  padding: 0 var(--mc-space-3);
+  border-radius: var(--mc-radius-sm);
+  color: rgb(var(--fg-2));
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  border: none;
+  background: transparent;
+  width: 100%;
+  text-align: left;
+  transition:
+    background var(--mc-t-fast) var(--mc-ease-out),
+    color var(--mc-t-fast) var(--mc-ease-out);
+}
+.sb-item .ico {
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  color: rgb(var(--fg-3));
+  transition: color var(--mc-t-fast);
+}
+.sb-item .lbl {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: opacity var(--mc-t-fast) var(--mc-ease-out);
+}
+.app-shell[data-collapsed='true'] .sb-item .lbl,
+.app-shell[data-collapsed='true'] .sb-group-label,
+.app-shell[data-collapsed='true'] .sb-chevron {
+  opacity: 0;
+  width: 0;
+  pointer-events: none;
+}
+.sb-item:hover {
+  background: rgb(var(--bg-s3));
+  color: rgb(var(--fg-1));
+}
+.sb-item:hover .ico {
+  color: rgb(var(--fg-1));
+}
+.sb-item:focus-visible {
+  outline: 2px solid rgb(var(--primary));
+  outline-offset: -2px;
+}
+.sb-item[data-active='true'] {
+  background: var(--mc-primary-soft);
+  color: rgb(var(--primary));
+  font-weight: 600;
+}
+.sb-item[data-active='true'] .ico {
+  color: rgb(var(--primary));
+}
+/* left accent bar on the active item */
+.sb-item[data-active='true']::before {
+  content: '';
+  position: absolute;
+  left: -2px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 20px;
+  border-radius: 0 3px 3px 0;
+  background: rgb(var(--primary));
+}
+
+/* Group (Insights) */
+.sb-group {
+  display: flex;
+  flex-direction: column;
+}
+.sb-group-toggle {
+  /* reuses .sb-item layout */
+}
+.sb-chevron {
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  color: rgb(var(--fg-3));
+  transition: transform var(--mc-t-base) var(--mc-ease-out);
+}
+.sb-group[data-open='true'] .sb-chevron {
+  transform: rotate(90deg);
+}
+.sb-children {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows var(--mc-t-base) var(--mc-ease-out);
+}
+.sb-group[data-open='true'] .sb-children {
+  grid-template-rows: 1fr;
+}
+.sb-children-inner {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-left: 14px;
+  margin-left: 12px;
+  border-left: 1px solid var(--mc-bg-line);
+}
+.app-shell[data-collapsed='true'] .sb-children-inner {
+  padding-left: 0;
+  margin-left: 0;
+  border-left: none;
+}
+.sb-children .sb-item {
+  height: 34px;
+  font-size: 0.84rem;
+}
+
+.sb-group-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  /* fg-2 for AA contrast on small uppercase text (see .topbar-crumb). */
+  color: rgb(var(--fg-2));
+  font-weight: 600;
+  padding: 0 var(--mc-space-3);
+  margin: var(--mc-space-3) 0 var(--mc-space-1);
+}
+
+.sb-footer {
+  flex: 0 0 auto;
+  padding: var(--mc-space-2);
+  border-top: 1px solid var(--mc-bg-line);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* ---- Content column --------------------------------------------------- */
+
+.content-col {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 100vh;
+}
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: var(--mc-space-3);
+  height: 60px;
+  padding: 0 var(--mc-space-5);
+  background: rgb(var(--bg-base) / 0.82);
+  backdrop-filter: blur(12px) saturate(140%);
+  border-bottom: 1px solid var(--mc-bg-line);
+}
+.topbar-title {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+.topbar-crumb {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  /* fg-2 not fg-3: small uppercase text must clear AA 4.5:1 (fg-3 measures
+     ~3.5:1 on these surfaces — fine for icons, fails for text). */
+  color: rgb(var(--fg-2));
+  font-weight: 600;
+}
+.topbar-h {
+  font-family: 'Cabinet Grotesk', system-ui, sans-serif;
+  font-size: 1.18rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  color: rgb(var(--fg-1));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.topbar-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--mc-space-2);
+}
+
+.tb-heartbeat {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 var(--mc-space-3);
+  border-radius: var(--mc-radius-pill);
+  background: var(--mc-primary-soft);
+  border: 1px solid var(--mc-primary-ring);
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: rgb(var(--fg-2));
+  white-space: nowrap;
+}
+.tb-heartbeat .pulse-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgb(var(--primary));
+  box-shadow: 0 0 0 0 rgb(var(--primary) / 0.5);
+  animation: tb-pulse 2.4s var(--mc-ease-out) infinite;
+}
+@keyframes tb-pulse {
+  0% { box-shadow: 0 0 0 0 rgb(var(--primary) / 0.45); }
+  70% { box-shadow: 0 0 0 6px rgb(var(--primary) / 0); }
+  100% { box-shadow: 0 0 0 0 rgb(var(--primary) / 0); }
+}
+
+.tb-icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--mc-radius-sm);
+  color: rgb(var(--fg-2));
+  background: transparent;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background var(--mc-t-fast), color var(--mc-t-fast), border-color var(--mc-t-fast);
+}
+.tb-icon-btn:hover {
+  background: rgb(var(--bg-s3));
+  color: rgb(var(--fg-1));
+  border-color: var(--mc-bg-line);
+}
+
+/* mobile menu trigger — hidden on desktop */
+.tb-menu {
+  display: none;
+}
+
+.main-scroll {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: hidden;
+}
+
+/* ---- Mobile (< lg) : sidebar becomes an off-canvas drawer ------------- */
+
+.sb-scrim {
+  display: none;
+}
+
+@media (max-width: 1023px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+  .sb {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 248px;
+    transform: translateX(-100%);
+    transition: transform var(--mc-t-base) var(--mc-ease-out);
+    box-shadow: var(--mc-shadow-3);
+  }
+  .app-shell[data-mobile-open='true'] .sb {
+    transform: translateX(0);
+  }
+  /* on mobile the collapse toggle is irrelevant — always show labels */
+  .app-shell[data-collapsed='true'] .sb-item .lbl,
+  .app-shell[data-collapsed='true'] .sb-group-label,
+  .app-shell[data-collapsed='true'] .sb-chevron,
+  .app-shell[data-collapsed='true'] .sb-brand .wmark {
+    opacity: 1;
+    width: auto;
+    pointer-events: auto;
+  }
+  .sb-collapse {
+    display: none;
+  }
+  .tb-menu {
+    display: inline-grid;
+  }
+  /* Reclaim width for the title on small screens — the heartbeat + telemetry
+     pills are wide and non-shrinking; hide them so the heading never collides
+     with the right cluster. Fleet liveness stays one tap away on Overview. */
+  .tb-heartbeat {
+    display: none;
+  }
+  .topbar {
+    padding: 0 var(--mc-space-4);
+    gap: var(--mc-space-2);
+  }
+  .app-shell[data-mobile-open='true'] .sb-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 35;
+    background: rgb(0 0 0 / 0.45);
+    backdrop-filter: blur(2px);
+  }
+}
+
+/* Entrance — content fade on view change is handled per-view; the shell
+   itself does a one-time settle on mount. */
+.app-shell {
+  animation: shell-settle 360ms var(--mc-ease-out) both;
+}
+@keyframes shell-settle {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .app-shell,
+  .sb,
+  .sb-children,
+  .sb-chevron,
+  .sb-item .lbl,
+  .tb-heartbeat .pulse-dot {
+    animation: none !important;
+    transition: none !important;
+  }
+}
