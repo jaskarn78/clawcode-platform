@@ -40,3 +40,20 @@ export {
   type ArchiveDeps,
   type ArchiveResult,
 } from "./clawcode-memory-archive.js";
+
+// Memory overhaul 2026-10-25 (WP5) - corrections on saved memories.
+export {
+  clawcodeMemoryForget,
+  FORGET_INPUT_SCHEMA,
+  type ForgetInput,
+  type ForgetDeps,
+  type ForgetResult,
+} from "./clawcode-memory-forget.js";
+
+export {
+  clawcodeMemoryUpdate,
+  UPDATE_INPUT_SCHEMA,
+  type UpdateInput,
+  type UpdateDeps,
+  type UpdateResult,
+} from "./clawcode-memory-update.js";

@@ -99,6 +99,9 @@ export const CLAWCODE_ACTING_TOOLS: readonly string[] = Object.freeze([
   "memory_save",
   "clawcode_memory_edit",
   "clawcode_memory_archive",
+  // Memory overhaul 2026-10-25 (WP5) - corrections mutate the memory store.
+  "clawcode_memory_forget",
+  "clawcode_memory_update",
   "ingest_document",
   "delete_document",
   "clawcode_rag_set_priority",

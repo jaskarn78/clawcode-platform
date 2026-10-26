@@ -387,6 +387,7 @@ ${llmContent}
       source: "consolidation",
       importance: 0.7,
       tags: ["weekly-digest", weekStr],
+      skipDedup: true,
     },
     embedding,
   );
@@ -442,6 +443,7 @@ ${llmContent}
       source: "consolidation",
       importance: 0.8,
       tags: ["monthly-digest", monthStr],
+      skipDedup: true,
     },
     embedding,
   );

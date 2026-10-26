@@ -78,6 +78,12 @@ export const IPC_METHODS = [
   "clawcode-memory-recall",
   "clawcode-memory-edit",
   "clawcode-memory-archive",
+  // Memory overhaul 2026-10-25 (WP5) - corrections on saved memories:
+  // forget retires a row (superseded_by = "forgotten"); update inserts the
+  // new content and marks the old row superseded by it. Backs the
+  // clawcode_memory_forget / clawcode_memory_update MCP tools.
+  "clawcode-memory-forget",
+  "clawcode-memory-update",
   // Phase 999.14 MCP-10 — operator escape hatches for the stale-binding
   // sweep. `threads-prune-stale` runs the sweep on demand with an
   // operator-supplied threshold; `threads-prune-agent` force-prunes ALL

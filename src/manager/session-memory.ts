@@ -68,7 +68,11 @@ export class AgentMemoryManager {
       }
 
       const dbPath = getAgentMemoryDbPath(config.memoryPath);
-      const store = new MemoryStore(dbPath);
+      // Memory overhaul 2026-10-25 (WP5) - the agent's resolved
+      // `memory.deduplication` reaches the store (it was parsed and dropped
+      // before, so the YAML knob did nothing). Undefined falls back to the
+      // store's defaults (enabled, 0.85 supersede floor, 0.95 duplicate floor).
+      const store = new MemoryStore(dbPath, config.memory?.deduplication);
       this.memoryStores.set(name, store);
 
       // Phase 999.119 — boot-time self-heal. Rows that reference a memory

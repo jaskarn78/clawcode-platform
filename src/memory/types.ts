@@ -33,6 +33,44 @@ export type MemoryEntry = {
   readonly tier: MemoryTier;
   /** Conversation turn IDs this memory was derived from (CONV-03 lineage). Null for non-conversation memories. */
   readonly sourceTurnIds: readonly string[] | null;
+  /**
+   * Memory overhaul 2026-10-25 (WP5) - supersession. The id of the memory
+   * that replaced this one, or `FORGOTTEN_MARKER` when an agent retired it
+   * with clawcode_memory_forget. Null (or absent on a row read through a
+   * statement that does not select the column) means the memory is live.
+   * Superseded rows stay in the table but are excluded from every search
+   * and retrieval path by default.
+   */
+  readonly supersededBy?: string | null;
+  /** ISO timestamp of the supersession; null while the memory is live. */
+  readonly supersededAt?: string | null;
+};
+
+/**
+ * Memory overhaul 2026-10-25 (WP5) - the `superseded_by` value written by
+ * clawcode_memory_forget. Not a memory id; a forgotten row has no successor.
+ */
+export const FORGOTTEN_MARKER = "forgotten";
+
+/** What `MemoryStore.insertWithStatus` did with the submitted content. */
+export type InsertStatus = "created" | "duplicate" | "superseded";
+
+/**
+ * Memory overhaul 2026-10-25 (WP5) - result of a dedup-aware insert.
+ *   created    - a new row was written (dedup found nothing close enough).
+ *   duplicate  - the content was already stored (cosine at or above the
+ *                duplicate threshold, or an origin_id collision); `entry`
+ *                is the EXISTING row and nothing was written.
+ *   superseded - a new row was written and the near-duplicate it replaces
+ *                (`supersedes`) was marked superseded_by = the new id.
+ */
+export type InsertOutcome = {
+  readonly entry: MemoryEntry;
+  readonly status: InsertStatus;
+  /** Set only when `status === "superseded"`: the id of the retired row. */
+  readonly supersedes?: string;
+  /** Cosine similarity to the nearest live memory when dedup compared one. */
+  readonly similarity?: number;
 };
 
 /** Input for creating a new memory entry. */
@@ -53,6 +91,14 @@ export type CreateMemoryInput = {
    * SKIPPED on the origin_id path — idempotency is the contract.
    */
   readonly origin_id?: string;
+  /**
+   * Memory overhaul 2026-10-25 (WP5) - explicit supersession. When set, the
+   * named row is marked `superseded_by = <new id>` inside the same
+   * transaction as the insert (clawcode_memory_update uses this with
+   * `skipDedup: true` so a correction never collides with a third memory).
+   * Ignored when the named row does not exist.
+   */
+  readonly supersedes?: string;
 };
 
 /** A search result extends MemoryEntry with distance score. */

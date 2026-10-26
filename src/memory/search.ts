@@ -57,12 +57,16 @@ export class SemanticSearch {
   constructor(db: DatabaseType, scoringConfig?: ScoringConfig) {
     this.scoringConfig = scoringConfig ?? DEFAULT_SCORING_CONFIG;
 
+    // Memory overhaul 2026-10-25 (WP5) - superseded rows keep their vectors
+    // so the KNN still sees them; the join filter hides them. The 2x
+    // over-fetch below leaves headroom for the rows it drops.
     this.searchStmtV1 = db.prepare(`
       SELECT ${SELECT_COLUMNS}
       FROM vec_memories v
       INNER JOIN memories m ON m.id = v.memory_id
       WHERE v.embedding MATCH ?
         AND k = ?
+        AND m.superseded_by IS NULL
       ORDER BY v.distance
     `);
 
@@ -72,6 +76,7 @@ export class SemanticSearch {
       INNER JOIN memories m ON m.id = v.memory_id
       WHERE v.embedding MATCH vec_int8(?)
         AND k = ?
+        AND m.superseded_by IS NULL
       ORDER BY v.distance
     `);
 

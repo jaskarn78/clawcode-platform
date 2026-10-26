@@ -1,15 +1,35 @@
 import type { Database as DatabaseType } from "better-sqlite3";
 import { MemoryError } from "./errors.js";
 
+/**
+ * Memory overhaul 2026-10-25 (WP5) - cosine at or above which a new memory
+ * is a true duplicate of an existing one and is dropped. Between the
+ * configured `similarityThreshold` and this value the new memory is
+ * inserted and SUPERSEDES the older one (explicit supersession with a
+ * date instead of a destructive merge).
+ */
+export const DEDUP_DUPLICATE_THRESHOLD = 0.95;
+
 /** Configuration for deduplication similarity check. */
 export type DedupConfig = {
+  /** Floor for the supersede band (default 0.85). */
   readonly similarityThreshold: number;
+  /** Floor for the drop-as-duplicate band (default 0.95). */
+  readonly duplicateThreshold?: number;
 };
 
-/** Result of a deduplication check. */
+/**
+ * Result of a deduplication check.
+ *   insert    - nothing close enough; write a new row.
+ *   duplicate - cosine >= duplicateThreshold; drop the new content and
+ *               hand back the existing id.
+ *   supersede - similarityThreshold <= cosine < duplicateThreshold; write
+ *               the new row and mark `existingId` superseded by it.
+ */
 export type DedupResult =
   | { readonly action: "insert" }
-  | { readonly action: "merge"; readonly existingId: string; readonly similarity: number };
+  | { readonly action: "duplicate"; readonly existingId: string; readonly similarity: number }
+  | { readonly action: "supersede"; readonly existingId: string; readonly similarity: number };
 
 /** Input for merging into an existing memory. */
 export type MergeInput = {
@@ -33,11 +53,22 @@ type ExistingRow = {
 };
 
 /**
+ * KNN over-fetch for the dedup probe. Superseded rows keep their vectors,
+ * so the single nearest neighbour may be a retired memory; fetching a few
+ * and taking the nearest LIVE one keeps the probe correct without a
+ * second query.
+ */
+const DEDUP_PROBE_K = 8;
+
+/**
  * Check whether a new embedding is a near-duplicate of an existing memory.
  *
- * Runs a KNN query with k=1 against vec_memories. If the nearest neighbor
- * has similarity >= threshold, returns a merge directive with the existing ID.
- * Otherwise returns an insert directive.
+ * Runs a KNN query against vec_memories joined to memories so superseded
+ * rows (superseded_by IS NOT NULL) never count as the nearest neighbour.
+ * The nearest live row decides:
+ *   - similarity >= duplicateThreshold (default 0.95) -> "duplicate"
+ *   - similarityThreshold <= similarity < duplicateThreshold -> "supersede"
+ *   - otherwise -> "insert"
  */
 export function checkForDuplicate(
   embedding: Float32Array,
@@ -46,19 +77,37 @@ export function checkForDuplicate(
 ): DedupResult {
   const row = db
     .prepare(
-      "SELECT memory_id, distance FROM vec_memories WHERE embedding MATCH ? AND k = 1",
+      `SELECT v.memory_id AS memory_id, v.distance AS distance
+       FROM vec_memories v
+       INNER JOIN memories m ON m.id = v.memory_id
+       WHERE v.embedding MATCH ? AND k = ? AND m.superseded_by IS NULL
+       ORDER BY v.distance
+       LIMIT 1`,
     )
-    .get(embedding) as VecRow | undefined;
+    .get(embedding, DEDUP_PROBE_K) as VecRow | undefined;
 
   if (!row) {
     return { action: "insert" };
   }
 
   const similarity = 1 - row.distance;
+  const duplicateThreshold = config.duplicateThreshold ?? DEDUP_DUPLICATE_THRESHOLD;
+  // The supersede band must sit below the duplicate band; a misconfigured
+  // pair (similarity floor above the duplicate floor) collapses to "drop
+  // at the lower of the two", which is the safer reading.
+  const supersedeFloor = Math.min(config.similarityThreshold, duplicateThreshold);
 
-  if (similarity >= config.similarityThreshold) {
+  if (similarity >= duplicateThreshold) {
     return Object.freeze({
-      action: "merge" as const,
+      action: "duplicate" as const,
+      existingId: row.memory_id,
+      similarity,
+    });
+  }
+
+  if (similarity >= supersedeFloor) {
+    return Object.freeze({
+      action: "supersede" as const,
       existingId: row.memory_id,
       similarity,
     });
@@ -69,6 +118,14 @@ export function checkForDuplicate(
 
 /**
  * Merge a new memory into an existing entry.
+ *
+ * DEPRECATED (memory overhaul 2026-10-25, WP5): `MemoryStore.insert` no
+ * longer calls this. Dedup is non-destructive now: a true duplicate is
+ * dropped and a near-duplicate supersedes the older row (see
+ * `MemoryStore.insertWithStatus`). This helper overwrites content, unions
+ * tags and bumps access_count, all of which the audit flagged as data
+ * loss; it is kept only so existing importers keep compiling. Prefer
+ * `MemoryStore.insertWithStatus` with `supersedes`.
  *
  * Updates the existing memory with:
  * - New content (replaces old)

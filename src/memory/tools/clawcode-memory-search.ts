@@ -34,8 +34,10 @@ export const SEARCH_INPUT_SCHEMA = z.object({
   /**
    * Phase 115 sub-scope 7 — optional include-tag filter applied AFTER
    * retrieval. Pre-filtered hits whose tags don't intersect this list are
-   * dropped. Empty / undefined → no filter. Memories without tags are NOT
-   * returned when this is set.
+   * dropped. Empty / undefined → no filter. Tags exist only on saved
+   * memories: when this is set, file-chunk and owner-fact hits (which carry
+   * no tags) are dropped too. The check is side-effect free (WP5): it no
+   * longer bumps access counters on rows it filters out.
    */
   includeTags: z.array(z.string()).optional(),
   /** Optional exclude-tag filter passed through to retrieveMemoryChunks. */
@@ -46,7 +48,7 @@ export const SEARCH_INPUT_SCHEMA = z.object({
 export type SearchInput = z.input<typeof SEARCH_INPUT_SCHEMA>;
 
 export interface SearchHit {
-  /** Memory ID (chunk_id for memory_chunks, memory_id for memories). */
+  /** Memory ID (chunk_id for memory_chunks, memory_id for memories, shared:<id> for owner facts). */
   readonly memoryId: string;
   /** Optional heading from a memory_chunks row. */
   readonly heading?: string | null;
@@ -54,10 +56,24 @@ export interface SearchHit {
   readonly snippet: string;
   /** Fused RRF + path-derived score. Higher is better. */
   readonly score: number;
-  /** Whether the hit came from memory_chunks ("chunk") or memories ("memory"). */
-  readonly source: "chunk" | "memory";
+  /**
+   * Where the hit came from: a memory file section ("chunk"), a saved
+   * memory ("memory") or one of the owner's shared facts ("owner-fact",
+   * WP5; recall it with the same `shared:<id>` id).
+   */
+  readonly source: "chunk" | "memory" | "owner-fact";
   /** Path of the originating file (memory_chunks) or synthetic memory:<id> (memories). */
   readonly path?: string;
+  /**
+   * WP5 - when the content dates from: the saved memory's created_at, the
+   * memory file's mtime for a chunk, or the owner fact's created_at. ISO.
+   * Lets the agent prefer the fresher of two contradicting hits.
+   */
+  readonly createdAt?: string;
+  /** WP5 - tags of a saved memory (empty for chunks and owner facts). */
+  readonly tags?: ReadonlyArray<string>;
+  /** WP5 - the saved memory's `source` column (manual, conversation, consolidation ...). */
+  readonly sourceKind?: string;
 }
 
 export interface SearchDeps {
@@ -103,6 +119,8 @@ export interface SearchResult {
 }
 
 const SNIPPET_MAX_CHARS = 500;
+/** Id prefix `ownerFactsAsChunks` puts on the owner's shared facts. */
+const SHARED_ID_PREFIX = "shared:";
 
 /**
  * Phase 115 Plan 05 sub-scope 7 — `clawcode_memory_search` tool body.
@@ -159,29 +177,49 @@ export async function clawcodeMemorySearch(
     const memoryId = c.chunkId ?? "";
     if (memoryId.length === 0) continue;
     const body = c.body ?? "";
+    const isOwnerFact = memoryId.startsWith(SHARED_ID_PREFIX);
+    // WP5 - provenance per hit. Both lookups are side-effect free (no
+    // access bump): getMemoryForRetrieval for saved memories, getMemoryChunk
+    // for file sections. A retriever that already carries createdAt wins.
+    let createdAt = c.createdAt;
+    let tags: ReadonlyArray<string> | undefined;
+    let sourceKind: string | undefined;
+    if (c.source === "memory") {
+      const meta = deps.store.getMemoryForRetrieval(memoryId);
+      if (meta) {
+        createdAt = createdAt ?? meta.created_at;
+        tags = meta.tags;
+        sourceKind = meta.source;
+      }
+    } else if (!isOwnerFact && createdAt === undefined) {
+      const chunk = deps.store.getMemoryChunk(memoryId);
+      if (chunk && Number.isFinite(chunk.file_mtime_ms) && chunk.file_mtime_ms > 0) {
+        createdAt = new Date(chunk.file_mtime_ms).toISOString();
+      }
+    }
     hits.push({
       memoryId,
       heading: c.heading,
       snippet: body.length > SNIPPET_MAX_CHARS ? body.slice(0, SNIPPET_MAX_CHARS) : body,
       score: c.fusedScore ?? 0,
-      source: c.source,
+      source: isOwnerFact ? "owner-fact" : c.source,
       path: c.path,
+      ...(createdAt ? { createdAt } : {}),
+      ...(tags ? { tags } : {}),
+      ...(sourceKind ? { sourceKind } : {}),
     });
   }
 
-  // Optional includeTags filter: applied post-retrieval since memory_chunks
-  // hits don't carry tags through retrieveMemoryChunks (only memories side
-  // does, internally). When includeTags is set we conservatively skip
-  // memory_chunks hits (no tag info to match) — this preserves "I asked
-  // for tagged-only memories" intent.
+  // Optional includeTags filter, applied post-retrieval. Tags exist only on
+  // saved memories, so when the filter is set, chunk and owner-fact hits
+  // (no tags) are dropped and a saved memory is kept only when its tags
+  // intersect the list. The tags were read above without touching access
+  // state, so filtered-out rows are never counted as accessed (WP5).
   if (parsed.includeTags && parsed.includeTags.length > 0) {
     const wanted = new Set(parsed.includeTags);
     const filtered = hits.filter((h) => {
-      if (h.source === "chunk") return false;
-      // memory-side hit: re-fetch tags via store.getById (per-agent isolated).
-      const entry = deps.store.getById(h.memoryId);
-      if (!entry) return false;
-      return entry.tags.some((t) => wanted.has(t));
+      if (h.source !== "memory") return false;
+      return (h.tags ?? []).some((t) => wanted.has(t));
     });
     return { hits: Object.freeze(filtered), agentName: deps.agentName };
   }

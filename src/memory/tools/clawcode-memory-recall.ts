@@ -11,6 +11,10 @@
  * handle to another agent's store.
  *
  * Lookup order:
+ *   0. `shared:<id>` ids (memory overhaul 2026-10-25, WP5): the owner's
+ *      shared facts that `clawcode_memory_search` lists with that prefix,
+ *      read from the fleet SharedFactsStore and checked against THIS
+ *      agent's owner so another owner's fact can never be read.
  *   1. memories table (agent-saved memories via memory_save / consolidation)
  *   2. memory_chunks table (file-scanned MEMORY.md sections)
  *
@@ -21,6 +25,7 @@
 
 import { z } from "zod/v4";
 import type { MemoryStore } from "../store.js";
+import { SHARED_FACT_PATH, type SharedFactsStore } from "../shared-facts-store.js";
 
 export const RECALL_INPUT_SCHEMA = z.object({
   memoryId: z.string().min(1).max(200),
@@ -31,7 +36,19 @@ export type RecallInput = z.infer<typeof RECALL_INPUT_SCHEMA>;
 export interface RecallDeps {
   readonly store: MemoryStore;
   readonly agentName: string;
+  /**
+   * WP5 - owner facts, so a `shared:<id>` hit from search can be recalled.
+   * The owner comes from the agent's config (daemon side), never from the
+   * tool input. Absent on old daemons or agents without an owner.
+   */
+  readonly ownerFacts?: {
+    readonly store: Pick<SharedFactsStore, "get">;
+    readonly owner: string;
+  };
 }
+
+/** Id prefix `ownerFactsAsChunks` puts on shared facts. */
+export const SHARED_MEMORY_ID_PREFIX = "shared:";
 
 export interface RecallResult {
   readonly ok: boolean;
@@ -43,6 +60,14 @@ export interface RecallResult {
   readonly created_at?: string;
   readonly heading?: string | null;
   readonly path?: string;
+  /**
+   * WP5 - set when the recalled memory has been replaced or forgotten: the
+   * successor's id, or "forgotten". The content is still returned so the
+   * agent can see what it used to believe, but it should prefer the
+   * successor (recall it by this id).
+   */
+  readonly supersededBy?: string;
+  readonly supersededAt?: string;
   readonly error?: string;
 }
 
@@ -60,8 +85,37 @@ export async function clawcodeMemoryRecall(
   const parsed = RECALL_INPUT_SCHEMA.parse(input);
   const id = parsed.memoryId;
 
+  // 0. WP5 - owner facts. Search lists them as `shared:<id>`; before this
+  //    the agent was shown a hit it could not recall.
+  if (id.startsWith(SHARED_MEMORY_ID_PREFIX)) {
+    const factId = id.slice(SHARED_MEMORY_ID_PREFIX.length);
+    const fact = deps.ownerFacts && factId.length > 0 ? deps.ownerFacts.store.get(factId) : null;
+    if (fact && deps.ownerFacts && fact.owner === deps.ownerFacts.owner) {
+      return Object.freeze({
+        ok: true,
+        memoryId: id,
+        content: fact.content,
+        tags: fact.tags,
+        source: "owner-fact",
+        importance: fact.importance,
+        created_at: fact.createdAt,
+        heading: `Owner fact (shared by ${fact.sourceAgent})`,
+        path: SHARED_FACT_PATH,
+      });
+    }
+    return Object.freeze({
+      ok: false,
+      memoryId: id,
+      error: deps.ownerFacts
+        ? "owner fact not found for this agent's owner"
+        : "owner facts are not available to this agent (no owner configured)",
+    });
+  }
+
   // 1. Try memories table first. getById bumps access_count + accessed_at —
   //    that's intended (the agent recalled a memory; mark it as accessed).
+  //    A superseded row is still returned (the agent may hold its id from
+  //    an earlier turn) and flagged so the successor can be preferred.
   const mem = deps.store.getById(id);
   if (mem) {
     return Object.freeze({
@@ -72,11 +126,14 @@ export async function clawcodeMemoryRecall(
       source: mem.source,
       importance: mem.importance,
       created_at: mem.createdAt,
+      ...(mem.supersededBy ? { supersededBy: mem.supersededBy } : {}),
+      ...(mem.supersededAt ? { supersededAt: mem.supersededAt } : {}),
     });
   }
 
   // 2. Fall through to memory_chunks (file-scanned MEMORY.md sections).
   //    getMemoryChunk has no side effects — it's a read-only lookup.
+  //    WP5 - the file's mtime is the best available date for a chunk.
   const chunk = deps.store.getMemoryChunk(id);
   if (chunk) {
     return Object.freeze({
@@ -87,6 +144,9 @@ export async function clawcodeMemoryRecall(
       source: "memory_chunks",
       heading: chunk.heading,
       path: chunk.path,
+      ...(Number.isFinite(chunk.file_mtime_ms) && chunk.file_mtime_ms > 0
+        ? { created_at: new Date(chunk.file_mtime_ms).toISOString() }
+        : {}),
     });
   }
 
