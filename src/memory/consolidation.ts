@@ -75,6 +75,64 @@ function describeUnusableSummary(text: string): string {
 /** Maximum combined character length before truncation of daily logs. */
 const MAX_PROMPT_CHARS = 30000;
 
+/**
+ * A past ISO week is left alone for this long after it ends before its
+ * logs are digested, so a day's log that is still being appended around
+ * the week boundary (and any late-indexed file) is included. Two days.
+ */
+export const WEEKLY_CONSOLIDATION_GRACE_MS = 2 * 24 * 60 * 60 * 1000;
+
+/**
+ * Weekly eligibility. The week must have ended more than
+ * WEEKLY_CONSOLIDATION_GRACE_MS ago and hold at least
+ * `min(weeklyThreshold, daysWithLogs)` daily files.
+ *
+ * WHY: the default threshold is 7 and files are grouped per ISO week (at
+ * most 7), so an agent that does not log every single day never produced a
+ * weekly digest and never archived its logs; dated conversation then left
+ * automatic recall after the 14-day window with no digest to stand in for
+ * it. Taking the minimum means the threshold can never ask for more days
+ * than the week actually has, so a weekday-only agent consolidates once the
+ * week is two days behind it.
+ */
+export function isWeekEligibleForConsolidation(params: {
+  readonly daysWithLogs: number;
+  readonly weeklyThreshold: number;
+  readonly weekEnd: Date;
+  readonly now: Date;
+}): boolean {
+  if (params.daysWithLogs <= 0) return false;
+  const required = Math.min(params.weeklyThreshold, params.daysWithLogs);
+  if (params.daysWithLogs < required) return false;
+  return params.now.getTime() - params.weekEnd.getTime() > WEEKLY_CONSOLIDATION_GRACE_MS;
+}
+
+/**
+ * Cut a daily log to `maxChars` keeping the head and the tail. The old
+ * head-only slice silently dropped everything decided late in a busy day,
+ * and the monthly digest inherited the gap.
+ */
+export function truncateHeadAndTail(content: string, maxChars: number): string {
+  if (content.length <= maxChars) return content;
+  const marker = "\n\n[...middle of this day truncated due to length...]\n\n";
+  const budget = Math.max(0, maxChars - marker.length);
+  const headChars = Math.ceil(budget / 2);
+  const tailChars = budget - headChars;
+  const head = content.slice(0, headChars);
+  const tail = tailChars > 0 ? content.slice(content.length - tailChars) : "";
+  return head + marker + tail;
+}
+
+/** Path of the weekly digest file for an ISO week key such as `2026-W05`. */
+export function weeklyDigestPath(memoryDir: string, weekKey: string): string {
+  return join(memoryDir, "digests", `weekly-${weekKey}.md`);
+}
+
+/** Path of the monthly digest file for a month key such as `2026-01`. */
+export function monthlyDigestPath(memoryDir: string, monthKey: string): string {
+  return join(memoryDir, "digests", `monthly-${monthKey}.md`);
+}
+
 /** A group of daily log files belonging to the same ISO week. */
 export type WeekGroup = {
   readonly year: number;
@@ -164,7 +222,6 @@ export function detectUnconsolidatedWeeks(
   for (const [key, group] of groups) {
     // Skip the in-progress week (guard above) — its logs are still being written.
     if (key === currentWeekKey) continue;
-    if (group.files.length < threshold) continue;
 
     const digestFile = join(digestDir, `weekly-${key}.md`);
     if (existsSync(digestFile)) continue;
@@ -173,6 +230,19 @@ export function detectUnconsolidatedWeeks(
     const sampleDate = parseISO(group.files[0].replace(".md", ""));
     const weekStart = startOfISOWeek(sampleDate);
     const weekEnd = endOfISOWeek(sampleDate);
+
+    // Past week with fewer than `threshold` logs: eligible once it is two
+    // days behind us (see isWeekEligibleForConsolidation).
+    if (
+      !isWeekEligibleForConsolidation({
+        daysWithLogs: group.files.length,
+        weeklyThreshold: threshold,
+        weekEnd,
+        now,
+      })
+    ) {
+      continue;
+    }
 
     result.push(Object.freeze({
       year: group.year,
@@ -271,9 +341,8 @@ export function buildWeeklySummarizationPrompt(
     let content = log.content;
     if (needsTruncation) {
       const maxPerDay = Math.floor(MAX_PROMPT_CHARS / dailyLogs.length);
-      if (content.length > maxPerDay) {
-        content = content.slice(0, maxPerDay) + "\n\n[...truncated due to length]";
-      }
+      // Head and tail survive; only the middle of an over-long day is cut.
+      content = truncateHeadAndTail(content, maxPerDay);
     }
     sections.push(`### ${log.date}\n\n${content}`);
   }
@@ -633,6 +702,13 @@ export async function runConsolidation(
   );
 
   for (const weekGroup of weekGroups) {
+    const weekKey = `${weekGroup.year}-W${String(weekGroup.week).padStart(2, "0")}`;
+    // Set once writeWeeklyDigest returns (file + SQLite row both landed).
+    // A throw before that with the file on disk means the embed or insert
+    // failed after the markdown write: the file must go, or
+    // detectUnconsolidatedWeeks skips the week forever with no memories
+    // row and no archive.
+    let digestCommitted = false;
     try {
       // Read daily log content
       const dailyLogs = weekGroup.files.map((file) => {
@@ -654,6 +730,7 @@ export async function runConsolidation(
 
       // Write digest (markdown + SQLite)
       await writeWeeklyDigest(deps, weekGroup, llmContent);
+      digestCommitted = true;
       weeklyDigestsCreated += 1;
 
       // Archive daily logs AFTER successful digest write
@@ -662,7 +739,20 @@ export async function runConsolidation(
       filesArchived += count;
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Unknown error";
-      errors.push(`Weekly consolidation failed for ${weekGroup.year}-W${weekGroup.week}: ${msg}`);
+      let note = "";
+      if (!digestCommitted) {
+        const orphan = weeklyDigestPath(deps.memoryDir, weekKey);
+        if (existsSync(orphan)) {
+          try {
+            unlinkSync(orphan);
+            note = " (digest file removed; the week will be retried)";
+          } catch (unlinkErr) {
+            const umsg = unlinkErr instanceof Error ? unlinkErr.message : String(unlinkErr);
+            note = ` (digest file could not be removed: ${umsg})`;
+          }
+        }
+      }
+      errors.push(`Weekly consolidation failed for ${weekGroup.year}-W${weekGroup.week}: ${msg}${note}`);
     }
   }
 
@@ -673,6 +763,10 @@ export async function runConsolidation(
   );
 
   for (const monthGroup of monthGroups) {
+    const monthKey = `${monthGroup.year}-${String(monthGroup.month).padStart(2, "0")}`;
+    // Same rollback rule as the weekly loop: an orphan monthly file would
+    // block the month forever.
+    let digestCommitted = false;
     try {
       // Read weekly digest content
       const digestDir = join(deps.memoryDir, "digests");
@@ -689,13 +783,14 @@ export async function runConsolidation(
 
       if (isErrorSummary(llmContent)) {
         errors.push(
-          `Monthly consolidation skipped for ${monthGroup.year}-${String(monthGroup.month).padStart(2, "0")}: summarize returned no usable content — ${describeUnusableSummary(llmContent)}`,
+          `Monthly consolidation skipped for ${monthKey}: summarize returned no usable content — ${describeUnusableSummary(llmContent)}`,
         );
         continue;
       }
 
       // Write digest (markdown + SQLite)
       await writeMonthlyDigest(deps, monthGroup, llmContent);
+      digestCommitted = true;
       monthlyDigestsCreated += 1;
 
       // Archive weekly digests AFTER successful monthly digest write
@@ -704,7 +799,20 @@ export async function runConsolidation(
       filesArchived += count;
     } catch (error) {
       const msg = error instanceof Error ? error.message : "Unknown error";
-      errors.push(`Monthly consolidation failed for ${monthGroup.year}-${monthGroup.month}: ${msg}`);
+      let note = "";
+      if (!digestCommitted) {
+        const orphan = monthlyDigestPath(deps.memoryDir, monthKey);
+        if (existsSync(orphan)) {
+          try {
+            unlinkSync(orphan);
+            note = " (digest file removed; the month will be retried)";
+          } catch (unlinkErr) {
+            const umsg = unlinkErr instanceof Error ? unlinkErr.message : String(unlinkErr);
+            note = ` (digest file could not be removed: ${umsg})`;
+          }
+        }
+      }
+      errors.push(`Monthly consolidation failed for ${monthGroup.year}-${monthGroup.month}: ${msg}${note}`);
     }
   }
 

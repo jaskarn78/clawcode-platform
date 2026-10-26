@@ -187,3 +187,83 @@ export const writeDreamLog: WriteDreamLogFn = async ({
   await atomicWrite(finalPath, merged);
   return { logPath: finalPath, appended: true };
 };
+
+// ---------------------------------------------------------------------------
+// Reflection digest: the one dream output that is meant to be remembered.
+//
+// The dream log under `<tier1Dir>/dreams` is an operator artifact that the
+// scanner does not watch in the default layout, so the themed reflection
+// of every pass was orphaned. This writer appends it as a dated H2 section
+// to `<memoryDir>/digests/dream-YYYY-MM-DD.md`, inside the scanned memory
+// tree, so each reflection becomes a standing memory chunk (the scanner
+// chunks by H2 and writes the heading into the indexed text).
+// ---------------------------------------------------------------------------
+
+export type AppendDreamReflectionDigestFn = (params: {
+  readonly agentName: string;
+  /** The agent's dated-memory dir (`resolveMemoryRoots(cfg).memoryDir`). */
+  readonly memoryDir: string;
+  readonly timestamp: Date;
+  readonly model: string;
+  readonly reflection: string;
+}) => Promise<{ digestPath: string; appended: boolean } | null>;
+
+/**
+ * Render one reflection section. The heading carries the date, time, agent
+ * and model so the chunk is self-describing when it is retrieved on its
+ * own (contextual header written into the indexed text).
+ */
+export function renderDreamReflectionSection(params: {
+  readonly agentName: string;
+  readonly timestamp: Date;
+  readonly model: string;
+  readonly reflection: string;
+}): string {
+  const iso = params.timestamp.toISOString();
+  const date = iso.slice(0, 10);
+  const hhmm = iso.slice(11, 16);
+  return (
+    `## Dream reflection ${date} ${hhmm} UTC (${params.agentName}, model=${params.model})\n\n` +
+    `${params.reflection.trim()}\n`
+  );
+}
+
+/**
+ * Append the pass's themed reflection to the day's reflection digest.
+ * Returns null (and writes nothing) when the reflection is blank, which is
+ * the model's documented "nothing found" envelope.
+ */
+export const appendDreamReflectionDigest: AppendDreamReflectionDigestFn =
+  async ({ agentName, memoryDir, timestamp, model, reflection }) => {
+    if (reflection.trim().length === 0) return null;
+
+    const dateBucket = timestamp.toISOString().slice(0, 10);
+    const dir = `${memoryDir}/digests`;
+    const finalPath = `${dir}/dream-${dateBucket}.md`;
+
+    await mkdir(dir, { recursive: true });
+
+    let existingContent: string | null = null;
+    try {
+      existingContent = await readFile(finalPath, "utf8");
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT") throw err;
+    }
+
+    const section = renderDreamReflectionSection({
+      agentName,
+      timestamp,
+      model,
+      reflection,
+    });
+
+    if (existingContent === null) {
+      const header = `# Dream reflections: ${agentName}, ${dateBucket}\n\n`;
+      await atomicWrite(finalPath, header + section);
+      return { digestPath: finalPath, appended: false };
+    }
+
+    await atomicWrite(finalPath, existingContent.trimEnd() + "\n\n" + section);
+    return { digestPath: finalPath, appended: true };
+  };

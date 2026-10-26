@@ -202,6 +202,17 @@ describe("applyDreamResult — D-04 additive-only auto-applier", () => {
     expect(applyAutoLinks).toHaveBeenCalledTimes(1);
   });
 
+  it("A9: the caller's measured idle minutes reach the dream-log entry (0 only when none supplied)", async () => {
+    const writeDreamLog = vi.fn(async () => ({ logPath: "/tmp/dreams/x.md", appended: false }));
+    const withMinutes: ApplyDreamResultDeps = { ...buildDeps({ writeDreamLog }), idleMinutes: 42 };
+    await applyDreamResult("atlas", COMPLETED_OUTCOME, withMinutes);
+    expect(writeDreamLog.mock.calls[0]![0].entry.idleMinutes).toBe(42);
+
+    writeDreamLog.mockClear();
+    await applyDreamResult("atlas", COMPLETED_OUTCOME, buildDeps({ writeDreamLog }));
+    expect(writeDreamLog.mock.calls[0]![0].entry.idleMinutes).toBe(0);
+  });
+
   it("A8 (CRITICAL — MEMORY.md invariant): renderDreamLogSection surfaces promotions for operator review", () => {
     const md = renderDreamLogSection({
       timestamp: FIXED_NOW,

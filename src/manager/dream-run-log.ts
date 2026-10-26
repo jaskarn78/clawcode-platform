@@ -46,6 +46,12 @@ export interface DreamRunRow {
   /** Wikilinks persisted — present on "applied" rows only. */
   readonly wikilinks_added?: number;
   /**
+   * Model that served the pass (haiku | sonnet | opus), present whenever the
+   * pass completed. Lets an operator confirm `dream.model` / `--model` was
+   * honored instead of trusting the configured value.
+   */
+  readonly model?: string;
+  /**
    * Bounded (<=300 chars) diagnostic string on non-applied rows — the
    * pass/apply error surface (e.g. "parse-failed: ..."). NEVER model
    * output; truncated defensively at the writer.

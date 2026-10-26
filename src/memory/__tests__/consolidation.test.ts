@@ -16,6 +16,9 @@ import {
   archiveDailyLogs,
   archiveWeeklyDigests,
   runConsolidation,
+  truncateHeadAndTail,
+  isWeekEligibleForConsolidation,
+  WEEKLY_CONSOLIDATION_GRACE_MS,
 } from "../consolidation.js";
 import type { ConsolidationDeps, WeekGroup, MonthGroup } from "../consolidation.js";
 
@@ -148,15 +151,34 @@ describe("Consolidation Pipeline", () => {
       expect(weeks).toHaveLength(0);
     });
 
-    it("does not return groups below threshold", () => {
-      // Only 5 days in a week
+    // WP7 (2026-10-25): this case previously pinned "a week with fewer than
+    // `threshold` files is never returned". With the default threshold of 7
+    // that meant a weekday-only agent never produced a weekly digest and
+    // never archived its logs. A past week now needs only
+    // min(threshold, daysWithLogs) files once it ended more than two days ago.
+    it("returns a past week with fewer than threshold files once it ended more than 2 days ago", () => {
+      // Only 5 days (Mon to Fri) in ISO week 2 of 2026; week ends Sun Jan 11.
       const dates = [
         "2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08", "2026-01-09",
       ];
       createDailyLogs(tempDir, dates);
 
-      const weeks = detectUnconsolidatedWeeks(tempDir, 7);
-      expect(weeks).toHaveLength(0);
+      const now = new Date(2026, 0, 14, 12, 0, 0); // Wed Jan 14, 2.5 days after the week ended
+      const weeks = detectUnconsolidatedWeeks(tempDir, 7, now);
+      expect(weeks).toHaveLength(1);
+      expect(weeks[0].files).toHaveLength(5);
+    });
+
+    it("holds a past week back while it is within the 2-day grace window", () => {
+      const dates = [
+        "2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08", "2026-01-09",
+        "2026-01-10", "2026-01-11",
+      ];
+      createDailyLogs(tempDir, dates);
+
+      const now = new Date(2026, 0, 13, 12, 0, 0); // Tue Jan 13, 1.5 days after the week ended
+      expect(detectUnconsolidatedWeeks(tempDir, 7, now)).toHaveLength(0);
+      expect(detectUnconsolidatedWeeks(tempDir, 1, now)).toHaveLength(0);
     });
 
     it("handles ISO week year boundary correctly (Dec 29-31 can be week 1 of next year)", () => {
@@ -275,6 +297,53 @@ describe("Consolidation Pipeline", () => {
       expect(prompt.length).toBeLessThan(35000);
       // Should note truncation
       expect(prompt).toContain("truncat");
+    });
+
+    it("keeps the head and the tail of an over-long day (WP7)", () => {
+      const day = (n: number) =>
+        `MORNING-${n} ` + "x".repeat(20000) + ` EVENING-DECISION-${n}`;
+      const prompt = buildWeeklySummarizationPrompt([
+        { date: "2026-01-05", content: day(1) },
+        { date: "2026-01-06", content: day(2) },
+      ]);
+      expect(prompt.length).toBeLessThan(35000);
+      for (const n of [1, 2]) {
+        expect(prompt).toContain(`MORNING-${n}`);
+        expect(prompt).toContain(`EVENING-DECISION-${n}`);
+      }
+      expect(prompt).toContain("middle of this day truncated");
+    });
+  });
+
+  describe("truncateHeadAndTail (WP7)", () => {
+    it("returns short content unchanged", () => {
+      expect(truncateHeadAndTail("short", 100)).toBe("short");
+    });
+
+    it("keeps both ends inside the budget", () => {
+      const content = "HEAD" + "m".repeat(1000) + "TAIL";
+      const out = truncateHeadAndTail(content, 200);
+      expect(out.length).toBeLessThanOrEqual(200);
+      expect(out.startsWith("HEAD")).toBe(true);
+      expect(out.endsWith("TAIL")).toBe(true);
+      expect(out).toContain("truncated");
+    });
+  });
+
+  describe("isWeekEligibleForConsolidation (WP7)", () => {
+    const weekEnd = new Date(2026, 0, 11, 23, 59, 59, 999); // Sun Jan 11
+    const afterGrace = new Date(weekEnd.getTime() + WEEKLY_CONSOLIDATION_GRACE_MS + 1);
+    const insideGrace = new Date(weekEnd.getTime() + WEEKLY_CONSOLIDATION_GRACE_MS - 1);
+
+    it("needs only min(threshold, daysWithLogs) files once the grace window has passed", () => {
+      expect(isWeekEligibleForConsolidation({ daysWithLogs: 5, weeklyThreshold: 7, weekEnd, now: afterGrace })).toBe(true);
+      expect(isWeekEligibleForConsolidation({ daysWithLogs: 1, weeklyThreshold: 7, weekEnd, now: afterGrace })).toBe(true);
+      expect(isWeekEligibleForConsolidation({ daysWithLogs: 7, weeklyThreshold: 7, weekEnd, now: afterGrace })).toBe(true);
+    });
+
+    it("is never eligible inside the grace window or with no logs", () => {
+      expect(isWeekEligibleForConsolidation({ daysWithLogs: 7, weeklyThreshold: 7, weekEnd, now: insideGrace })).toBe(false);
+      expect(isWeekEligibleForConsolidation({ daysWithLogs: 0, weeklyThreshold: 1, weekEnd, now: afterGrace })).toBe(false);
     });
   });
 
@@ -563,6 +632,103 @@ describe("Consolidation Pipeline", () => {
       const files = readdirSync(digestDir);
       expect(files.filter((f) => f.startsWith("monthly-"))).toHaveLength(0);
 
+      deps.memoryStore.close();
+    });
+
+    it("digests a weekday-only week with the default threshold of 7 (WP7)", async () => {
+      const deps = createTestDeps(tempDir);
+      const dates = ["2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08", "2026-01-09"];
+      createDailyLogs(tempDir, dates);
+      for (const date of dates) {
+        deps.memoryStore.recordSessionLog({ date, filePath: join(tempDir, `${date}.md`), entryCount: 1 });
+      }
+      const config: ConsolidationConfig = {
+        enabled: true,
+        weeklyThreshold: 7,
+        monthlyThreshold: 4,
+        schedule: "0 3 * * *",
+      };
+      const result = await runConsolidation(deps, config);
+      expect(result.weeklyDigestsCreated).toBe(1);
+      expect(result.filesArchived).toBe(5);
+      expect(existsSync(join(tempDir, "digests", "weekly-2026-W02.md"))).toBe(true);
+      deps.memoryStore.close();
+    });
+
+    it("removes the digest file when the embed or insert fails, so the week is retried (WP7)", async () => {
+      const deps = createTestDeps(tempDir);
+      const dates = [
+        "2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08",
+        "2026-01-09", "2026-01-10", "2026-01-11",
+      ];
+      createDailyLogs(tempDir, dates);
+      for (const date of dates) {
+        deps.memoryStore.recordSessionLog({ date, filePath: join(tempDir, `${date}.md`), entryCount: 1 });
+      }
+      const config: ConsolidationConfig = {
+        enabled: true,
+        weeklyThreshold: 7,
+        monthlyThreshold: 4,
+        schedule: "0 3 * * *",
+      };
+      const digestPath = join(tempDir, "digests", "weekly-2026-W02.md");
+
+      // Embed fails after the markdown write.
+      (deps.embedder.embed as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("embedder down"));
+      const first = await runConsolidation(deps, config);
+      expect(first.weeklyDigestsCreated).toBe(0);
+      expect(first.errors[0]).toContain("embedder down");
+      expect(first.errors[0]).toContain("digest file removed");
+      expect(existsSync(digestPath)).toBe(false);
+      expect(deps.memoryStore.listRecent(10).filter((e) => e.source === "consolidation")).toHaveLength(0);
+      // Daily logs were not archived.
+      expect(existsSync(join(tempDir, "2026-01-05.md"))).toBe(true);
+
+      // Insert fails after the markdown write.
+      vi.spyOn(deps.memoryStore, "insert").mockImplementationOnce(() => {
+        throw new Error("db locked");
+      });
+      const second = await runConsolidation(deps, config);
+      expect(second.weeklyDigestsCreated).toBe(0);
+      expect(second.errors[0]).toContain("db locked");
+      expect(existsSync(digestPath)).toBe(false);
+
+      // Next run succeeds: file, row and archive all land.
+      const third = await runConsolidation(deps, config);
+      expect(third.weeklyDigestsCreated).toBe(1);
+      expect(third.errors).toHaveLength(0);
+      expect(existsSync(digestPath)).toBe(true);
+      expect(deps.memoryStore.listRecent(10).filter((e) => e.source === "consolidation")).toHaveLength(1);
+      expect(existsSync(join(tempDir, "archive", "2026", "2026-01-05.md"))).toBe(true);
+      deps.memoryStore.close();
+    });
+
+    it("removes an orphan monthly digest file when its insert fails (WP7)", async () => {
+      const deps = createTestDeps(tempDir);
+      const digestDir = join(tempDir, "digests");
+      mkdirSync(digestDir, { recursive: true });
+      for (const w of ["W02", "W03", "W04", "W05"]) {
+        writeFileSync(join(digestDir, `weekly-2026-${w}.md`), `# ${w}\n`);
+      }
+      const config: ConsolidationConfig = {
+        enabled: true,
+        weeklyThreshold: 7,
+        monthlyThreshold: 4,
+        schedule: "0 3 * * *",
+      };
+      vi.spyOn(deps.memoryStore, "insert").mockImplementationOnce(() => {
+        throw new Error("db locked");
+      });
+      const first = await runConsolidation(deps, config);
+      expect(first.monthlyDigestsCreated).toBe(0);
+      expect(first.errors[0]).toContain("digest file removed");
+      expect(existsSync(join(digestDir, "monthly-2026-01.md"))).toBe(false);
+      // Source weekly digests still in place for the retry.
+      expect(existsSync(join(digestDir, "weekly-2026-W02.md"))).toBe(true);
+
+      const second = await runConsolidation(deps, config);
+      expect(second.monthlyDigestsCreated).toBe(1);
+      expect(existsSync(join(digestDir, "monthly-2026-01.md"))).toBe(true);
       deps.memoryStore.close();
     });
 

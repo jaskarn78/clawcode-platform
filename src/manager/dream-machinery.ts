@@ -77,6 +77,91 @@ export function resolveDreamPolicy(
 export const LAST_TURN_SESSION_SCAN_LIMIT = 5;
 
 /**
+ * Novelty-gate floor: an idle agent dreams at most once per 6 hours when
+ * nothing new has been written, and never more often than the cron cadence
+ * when something has. Replaces the "every idle tick" behavior (50 to 80
+ * passes a day per idle agent on the live host).
+ */
+export const DREAM_PASS_FLOOR_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Rows scanned when looking for memory written after the last pass. The
+ * store orders both lists newest-first, so the first row that is not a
+ * dream artifact (chunks) or a periodic flush (memories) decides.
+ */
+export const NOVELTY_SCAN_LIMIT = 50;
+
+/**
+ * Tags on memories rows that are re-summaries of turns already captured
+ * (the 15-minute mid-session flush), not new information. They must not
+ * count as novelty or the gate never closes while a session is open.
+ */
+const NOVELTY_IGNORED_MEMORY_TAGS: ReadonlySet<string> = new Set(["mid-session"]);
+
+/**
+ * True for files the dream pass itself writes: the dream log under
+ * `dreams/` and the reflection digest under `digests/dream-*.md`. They are
+ * excluded from the novelty signal (a pass must not re-trigger itself) and
+ * from the pass's own "recent chunks" input (the reflection daemon should
+ * not reflect on its prior reflections).
+ */
+export function isDreamArtifactPath(path: string): boolean {
+  return (
+    /(^|\/)dreams\/\d{4}-\d{2}-\d{2}\.md$/.test(path) ||
+    /(^|\/)digests\/dream-\d{4}-\d{2}-\d{2}\.md$/.test(path)
+  );
+}
+
+/** Narrow store surface the novelty check reads (tests stub it). */
+export interface NoveltyStore {
+  listRecentMemoryChunks(
+    limit: number,
+  ): ReadonlyArray<{ readonly path: string; readonly lastModified: Date }>;
+  listRecent(
+    limit: number,
+  ): ReadonlyArray<{ readonly createdAt: string; readonly tags: readonly string[] }>;
+}
+
+/**
+ * Was any memory_chunks row (file mtime) or memories row (created_at)
+ * written after `sinceMs`? Dream artifacts and mid-session flush rows do
+ * not count. Fails open (true) on a store error so a hiccup can never
+ * silence dreaming.
+ */
+export function hasNewMemorySince(store: NoveltyStore, sinceMs: number): boolean {
+  try {
+    for (const c of store.listRecentMemoryChunks(NOVELTY_SCAN_LIMIT)) {
+      if (isDreamArtifactPath(c.path)) continue;
+      if (c.lastModified.getTime() > sinceMs) return true;
+      break; // newest-first: the first real chunk decides
+    }
+    for (const m of store.listRecent(NOVELTY_SCAN_LIMIT)) {
+      if (m.tags.some((t) => NOVELTY_IGNORED_MEMORY_TAGS.has(t))) continue;
+      const createdMs = Date.parse(m.createdAt);
+      if (Number.isNaN(createdMs)) continue;
+      if (createdMs > sinceMs) return true;
+      break;
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/** Result of the novelty gate; `reason` is operator-readable for the log. */
+export interface DreamNoveltyDecision {
+  readonly skip: boolean;
+  readonly reason:
+    | "no-prior-pass"
+    | "floor-elapsed"
+    | "no-memory-store"
+    | "new-memory"
+    | "no-new-memory";
+  /** ISO of the last applied pass, when known. */
+  readonly lastPassAt?: string;
+}
+
+/**
  * Subset of `SessionManager` the dream machinery touches. Narrow on
  * purpose so unit tests stand up a tiny fake instead of the full manager.
  */
@@ -102,6 +187,12 @@ export interface DreamMachineryDeps {
   /** Resolve the agent's memory root (memoryPath ?? workspace ?? ""). */
   readonly resolveMemoryRoot: (agent: string) => string;
   /**
+   * Resolve the agent's dated-memory dir (`resolveMemoryRoots(cfg).memoryDir`),
+   * where the reflection digest is written so the scanner indexes it.
+   * Omitted: `<memoryRoot>/memory`, which matches the default layout.
+   */
+  readonly resolveMemoryDir?: (agent: string) => string;
+  /**
    * One-shot LLM call for the dream-pass prompt. Production wires
    * `callHaikuDirect`; tests inject a stub. Mirrors the dispatch
    * contract the dream-pass primitive expects.
@@ -121,7 +212,8 @@ export interface DreamMachineryDeps {
   /**
    * Phase 999.113 WS-6 — optional dir override for the dream run-log
    * (test sandbox seam, mirroring the run-log module's own dirOverride).
-   * Production omits it → ~/.clawcode/manager/dream-runs.jsonl.
+   * Production omits it → ~/.clawcode/manager/dream-runs.jsonl. The
+   * last-pass record (dream-last-pass.json) lives in the same dir.
    */
   readonly dreamRunLogDir?: string;
   /**
@@ -156,8 +248,19 @@ export interface DreamMachinery {
     outcome: DreamPassOutcome,
     /** Phase 999.188 — D-10 Row 5; the cron passes it, the IPC path omits it. */
     isPriorityPass?: boolean,
+    /**
+     * Real idle minutes at fire time (the cron measures them). Omitted:
+     * derived from the agent's last turn so the dream log never says 0.
+     */
+    idleMinutes?: number,
   ) => Promise<DreamApplyOutcome>;
   readonly getLastTurnAt: (agent: string) => Date | null;
+  /**
+   * Novelty gate for the idle cron: skip when nothing was written since the
+   * last applied pass and that pass is less than DREAM_PASS_FLOOR_MS old.
+   * The manual `clawcode dream` path does not consult it (operator intent).
+   */
+  readonly noveltyGate: (agent: string) => Promise<DreamNoveltyDecision>;
 }
 
 /**
@@ -236,6 +339,42 @@ export function buildDreamMachinery(
   // timing attribution is slightly off — acceptable for a diagnostic log.
   const passStartedAt = new Map<string, { iso: string; ms: number }>();
 
+  // Last APPLIED pass per agent (ms). Loaded lazily from the manager-dir
+  // record so the floor survives a daemon restart; written on every
+  // applied pass.
+  const lastPassMs = new Map<string, number>();
+  const loadLastPassMs = async (agent: string): Promise<number | null> => {
+    const cached = lastPassMs.get(agent);
+    if (cached !== undefined) return cached;
+    const { readLastDreamPass } = await import("./dream-last-pass.js");
+    const iso = await readLastDreamPass(agent, deps.dreamRunLogDir);
+    if (iso === null) return null;
+    const ms = Date.parse(iso);
+    if (Number.isNaN(ms)) return null;
+    lastPassMs.set(agent, ms);
+    return ms;
+  };
+  const recordLastPass = async (agent: string, at: Date): Promise<void> => {
+    lastPassMs.set(agent, at.getTime());
+    const { writeLastDreamPass } = await import("./dream-last-pass.js");
+    await writeLastDreamPass(agent, at.toISOString(), deps.dreamRunLogDir);
+  };
+
+  const noveltyGate = async (agent: string): Promise<DreamNoveltyDecision> => {
+    const last = await loadLastPassMs(agent);
+    if (last === null) return { skip: false, reason: "no-prior-pass" };
+    const lastPassAt = new Date(last).toISOString();
+    if (now().getTime() - last >= DREAM_PASS_FLOOR_MS) {
+      return { skip: false, reason: "floor-elapsed", lastPassAt };
+    }
+    const store = manager.getMemoryStore(agent);
+    if (!store) return { skip: false, reason: "no-memory-store", lastPassAt };
+    if (hasNewMemorySince(store, last)) {
+      return { skip: false, reason: "new-memory", lastPassAt };
+    }
+    return { skip: true, reason: "no-new-memory", lastPassAt };
+  };
+
   const runDreamPass = async (
     agent: string,
     model: string,
@@ -261,7 +400,13 @@ export function buildDreamMachinery(
       getRecentChunks: async (_agent: string, limit: number) => {
         if (!memoryStore) return [];
         try {
-          return memoryStore.listRecentMemoryChunks(limit);
+          // Over-fetch and drop the pass's own artifacts (dream log,
+          // reflection digest) so the reflection daemon reads memory, not
+          // its previous reflections.
+          return memoryStore
+            .listRecentMemoryChunks(limit * 2)
+            .filter((c) => !isDreamArtifactPath(c.path))
+            .slice(0, limit);
         } catch (err) {
           log.warn(
             {
@@ -413,6 +558,8 @@ export function buildDreamMachinery(
           ...(wikilinksAdded !== undefined
             ? { wikilinks_added: wikilinksAdded }
             : {}),
+          // The model that served the pass (real, see dream-pass.ts).
+          ...(outcome.kind === "completed" ? { model: outcome.model } : {}),
           ...(reason !== undefined ? { reason } : {}),
         },
         deps.dreamRunLogDir,
@@ -430,17 +577,33 @@ export function buildDreamMachinery(
     }
   };
 
+  /**
+   * Real idle minutes for the dream log header. The cron measures them at
+   * fire time; the manual IPC path does not, so derive them from the
+   * agent's last turn (0 only when the agent never spoke).
+   */
+  const resolveIdleMinutes = (agent: string, supplied: number | undefined): number => {
+    if (supplied !== undefined) return Math.max(0, Math.floor(supplied));
+    const lastTurn = deriveLastTurnAt(agent, manager, log);
+    if (lastTurn === null) return 0;
+    return Math.max(0, Math.floor((now().getTime() - lastTurn.getTime()) / 60_000));
+  };
+
   const applyDreamResult = async (
     agent: string,
     outcome: DreamPassOutcome,
     isPriorityPass: boolean = false,
+    idleMinutesSupplied?: number,
   ): Promise<DreamApplyOutcome> => {
     const { applyDreamResult: applyDreamResultPrim, applyDreamResultD10 } = await import(
       "./dream-auto-apply.js"
     );
-    const { writeDreamLog } = await import("./dream-log-writer.js");
+    const { writeDreamLog, appendDreamReflectionDigest } = await import(
+      "./dream-log-writer.js"
+    );
     const { appendDreamWikilinks } = await import("./dream-graph-edges.js");
     const memoryRoot = resolveMemoryRoot(agent);
+    const idleMinutes = resolveIdleMinutes(agent, idleMinutesSupplied);
     const applyAutoLinks = async (_agent: string, links: ReadonlyArray<{ from: string; to: string }>) => {
       if (!memoryRoot) return { added: 0 };
       return appendDreamWikilinks({ memoryRoot, links, now });
@@ -475,6 +638,7 @@ export function buildDreamMachinery(
           autoApplyFloor: policy.autoApplyFloor,
           vetoWindowMs: policy.vetoWindowMs,
           postDiscordSummary: deps.postToAgent ? (text) => deps.postToAgent!(agent, text) : undefined,
+          idleMinutes,
         });
         applied =
           d10.kind === "applied"
@@ -496,6 +660,7 @@ export function buildDreamMachinery(
           memoryRoot,
           now,
           log,
+          idleMinutes,
         });
       }
     } catch (err) {
@@ -511,6 +676,37 @@ export function buildDreamMachinery(
       throw err;
     }
 
+    if (outcome.kind === "completed" && applied.kind === "applied") {
+      // The reflection is the one dream output meant to be remembered:
+      // append it under the scanned memory tree so it becomes a standing
+      // memory chunk. Best-effort; the apply result is unaffected.
+      const memoryDir = deps.resolveMemoryDir?.(agent) ?? (memoryRoot ? `${memoryRoot}/memory` : "");
+      if (memoryDir) {
+        try {
+          await appendDreamReflectionDigest({
+            agentName: agent,
+            memoryDir,
+            timestamp: now(),
+            model: outcome.model,
+            reflection: outcome.result.themedReflection,
+          });
+        } catch (err) {
+          log.warn(
+            {
+              component: "dream-machinery",
+              action: "reflection-digest-failed",
+              agent,
+              err: err instanceof Error ? err.message : String(err),
+            },
+            "dream-machinery: reflection digest write failed; dreaming unaffected",
+          );
+        }
+      }
+      // Recorded after the digest write so the digest's own chunk (file
+      // mtime) never counts as novelty for the next tick.
+      await recordLastPass(agent, now());
+    }
+
     await recordDreamRun(agent, outcome, applied, undefined);
     return applied;
   };
@@ -518,5 +714,5 @@ export function buildDreamMachinery(
   const getLastTurnAt = (agent: string): Date | null =>
     deriveLastTurnAt(agent, manager, log);
 
-  return { runDreamPass, applyDreamResult, getLastTurnAt };
+  return { runDreamPass, applyDreamResult, getLastTurnAt, noveltyGate };
 }

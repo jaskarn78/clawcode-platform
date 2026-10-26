@@ -32,6 +32,15 @@ export type AppendDreamWikilinksFn = (params: {
 
 const FILE_NAME = "graph-edges.json";
 
+/**
+ * Hard cap on persisted edges. The file is read back into the dream prompt
+ * on every pass (and is the first section the prompt builder degrades when
+ * over budget), so unbounded growth (680 KB on the live host) only feeds
+ * the model re-proposals of edges it can no longer see. Oldest edges are
+ * dropped first; the file is append-ordered so "oldest" is the head.
+ */
+export const MAX_GRAPH_EDGES = 2000;
+
 function edgeKey(from: string, to: string): string {
   return `${from} ${to}`;
 }
@@ -79,7 +88,18 @@ export const appendDreamWikilinks: AppendDreamWikilinksFn = async ({
     }
   }
 
-  const seen = new Set<string>(existing.map((e) => edgeKey(e.from, e.to)));
+  // Dedupe what is already on disk (earlier writers appended without this
+  // pass, so a file can carry repeats). First occurrence wins so the
+  // original createdAt survives.
+  const seen = new Set<string>();
+  const deduped: DreamGraphEdge[] = [];
+  for (const e of existing) {
+    const key = edgeKey(e.from, e.to);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(e);
+  }
+
   const createdAt = now().toISOString();
   const additions: DreamGraphEdge[] = [];
   for (const link of links) {
@@ -89,11 +109,15 @@ export const appendDreamWikilinks: AppendDreamWikilinksFn = async ({
     additions.push({ from: link.from, to: link.to, createdAt });
   }
 
-  if (additions.length === 0) return { added: 0 };
+  let edges: DreamGraphEdge[] = [...deduped, ...additions];
+  const overflow = edges.length - MAX_GRAPH_EDGES;
+  if (overflow > 0) edges = edges.slice(overflow);
 
-  const next: DreamGraphEdgesFile = {
-    edges: [...existing, ...additions],
-  };
+  const changed =
+    additions.length > 0 || deduped.length !== existing.length || overflow > 0;
+  if (!changed) return { added: 0 };
+
+  const next: DreamGraphEdgesFile = { edges };
   await atomicWrite(finalPath, JSON.stringify(next, null, 2) + "\n");
   return { added: additions.length };
 };

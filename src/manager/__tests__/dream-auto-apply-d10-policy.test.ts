@@ -591,6 +591,34 @@ describe("D-10 hybrid 5-row policy", () => {
     });
   });
 
+  describe("dream log entry — real idle minutes (WP7)", () => {
+    it("threads the caller's idleMinutes into the writeDreamLog entry", async () => {
+      const writeDreamLog = vi.fn().mockResolvedValue({ logPath: "/tmp/x/dreams/d.md", appended: false });
+      const vetoStore = {
+        scheduleAutoApply: vi.fn().mockResolvedValue(undefined),
+        vetoRun: vi.fn(),
+        tick: vi.fn(),
+        list: vi.fn(),
+      };
+      const result = await applyDreamResultD10({
+        agentName: "atlas",
+        outcome: makeOutcome(emptyResult()),
+        isPriorityPass: false,
+        memoryRoot: "/tmp/x",
+        log: noopLog,
+        vetoStore,
+        nanoid: () => "run-idle",
+        applyAutoLinks: vi.fn().mockResolvedValue({ added: 0 }),
+        now: () => FIXED_NOW,
+        writeDreamLog,
+        idleMinutes: 63,
+      });
+      expect(result.kind).toBe("applied");
+      expect(writeDreamLog).toHaveBeenCalledTimes(1);
+      expect(writeDreamLog.mock.calls[0]![0].entry.idleMinutes).toBe(63);
+    });
+  });
+
   describe("Row 1 — outcome.kind !== completed → skipped", () => {
     it("non-completed outcome short-circuits to skipped", async () => {
       const applyAutoLinks = vi.fn();

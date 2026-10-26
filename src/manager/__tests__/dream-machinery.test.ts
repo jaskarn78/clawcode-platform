@@ -275,3 +275,366 @@ describe("buildDreamMachinery — dream run-log rows (WS-6)", () => {
     expect(applied.kind).toBe("applied");
   });
 });
+
+/**
+ * WP7 (memory overhaul, 2026-10-25): novelty gate, last-pass record,
+ * reflection digest, real idle minutes, real model in the run log, and the
+ * dream pass not reading its own artifacts. The live host ran 50 to 80
+ * dream passes a day per idle agent; these pin the behavior that stops it.
+ */
+import { existsSync, readFileSync } from "node:fs";
+import {
+  DREAM_PASS_FLOOR_MS,
+  hasNewMemorySince,
+  isDreamArtifactPath,
+  type DreamMachineryDeps,
+} from "../dream-machinery.js";
+import { readLastDreamPass } from "../dream-last-pass.js";
+import type { MemoryStore } from "../../memory/store.js";
+
+describe("isDreamArtifactPath", () => {
+  it("matches the dream log and the reflection digest, nothing else", () => {
+    expect(isDreamArtifactPath("/w/memory/dreams/2026-10-25.md")).toBe(true);
+    expect(isDreamArtifactPath("/w/memory/memory/digests/dream-2026-10-25.md")).toBe(true);
+    expect(isDreamArtifactPath("digests/dream-2026-10-25.md")).toBe(true);
+    expect(isDreamArtifactPath("/w/memory/memory/digests/weekly-2026-W42.md")).toBe(false);
+    expect(isDreamArtifactPath("/w/memory/memory/2026-10-25.md")).toBe(false);
+    expect(isDreamArtifactPath("/w/memory/memory/2026-10-25-remember-ab12.md")).toBe(false);
+  });
+});
+
+describe("hasNewMemorySince", () => {
+  const since = Date.parse("2026-10-25T10:00:00.000Z");
+  const older = new Date(since - 60_000);
+  const newer = new Date(since + 60_000);
+
+  function store(opts: {
+    chunks?: ReadonlyArray<{ path: string; lastModified: Date }>;
+    memories?: ReadonlyArray<{ createdAt: string; tags: readonly string[] }>;
+    throws?: boolean;
+  }) {
+    return {
+      listRecentMemoryChunks: () => {
+        if (opts.throws) throw new Error("db closed");
+        return opts.chunks ?? [];
+      },
+      listRecent: () => opts.memories ?? [],
+    };
+  }
+
+  it("is false when nothing was written after the last pass", () => {
+    expect(
+      hasNewMemorySince(
+        store({
+          chunks: [{ path: "/m/2026-10-24.md", lastModified: older }],
+          memories: [{ createdAt: older.toISOString(), tags: [] }],
+        }),
+        since,
+      ),
+    ).toBe(false);
+  });
+
+  it("is true for a newer daily-log chunk", () => {
+    expect(
+      hasNewMemorySince(store({ chunks: [{ path: "/m/2026-10-25.md", lastModified: newer }] }), since),
+    ).toBe(true);
+  });
+
+  it("is true for a newer memories row", () => {
+    expect(
+      hasNewMemorySince(store({ memories: [{ createdAt: newer.toISOString(), tags: ["manual"] }] }), since),
+    ).toBe(true);
+  });
+
+  it("ignores the dream's own artifacts so a pass never re-triggers itself", () => {
+    expect(
+      hasNewMemorySince(
+        store({
+          chunks: [
+            { path: "/m/digests/dream-2026-10-25.md", lastModified: newer },
+            { path: "/m/dreams/2026-10-25.md", lastModified: newer },
+            { path: "/m/2026-10-24.md", lastModified: older },
+          ],
+        }),
+        since,
+      ),
+    ).toBe(false);
+  });
+
+  it("ignores mid-session flush rows (periodic re-summaries, not new information)", () => {
+    expect(
+      hasNewMemorySince(
+        store({
+          memories: [
+            { createdAt: newer.toISOString(), tags: ["mid-session", "session:s1", "flush:3"] },
+            { createdAt: older.toISOString(), tags: ["manual"] },
+          ],
+        }),
+        since,
+      ),
+    ).toBe(false);
+  });
+
+  it("fails open on a store error", () => {
+    expect(hasNewMemorySince(store({ throws: true }), since)).toBe(true);
+  });
+});
+
+describe("buildDreamMachinery — novelty gate, last-pass record, digest, idle minutes (WP7)", () => {
+  let tmpRoot: string;
+  let runLogDir: string;
+  let memoryRoot: string;
+  let memoryDir: string;
+  const T0 = new Date("2026-08-28T10:00:00.000Z");
+  let clock: Date;
+  const now = () => clock;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), "wp7-machinery-"));
+    runLogDir = join(tmpRoot, "runlog");
+    memoryRoot = join(tmpRoot, "tier1");
+    memoryDir = join(tmpRoot, "tier1", "memory");
+    clock = T0;
+  });
+
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  type StoreRows = {
+    chunks: Array<{ id: string; path: string; body: string; lastModified: Date }>;
+    memories: Array<{ createdAt: string; tags: string[] }>;
+  };
+
+  function makeDeps(
+    rows: StoreRows | null,
+    opts: {
+      lastTurnAt?: Date;
+      dispatch?: DreamMachineryDeps["dispatch"];
+      resolveMemoryDir?: (agent: string) => string;
+    } = {},
+  ): DreamMachineryDeps {
+    const memoryStore =
+      rows === null
+        ? undefined
+        : ({
+            listRecentMemoryChunks: (limit: number) => rows.chunks.slice(0, limit),
+            listRecent: (limit: number) => rows.memories.slice(0, limit),
+            getById: () => null,
+          } as unknown as MemoryStore);
+    const turns = opts.lastTurnAt ? [{ createdAt: opts.lastTurnAt.toISOString() }] : [];
+    const conversationStore = {
+      listRecentSessions: () => [{ id: "s1" }],
+      getTurnsForSession: () => turns,
+      listRecentTerminatedSessions: () => [],
+    };
+    return {
+      manager: {
+        getMemoryStore: () => memoryStore,
+        getConversationStore: () =>
+          conversationStore as unknown as ReturnType<DreamMachineryManager["getConversationStore"]>,
+      },
+      resolveMemoryRoot: () => memoryRoot,
+      resolveMemoryDir: opts.resolveMemoryDir,
+      dispatch:
+        opts.dispatch ??
+        (async () => {
+          throw new Error("dispatch must not be called");
+        }),
+      now,
+      log: makeLog(),
+      dreamRunLogDir: runLogDir,
+    };
+  }
+
+  function outcome(overrides: { reflection?: string; model?: string } = {}): DreamPassOutcome {
+    return {
+      kind: "completed",
+      result: {
+        newWikilinks: [],
+        promotionCandidates: [],
+        themedReflection: overrides.reflection ?? "The agent spent the day on deploy debugging.",
+        suggestedConsolidations: [],
+      },
+      durationMs: 100,
+      tokensIn: 10,
+      tokensOut: 20,
+      model: overrides.model ?? "haiku",
+    };
+  }
+
+  it("gate: an agent that never dreamt is not skipped", async () => {
+    const m = buildDreamMachinery(makeDeps({ chunks: [], memories: [] }));
+    expect(await m.noveltyGate("agent-a")).toEqual({ skip: false, reason: "no-prior-pass" });
+  });
+
+  it("gate: after an applied pass, skips until memory is written, then runs again", async () => {
+    const rows: StoreRows = {
+      chunks: [{ id: "c1", path: "/m/2026-08-27.md", body: "old", lastModified: new Date(T0.getTime() - 3_600_000) }],
+      memories: [{ createdAt: new Date(T0.getTime() - 3_600_000).toISOString(), tags: [] }],
+    };
+    const m = buildDreamMachinery(makeDeps(rows));
+    const applied = await m.applyDreamResult("agent-a", outcome());
+    expect(applied.kind).toBe("applied");
+
+    // Record landed in the manager dir (persists across daemon restarts).
+    expect(await readLastDreamPass("agent-a", runLogDir)).toBe(T0.toISOString());
+
+    // Next tick, nothing new: skip.
+    clock = new Date(T0.getTime() + 30 * 60_000);
+    expect(await m.noveltyGate("agent-a")).toEqual({
+      skip: true,
+      reason: "no-new-memory",
+      lastPassAt: T0.toISOString(),
+    });
+
+    // The digest the pass just wrote is indexed as a chunk: still skip.
+    rows.chunks.unshift({
+      id: "d1",
+      path: join(memoryDir, "digests", "dream-2026-08-28.md"),
+      body: "reflection",
+      lastModified: new Date(T0.getTime() + 1),
+    });
+    expect((await m.noveltyGate("agent-a")).skip).toBe(true);
+
+    // A mid-session flush row is not novelty either.
+    rows.memories.unshift({ createdAt: new Date(T0.getTime() + 60_000).toISOString(), tags: ["mid-session"] });
+    expect((await m.noveltyGate("agent-a")).skip).toBe(true);
+
+    // A real daily-log chunk written after the pass: run.
+    rows.chunks.unshift({ id: "c2", path: "/m/2026-08-28.md", body: "new", lastModified: new Date(T0.getTime() + 120_000) });
+    expect(await m.noveltyGate("agent-a")).toMatchObject({ skip: false, reason: "new-memory" });
+  });
+
+  it("gate: a saved memory row written after the pass counts as novelty", async () => {
+    const rows: StoreRows = { chunks: [], memories: [] };
+    const m = buildDreamMachinery(makeDeps(rows));
+    await m.applyDreamResult("agent-a", outcome());
+    clock = new Date(T0.getTime() + 30 * 60_000);
+    expect((await m.noveltyGate("agent-a")).skip).toBe(true);
+    rows.memories.unshift({ createdAt: new Date(T0.getTime() + 5_000).toISOString(), tags: ["manual"] });
+    expect(await m.noveltyGate("agent-a")).toMatchObject({ skip: false, reason: "new-memory" });
+  });
+
+  it("gate: the 6-hour floor lets an idle agent dream again without new memory", async () => {
+    const m = buildDreamMachinery(makeDeps({ chunks: [], memories: [] }));
+    await m.applyDreamResult("agent-a", outcome());
+    clock = new Date(T0.getTime() + DREAM_PASS_FLOOR_MS - 1);
+    expect((await m.noveltyGate("agent-a")).skip).toBe(true);
+    clock = new Date(T0.getTime() + DREAM_PASS_FLOOR_MS);
+    expect(await m.noveltyGate("agent-a")).toMatchObject({ skip: false, reason: "floor-elapsed" });
+  });
+
+  it("gate: survives a daemon restart through the manager-dir record", async () => {
+    const first = buildDreamMachinery(makeDeps({ chunks: [], memories: [] }));
+    await first.applyDreamResult("agent-a", outcome());
+    // Fresh machinery (new in-memory cache), same manager dir.
+    const second = buildDreamMachinery(makeDeps({ chunks: [], memories: [] }));
+    clock = new Date(T0.getTime() + 60 * 60_000);
+    expect(await second.noveltyGate("agent-a")).toEqual({
+      skip: true,
+      reason: "no-new-memory",
+      lastPassAt: T0.toISOString(),
+    });
+  });
+
+  it("gate: fails open when the agent has no memory store", async () => {
+    const m = buildDreamMachinery(makeDeps({ chunks: [], memories: [] }));
+    await m.applyDreamResult("agent-a", outcome());
+    const noStore = buildDreamMachinery(makeDeps(null));
+    clock = new Date(T0.getTime() + 60 * 60_000);
+    expect(await noStore.noveltyGate("agent-a")).toMatchObject({ skip: false, reason: "no-memory-store" });
+  });
+
+  it("gate: a failed or skipped pass does not count as a pass", async () => {
+    const m = buildDreamMachinery(makeDeps({ chunks: [], memories: [] }));
+    await m.applyDreamResult("agent-a", { kind: "failed", error: "parse-failed" });
+    await m.applyDreamResult("agent-a", { kind: "skipped", reason: "disabled" });
+    expect(await m.noveltyGate("agent-a")).toEqual({ skip: false, reason: "no-prior-pass" });
+    expect(await readLastDreamPass("agent-a", runLogDir)).toBeNull();
+  });
+
+  it("digest: the themed reflection of an applied pass lands under <memoryDir>/digests as a dated H2 section", async () => {
+    const m = buildDreamMachinery(makeDeps({ chunks: [], memories: [] }, { resolveMemoryDir: () => memoryDir }));
+    await m.applyDreamResult("agent-a", outcome({ reflection: "First reflection of the day." }));
+    const digestPath = join(memoryDir, "digests", "dream-2026-08-28.md");
+    expect(existsSync(digestPath)).toBe(true);
+    const content = readFileSync(digestPath, "utf8");
+    expect(content).toContain("# Dream reflections: agent-a, 2026-08-28");
+    expect(content).toContain("## Dream reflection 2026-08-28 10:00 UTC (agent-a, model=haiku)");
+    expect(content).toContain("First reflection of the day.");
+
+    clock = new Date(T0.getTime() + 4 * 3_600_000);
+    await m.applyDreamResult("agent-a", outcome({ reflection: "Second reflection.", model: "sonnet" }));
+    const after = readFileSync(digestPath, "utf8");
+    expect(after.match(/^# Dream reflections/gm)).toHaveLength(1);
+    expect(after).toContain("## Dream reflection 2026-08-28 14:00 UTC (agent-a, model=sonnet)");
+    expect(after).toContain("First reflection of the day.");
+    expect(after).toContain("Second reflection.");
+  });
+
+  it("digest: falls back to <memoryRoot>/memory when no resolver is wired, and skips a blank reflection", async () => {
+    const m = buildDreamMachinery(makeDeps({ chunks: [], memories: [] }));
+    await m.applyDreamResult("agent-a", outcome({ reflection: "   " }));
+    expect(existsSync(join(memoryRoot, "memory", "digests"))).toBe(false);
+    await m.applyDreamResult("agent-a", outcome({ reflection: "Something happened." }));
+    expect(existsSync(join(memoryRoot, "memory", "digests", "dream-2026-08-28.md"))).toBe(true);
+  });
+
+  it("idle minutes: the dream log header records minutes since the last turn when the caller supplies none", async () => {
+    const lastTurnAt = new Date(T0.getTime() - 90 * 60_000 - 30_000);
+    const m = buildDreamMachinery(makeDeps({ chunks: [], memories: [] }, { lastTurnAt }));
+    const applied = await m.applyDreamResult("agent-a", outcome());
+    expect(applied.kind).toBe("applied");
+    const log = readFileSync(join(memoryRoot, "dreams", "2026-08-28.md"), "utf8");
+    expect(log).toContain("Dream pass (idle 90min, model=haiku)");
+  });
+
+  it("idle minutes: a value measured by the cron tick wins over the derived one", async () => {
+    const lastTurnAt = new Date(T0.getTime() - 90 * 60_000);
+    const m = buildDreamMachinery(makeDeps({ chunks: [], memories: [] }, { lastTurnAt }));
+    await m.applyDreamResult("agent-a", outcome(), false, 47);
+    const log = readFileSync(join(memoryRoot, "dreams", "2026-08-28.md"), "utf8");
+    expect(log).toContain("Dream pass (idle 47min, model=haiku)");
+  });
+
+  it("run log: the applied row carries the model that served the pass", async () => {
+    const m = buildDreamMachinery(makeDeps({ chunks: [], memories: [] }));
+    await m.applyDreamResult("agent-a", outcome({ model: "sonnet" }));
+    const rows = await listRecentDreamRuns(10, runLogDir);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: "applied", model: "sonnet" });
+  });
+
+  it("runDreamPass: the pass does not read its own dream log or reflection digest as recent chunks", async () => {
+    const prompts: string[] = [];
+    const dispatch: DreamMachineryDeps["dispatch"] = async (req) => {
+      prompts.push(req.userPrompt);
+      return {
+        rawText: JSON.stringify({
+          newWikilinks: [],
+          promotionCandidates: [],
+          themedReflection: "",
+          suggestedConsolidations: [],
+        }),
+        tokensIn: 1,
+        tokensOut: 1,
+      };
+    };
+    const rows: StoreRows = {
+      chunks: [
+        { id: "d1", path: join(memoryDir, "digests", "dream-2026-08-27.md"), body: "PRIOR-REFLECTION", lastModified: T0 },
+        { id: "l1", path: join(memoryRoot, "dreams", "2026-08-27.md"), body: "PRIOR-DREAM-LOG", lastModified: T0 },
+        { id: "c1", path: join(memoryDir, "2026-08-27.md"), body: "REAL-DAILY-LOG", lastModified: T0 },
+      ],
+      memories: [],
+    };
+    const m = buildDreamMachinery(makeDeps(rows, { dispatch }));
+    const out = await m.runDreamPass("agent-a", "haiku");
+    expect(out.kind).toBe("completed");
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain("REAL-DAILY-LOG");
+    expect(prompts[0]).not.toContain("PRIOR-REFLECTION");
+    expect(prompts[0]).not.toContain("PRIOR-DREAM-LOG");
+  });
+});

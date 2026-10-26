@@ -93,6 +93,34 @@ describe("isAgentIdle — D-01 silence detector primitive", () => {
   });
 });
 
+describe("isAgentIdle — elapsedMinutes (real idle minutes for the dream log)", () => {
+  it("reports whole minutes since lastTurnAt on every reason except no-prior-turn", () => {
+    const thirtyFive = new Date(FIXED_NOW.getTime() - 35 * 60 * 1000 - 20 * 1000);
+    expect(isAgentIdle({ lastTurnAt: thirtyFive, idleMinutes: 30, now })).toMatchObject({
+      idle: true,
+      reason: "idle-threshold-met",
+      elapsedMinutes: 35,
+    });
+    const sevenHours = new Date(FIXED_NOW.getTime() - 7 * 60 * 60 * 1000);
+    expect(isAgentIdle({ lastTurnAt: sevenHours, idleMinutes: 30, now })).toMatchObject({
+      reason: "idle-ceiling-bypass",
+      elapsedMinutes: 420,
+    });
+    const twoMinutes = new Date(FIXED_NOW.getTime() - 2 * 60 * 1000);
+    expect(isAgentIdle({ lastTurnAt: twoMinutes, idleMinutes: 30, now })).toMatchObject({
+      idle: false,
+      reason: "active",
+      elapsedMinutes: 2,
+    });
+    expect(isAgentIdle({ lastTurnAt: null, idleMinutes: 30, now }).elapsedMinutes).toBeUndefined();
+  });
+
+  it("never reports negative minutes when lastTurnAt is in the future (clock skew)", () => {
+    const future = new Date(FIXED_NOW.getTime() + 60 * 1000);
+    expect(isAgentIdle({ lastTurnAt: future, idleMinutes: 30, now }).elapsedMinutes).toBe(0);
+  });
+});
+
 describe("findIdleAgents — fleet sweep filter (D-06)", () => {
   it("I6: filters disabled agents (dream.enabled=false → never returned even if idle)", () => {
     // Agent A: enabled, idle (35min elapsed, threshold 30) → should be returned

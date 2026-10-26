@@ -101,6 +101,11 @@ export interface ApplyDreamResultDeps {
   readonly memoryRoot: string;
   readonly now: () => Date;
   readonly log: DreamApplyLog;
+  /**
+   * Real idle minutes at fire time, measured by the caller (cron tick or
+   * the machinery from the agent's last turn). Omitted: logged as 0.
+   */
+  readonly idleMinutes?: number;
 }
 
 /**
@@ -132,7 +137,8 @@ export async function applyDreamResult(
   const timestamp = nowResult instanceof Date ? nowResult : new Date(nowResult);
   const entry = {
     timestamp,
-    idleMinutes: 0, // caller (cron tick) supplies actual; primitive doesn't recompute
+    // Measured by the caller; the primitive does not recompute it.
+    idleMinutes: deps.idleMinutes ?? 0,
     model: outcome.model,
     result: outcome.result,
     tokensIn: outcome.tokensIn,
@@ -327,6 +333,11 @@ export interface ApplyDreamD10Args {
   readonly autoApplyFloor?: number;
   /** Phase 999.188 — operator knob; default D10_VETO_WINDOW_MS. */
   readonly vetoWindowMs?: number;
+  /**
+   * Real idle minutes at fire time, measured by the caller. Omitted: the
+   * dream log header records 0.
+   */
+  readonly idleMinutes?: number;
 }
 
 /**
@@ -427,7 +438,7 @@ export async function applyDreamResultD10(
         memoryRoot: args.memoryRoot,
         entry: {
           timestamp: ts,
-          idleMinutes: 0,
+          idleMinutes: args.idleMinutes ?? 0,
           model: outcome.model,
           result: outcome.result,
           tokensIn: outcome.tokensIn,

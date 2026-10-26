@@ -16,6 +16,8 @@ import {
   detectCue,
   writeCueMemory,
   extractCueContext,
+  isRecallQuestion,
+  stripChannelEnvelope,
   MEMORY_CUE_REGEX,
 } from "../memory-cue.js";
 
@@ -72,6 +74,51 @@ describe("MEMORY_CUE_REGEX + detectCue (Phase 90 MEM-05)", () => {
     expect(MEMORY_CUE_REGEX.source).toContain("forget");
     expect(MEMORY_CUE_REGEX.source).toContain("save to memory");
     expect(MEMORY_CUE_REGEX.flags).toContain("i");
+  });
+});
+
+describe("detectCue — recall questions and the channel envelope (WP7)", () => {
+  const envelope = (body: string) =>
+    `<channel source="discord" chat_id="123" message_id="456" user="jas" ts="2026-10-25 09:00">\n${body}\n</channel>`;
+
+  it("does not fire on a question ending with ?", () => {
+    expect(detectCue("do you remember the deploy window?").match).toBe(false);
+    expect(detectCue("Remember this: the window is Friday. Did you get it?").match).toBe(false);
+  });
+
+  it("does not fire on 'do you' / 'did you' / 'can you remember' openers", () => {
+    expect(detectCue("Do you remember what I said about SGOV").match).toBe(false);
+    expect(detectCue("did you note the standing rule").match).toBe(false);
+    expect(detectCue("Can you remember the deadline for me").match).toBe(false);
+  });
+
+  it("still fires on an imperative cue", () => {
+    const r = detectCue("Remember this: the deploy window is Friday.");
+    expect(r.match).toBe(true);
+    expect(r.captured?.toLowerCase()).toContain("remember");
+  });
+
+  it("judges the body inside the Discord <channel> envelope, not the envelope", () => {
+    expect(detectCue(envelope("remember this: the deploy window is Friday")).match).toBe(true);
+    expect(detectCue(envelope("do you remember the deploy window?")).match).toBe(false);
+    // Envelope with a cue-free body: the attributes alone never match.
+    expect(detectCue(envelope("what time is it")).match).toBe(false);
+  });
+
+  it("isRecallQuestion and stripChannelEnvelope are exported helpers", () => {
+    expect(isRecallQuestion("did you save it")).toBe(true);
+    expect(isRecallQuestion("save it")).toBe(false);
+    expect(isRecallQuestion("")).toBe(false);
+    expect(stripChannelEnvelope(envelope("hello"))).toBe("hello");
+    expect(stripChannelEnvelope("<channel source=\"x\">dangling")).toBe("dangling");
+    expect(stripChannelEnvelope("plain text")).toBe("plain text");
+  });
+
+  it("extractCueContext never carries the envelope into the saved note", () => {
+    const ctx = extractCueContext(envelope("Setup done. Remember this: use Node 22 LTS. That is the stack."));
+    expect(ctx).toContain("Remember this: use Node 22 LTS.");
+    expect(ctx).not.toContain("<channel");
+    expect(ctx).not.toContain("message_id");
   });
 });
 

@@ -255,6 +255,133 @@ describe("registerDreamCron — D-06 per-agent cron timer", () => {
   });
 });
 
+describe("registerDreamCron — novelty gate and real idle minutes (WP7)", () => {
+  const completedOutcome: DreamPassOutcome = {
+    kind: "completed",
+    result: {
+      newWikilinks: [],
+      promotionCandidates: [],
+      themedReflection: "x",
+      suggestedConsolidations: [],
+    },
+    durationMs: 1,
+    tokensIn: 1,
+    tokensOut: 1,
+    model: "haiku",
+  };
+
+  it("skips the tick without running a pass when the gate reports no new memory", async () => {
+    const stub = makeStubCronFactory();
+    const runDreamPass = vi.fn(async () => completedOutcome);
+    const applyDreamResult = vi.fn();
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const noveltyGate = vi.fn(async () => ({
+      skip: true,
+      reason: "no-new-memory",
+      lastPassAt: "2026-04-25T09:00:00.000Z",
+    }));
+    const deps = buildDeps({
+      cronFactory: stub.factory,
+      runDreamPass,
+      applyDreamResult,
+      isAgentIdle: () => ({ idle: true, reason: "idle-threshold-met", elapsedMinutes: 60 }),
+      noveltyGate,
+      log,
+    });
+    registerDreamCron(deps);
+    await stub.crons[0]!.trigger();
+    expect(noveltyGate).toHaveBeenCalledWith("atlas");
+    expect(runDreamPass).not.toHaveBeenCalled();
+    expect(applyDreamResult).not.toHaveBeenCalled();
+    const skipLine = log.info.mock.calls.map((c) => String(c[0])).find((l) => l.includes("no-new-memory"));
+    expect(skipLine).toContain("2026-04-25T09:00:00.000Z");
+  });
+
+  it("runs the pass when the gate reports novelty, and is consulted only after the idle check", async () => {
+    const stub = makeStubCronFactory();
+    const runDreamPass = vi.fn(async () => completedOutcome);
+    const noveltyGate = vi.fn(async () => ({ skip: false, reason: "new-memory" }));
+    const deps = buildDeps({
+      cronFactory: stub.factory,
+      runDreamPass,
+      isAgentIdle: () => ({ idle: false, reason: "active" }),
+      noveltyGate,
+    });
+    registerDreamCron(deps);
+    await stub.crons[0]!.trigger();
+    expect(noveltyGate).not.toHaveBeenCalled();
+    expect(runDreamPass).not.toHaveBeenCalled();
+
+    const stub2 = makeStubCronFactory();
+    registerDreamCron(
+      buildDeps({
+        cronFactory: stub2.factory,
+        runDreamPass,
+        isAgentIdle: () => ({ idle: true, reason: "idle-threshold-met" }),
+        noveltyGate,
+      }),
+    );
+    await stub2.crons[0]!.trigger();
+    expect(noveltyGate).toHaveBeenCalledTimes(1);
+    expect(runDreamPass).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails open when the gate throws", async () => {
+    const stub = makeStubCronFactory();
+    const runDreamPass = vi.fn(async () => completedOutcome);
+    const deps = buildDeps({
+      cronFactory: stub.factory,
+      runDreamPass,
+      isAgentIdle: () => ({ idle: true, reason: "idle-threshold-met" }),
+      noveltyGate: async () => {
+        throw new Error("store closed");
+      },
+    });
+    registerDreamCron(deps);
+    await stub.crons[0]!.trigger();
+    expect(runDreamPass).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes the measured idle minutes to the priority-aware applier", async () => {
+    const stub = makeStubCronFactory();
+    const applyDreamResultPriority = vi.fn(
+      async (): Promise<DreamApplyOutcome> => ({
+        kind: "applied",
+        appliedWikilinkCount: 0,
+        surfacedPromotionCount: 0,
+        surfacedConsolidationCount: 0,
+        logPath: "/tmp/dreams/x.md",
+      }),
+    );
+    const deps = buildDeps({
+      cronFactory: stub.factory,
+      runDreamPass: vi.fn(async () => completedOutcome),
+      isAgentIdle: () => ({ idle: true, reason: "idle-threshold-met", elapsedMinutes: 47 }),
+      applyDreamResultPriority,
+    });
+    registerDreamCron(deps);
+    await stub.crons[0]!.trigger();
+    expect(applyDreamResultPriority).toHaveBeenCalledWith("atlas", completedOutcome, false, 47);
+  });
+
+  it("keeps the 3-argument applier call when the detector reports no minutes", async () => {
+    const stub = makeStubCronFactory();
+    const applyDreamResultPriority = vi.fn(
+      async (): Promise<DreamApplyOutcome> => ({ kind: "skipped", reason: "no-completed-result" }),
+    );
+    const deps = buildDeps({
+      cronFactory: stub.factory,
+      runDreamPass: vi.fn(async () => completedOutcome),
+      isAgentIdle: () => ({ idle: true, reason: "idle-threshold-met" }),
+      applyDreamResultPriority,
+    });
+    registerDreamCron(deps);
+    await stub.crons[0]!.trigger();
+    expect(applyDreamResultPriority).toHaveBeenCalledWith("atlas", completedOutcome, false);
+    expect(applyDreamResultPriority.mock.calls[0]).toHaveLength(3);
+  });
+});
+
 describe("registerDreamCron — INC-2026-06-04 regression (idleMinutes>59 invalid cron)", () => {
   it("clamps the cron check-cadence step to <=59 so idleMinutes>59 yields a VALID pattern", () => {
     const stub = makeStubCronFactory();

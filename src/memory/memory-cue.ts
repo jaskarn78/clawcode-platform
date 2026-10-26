@@ -51,13 +51,56 @@ export type CueDetection = Readonly<{
 }>;
 
 /**
+ * The Discord bridge wraps every user message in
+ * `<channel source="discord" chat_id=".." message_id=".." user=".." ts="..">
+ * ...body...</channel>` (bridge.ts formatDiscordMessage), sometimes followed
+ * by attachment metadata. The cue must be judged on the body alone, and the
+ * saved note must not carry the envelope.
+ */
+const CHANNEL_ENVELOPE_REGEX = /<channel\b[^>]*>([\s\S]*?)<\/channel>/i;
+const CHANNEL_TAG_REGEX = /<\/?channel\b[^>]*>/gi;
+
+/**
+ * Return the user-authored body of a turn: the inside of the first
+ * `<channel ...>...</channel>` envelope when one is present, otherwise the
+ * text with any stray channel tags removed. Trimmed.
+ */
+export function stripChannelEnvelope(text: string): string {
+  const m = CHANNEL_ENVELOPE_REGEX.exec(text);
+  if (m) return m[1].trim();
+  return text.replace(CHANNEL_TAG_REGEX, "").trim();
+}
+
+/**
+ * Recall questions ("do you remember X?", "did you note that?") contain the
+ * cue vocabulary but ask the agent to recall, not to save. Fired on, they
+ * wrote a "standing note" holding the question. A body that ends with `?`
+ * or opens with "do you" / "did you" / "can you remember" is a question.
+ */
+const RECALL_QUESTION_OPENERS = /^(do you|did you|can you remember)\b/i;
+
+export function isRecallQuestion(body: string): boolean {
+  const t = body.trim();
+  if (t.length === 0) return false;
+  if (t.endsWith("?")) return true;
+  return RECALL_QUESTION_OPENERS.test(t);
+}
+
+/**
  * Test the cue regex against arbitrary text (the user turn content, or
  * a subset like the last 500 chars). When the regex matches, `captured`
  * contains the matched substring (the cue phrase itself) for persistence
  * in the frontmatter.
+ *
+ * The text is reduced to its channel-envelope body first, and a recall
+ * question never matches (see isRecallQuestion).
  */
 export function detectCue(text: string): CueDetection {
-  const m = MEMORY_CUE_REGEX.exec(text);
+  const body = stripChannelEnvelope(text);
+  if (isRecallQuestion(body)) {
+    return Object.freeze({ match: false, captured: null });
+  }
+  const m = MEMORY_CUE_REGEX.exec(body);
   return Object.freeze({
     match: m !== null,
     captured: m?.[0] ?? null,
@@ -75,12 +118,14 @@ export function extractCueContext(
   fullText: string,
   maxSentences: number = 3,
 ): string {
+  // The saved note holds the user's words, never the channel envelope.
+  const body = stripChannelEnvelope(fullText);
   // Split on sentence-ending punctuation (period/question/exclamation) +
   // at least one whitespace char. `(?<=[.?!])` preserves the punctuation
   // on the preceding sentence.
-  const parts = fullText.split(/(?<=[.?!])\s+/);
+  const parts = body.split(/(?<=[.?!])\s+/);
   const idx = parts.findIndex((p) => MEMORY_CUE_REGEX.test(p));
-  if (idx === -1) return fullText.slice(0, 500);
+  if (idx === -1) return body.slice(0, 500);
   const start = Math.max(0, idx - 1);
   const slice = parts.slice(start, start + maxSentences).join(" ").trim();
   return slice;

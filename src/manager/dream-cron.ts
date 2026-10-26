@@ -169,7 +169,18 @@ export interface DreamCronDeps {
     agent: string,
     outcome: DreamPassOutcome,
     isPriorityPass: boolean,
+    /** Real idle minutes measured by this tick (for the dream log header). */
+    idleMinutes?: number,
   ) => Promise<DreamApplyOutcome>;
+  /**
+   * Novelty gate, consulted after the idle check. When it says skip, the
+   * tick logs one line and returns without running a pass (no run-log row,
+   * no dream log section, no channel post). Production wires the dream
+   * machinery's `noveltyGate`; omitted keeps the idle-only behavior.
+   */
+  readonly noveltyGate?: (
+    agent: string,
+  ) => Promise<{ readonly skip: boolean; readonly reason: string; readonly lastPassAt?: string }>;
 }
 
 export interface DreamCronRegistration {
@@ -251,16 +262,47 @@ export function registerDreamCron(deps: DreamCronDeps): DreamCronRegistration {
       );
       return;
     }
+    // Novelty gate: an idle agent re-dreamt on every tick with identical
+    // input. Skip unless something was written since the last applied
+    // pass (or the 6-hour floor elapsed). A gate failure fails open.
+    if (deps.noveltyGate) {
+      let gate: { skip: boolean; reason: string; lastPassAt?: string };
+      try {
+        gate = await deps.noveltyGate(deps.agentName);
+      } catch (err) {
+        gate = {
+          skip: false,
+          reason: `gate-error: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+      if (gate.skip) {
+        deps.log.info(
+          `[dream] skip: agent ${deps.agentName} has ${gate.reason}` +
+            (gate.lastPassAt ? ` since the last pass at ${gate.lastPassAt}` : ""),
+        );
+        return;
+      }
+    }
     try {
       const outcome = await deps.runDreamPass(deps.agentName);
       // Priority signal propagated to applier when wired; falls through
       // to legacy single-arg applier otherwise (Phase 95 D-04 unchanged).
+      // The measured idle minutes ride along when the detector supplied
+      // them (the 4th argument is only passed when present so legacy
+      // call-shape assertions keep holding).
       const applied = deps.applyDreamResultPriority
-        ? await deps.applyDreamResultPriority(
-            deps.agentName,
-            outcome,
-            isPriority,
-          )
+        ? idle.elapsedMinutes !== undefined
+          ? await deps.applyDreamResultPriority(
+              deps.agentName,
+              outcome,
+              isPriority,
+              idle.elapsedMinutes,
+            )
+          : await deps.applyDreamResultPriority(
+              deps.agentName,
+              outcome,
+              isPriority,
+            )
         : await deps.applyDreamResult(deps.agentName, outcome);
       deps.log.info(
         `[dream] ${deps.agentName} ${applied.kind} ` +

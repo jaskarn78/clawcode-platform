@@ -250,6 +250,24 @@ describe("runDreamPass — D-03 LLM-pass primitive (pure DI)", () => {
     }
   });
 
+  it("D3b: outcome.model is the model the dispatcher reports when it fell back (WP7)", async () => {
+    const dispatch = vi.fn().mockResolvedValue({
+      rawText: JSON.stringify(VALID_DREAM_RESULT),
+      tokensIn: 1,
+      tokensOut: 1,
+      model: "haiku",
+    } as DreamDispatchResponse);
+    const deps = buildDeps({
+      dispatch,
+      resolvedDreamConfig: { enabled: true, idleMinutes: 30, model: "opus" },
+    });
+    const outcome = await runDreamPass("clawdy", deps);
+    expect(outcome.kind).toBe("completed");
+    if (outcome.kind === "completed") expect(outcome.model).toBe("haiku");
+    // The request still asked for the configured model.
+    expect(dispatch.mock.calls[0]![0].model).toBe("opus");
+  });
+
   it("D4: malformed JSON in dispatch response → {kind:'failed', error contains 'dream-result-schema-validation-failed'} OR JSON parse error", async () => {
     const dispatch = vi.fn().mockResolvedValue({
       rawText: "this is not json",

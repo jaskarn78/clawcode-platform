@@ -144,6 +144,13 @@ export interface DreamDispatchResponse {
   readonly rawText: string;
   readonly tokensIn: number;
   readonly tokensOut: number;
+  /**
+   * The model that actually served the call, when the dispatcher knows it.
+   * The daemon dispatcher falls back to haiku for an alias it cannot route,
+   * and reports that here so the outcome (and so the dream log and run log)
+   * never claim a model that did not run. Absent: the requested model ran.
+   */
+  readonly model?: string;
 }
 
 export interface DreamPassLog {
@@ -340,7 +347,9 @@ export async function runDreamPass(
       durationMs,
       tokensIn: dispatchResp.tokensIn,
       tokensOut: dispatchResp.tokensOut,
-      model: deps.resolvedDreamConfig.model,
+      // Real model when the dispatcher reports one (it may have fallen
+      // back); otherwise the model that was requested.
+      model: dispatchResp.model ?? deps.resolvedDreamConfig.model,
     };
   } catch (err) {
     // TOOL-04 verbatim pass-through (Phase 85): keep the err.message

@@ -52,6 +52,12 @@ export interface IsAgentIdleDeps {
 export interface IsAgentIdleResult {
   readonly idle: boolean;
   readonly reason: IsAgentIdleReason;
+  /**
+   * Whole minutes since `lastTurnAt` (floored). Absent only for
+   * `no-prior-turn`. The cron threads it into the dream log header so the
+   * "idle Nmin" line records the real trigger instead of a constant 0.
+   */
+  readonly elapsedMinutes?: number;
 }
 
 /**
@@ -69,16 +75,17 @@ export function isAgentIdle(deps: IsAgentIdleDeps): IsAgentIdleResult {
     return { idle: false, reason: "no-prior-turn" };
   }
   const elapsedMs = deps.now().getTime() - deps.lastTurnAt.getTime();
+  const elapsedMinutes = Math.max(0, Math.floor(elapsedMs / 60_000));
   if (elapsedMs < IDLE_HARD_FLOOR_MS) {
-    return { idle: false, reason: "active" };
+    return { idle: false, reason: "active", elapsedMinutes };
   }
   if (elapsedMs > IDLE_HARD_CEILING_MS) {
-    return { idle: true, reason: "idle-ceiling-bypass" };
+    return { idle: true, reason: "idle-ceiling-bypass", elapsedMinutes };
   }
   if (elapsedMs > deps.idleMinutes * 60_000) {
-    return { idle: true, reason: "idle-threshold-met" };
+    return { idle: true, reason: "idle-threshold-met", elapsedMinutes };
   }
-  return { idle: false, reason: "active" };
+  return { idle: false, reason: "active", elapsedMinutes };
 }
 
 /**

@@ -24,6 +24,8 @@ import { join } from "node:path";
 import {
   writeDreamLog,
   renderDreamLogSection,
+  appendDreamReflectionDigest,
+  renderDreamReflectionSection,
   type DreamLogEntry,
 } from "../dream-log-writer.js";
 import type { DreamResult } from "../dream-pass.js";
@@ -247,5 +249,73 @@ describe("writeDreamLog — D-05 atomic markdown emission", () => {
     const content = await readFile(out.logPath, "utf8");
     expect(content).toContain("## [03:07 UTC]");
     expect(content).toContain("# Dream log — atlas — 2026-01-05");
+  });
+});
+
+describe("appendDreamReflectionDigest — reflections as standing memory (WP7)", () => {
+  it("creates <memoryDir>/digests/dream-<date>.md with a self-describing H2 section", async () => {
+    const memoryDir = join(await makeTmp(), "memory");
+    const out = await appendDreamReflectionDigest({
+      agentName: "atlas",
+      memoryDir,
+      timestamp: new Date("2026-04-25T03:07:42.000Z"),
+      model: "haiku",
+      reflection: "  Recent activity centered on cutover verification.  ",
+    });
+    expect(out).toEqual({ digestPath: `${memoryDir}/digests/dream-2026-04-25.md`, appended: false });
+    const content = await readFile(out!.digestPath, "utf8");
+    expect(content.startsWith("# Dream reflections: atlas, 2026-04-25\n\n")).toBe(true);
+    expect(content).toContain("## Dream reflection 2026-04-25 03:07 UTC (atlas, model=haiku)\n\nRecent activity centered on cutover verification.\n");
+    expect(content).not.toContain("  Recent activity");
+  });
+
+  it("appends a second section the same day and keeps the first", async () => {
+    const memoryDir = join(await makeTmp(), "memory");
+    await appendDreamReflectionDigest({
+      agentName: "atlas",
+      memoryDir,
+      timestamp: new Date("2026-04-25T03:07:42.000Z"),
+      model: "haiku",
+      reflection: "First.",
+    });
+    const out = await appendDreamReflectionDigest({
+      agentName: "atlas",
+      memoryDir,
+      timestamp: new Date("2026-04-25T15:30:00.000Z"),
+      model: "sonnet",
+      reflection: "Second.",
+    });
+    expect(out?.appended).toBe(true);
+    const content = await readFile(out!.digestPath, "utf8");
+    expect(content.match(/^# Dream reflections/gm)).toHaveLength(1);
+    expect(content.indexOf("03:07 UTC")).toBeLessThan(content.indexOf("15:30 UTC"));
+    expect(content).toContain("First.");
+    expect(content).toContain("Second.");
+    expect(content).toContain("model=sonnet");
+  });
+
+  it("writes nothing for a blank reflection (the model's empty envelope)", async () => {
+    const memoryDir = join(await makeTmp(), "memory");
+    const out = await appendDreamReflectionDigest({
+      agentName: "atlas",
+      memoryDir,
+      timestamp: new Date("2026-04-25T03:07:42.000Z"),
+      model: "haiku",
+      reflection: "\n  \n",
+    });
+    expect(out).toBeNull();
+    await expect(readFile(`${memoryDir}/digests/dream-2026-04-25.md`, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("renderDreamReflectionSection puts date, time, agent and model in the heading", () => {
+    const md = renderDreamReflectionSection({
+      agentName: "atlas",
+      timestamp: new Date("2026-01-05T03:07:42.000Z"),
+      model: "opus",
+      reflection: "Body.",
+    });
+    expect(md).toBe("## Dream reflection 2026-01-05 03:07 UTC (atlas, model=opus)\n\nBody.\n");
   });
 });

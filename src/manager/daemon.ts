@@ -3996,18 +3996,46 @@ export async function startDaemon(
         // Phase 999.187 — the ONE Tier 1 dir (same as the prompt + edit tool).
         return cfg ? resolveMemoryRoots(cfg).tier1Dir : "";
       },
+      // The dated-memory dir the scanner watches: the reflection digest
+      // (digests/dream-YYYY-MM-DD.md) is written there so it is indexed.
+      resolveMemoryDir: (agent: string) => {
+        const cfg = resolvedAgents.find((a) => a.name === agent);
+        return cfg ? resolveMemoryRoots(cfg).memoryDir : "";
+      },
       // dream-pass is a one-shot LLM call (no session context, no tools).
-      // callHaikuDirect honors the maxOutputTokens budget (dream-pass needs
+      // callModelDirect honors the maxOutputTokens budget (dream-pass needs
       // ~4096 for full JSON; haiku-direct's 2048 default truncates mid-
       // string → parse-failed). Site tag "dream-pass" for haiku-direct
       // telemetry attribution.
+      //
+      // The requested model (dream.model, or the CLI --model override) is
+      // passed through. Earlier this called callHaikuDirect, so every pass
+      // ran on Haiku while the dream log claimed the configured model. An
+      // alias outside haiku|sonnet|opus falls back to haiku and the
+      // response reports the model that really ran.
       dispatch: async (dispatchReq) => {
+        const requested = dispatchReq.model;
+        const model =
+          requested === "sonnet" || requested === "opus" || requested === "haiku"
+            ? requested
+            : "haiku";
+        if (model !== requested) {
+          log.warn(
+            { requested, model, component: "dream-pass" },
+            "dream-pass: unknown dream.model alias; falling back to haiku",
+          );
+        }
         try {
-          const text = await callHaikuDirect(
+          const text = await callModelDirect(
             dispatchReq.systemPrompt,
             dispatchReq.userPrompt,
+            model,
             { maxTokens: dispatchReq.maxOutputTokens },
             "dream-pass",
+          );
+          log.info(
+            { model, component: "dream-pass", chars: text.length },
+            "dream-pass: model call completed",
           );
           // Token counts unavailable from the direct call; approximate
           // via chars/4 (consistent with dream-prompt-builder's budget).
@@ -4016,7 +4044,7 @@ export async function startDaemon(
               4,
           );
           const outApprox = Math.ceil(text.length / 4);
-          return { rawText: text, tokensIn: inApprox, tokensOut: outApprox };
+          return { rawText: text, tokensIn: inApprox, tokensOut: outApprox, model };
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           throw new Error(`dream-dispatch-failed: ${msg}`);
@@ -13339,6 +13367,10 @@ export async function startDaemon(
           dreamMachinery.runDreamPass(agent, dreamCfg.model),
         applyDreamResult: (agent, outcome) =>
           dreamMachinery.applyDreamResult(agent, outcome),
+        // Novelty gate: skip the tick unless memory was written since the
+        // last applied pass (floor: one pass per 6 hours). Without it an
+        // idle agent dreamt on every tick with identical input.
+        noveltyGate: (agent: string) => dreamMachinery.noveltyGate(agent),
         // Raw idle-window primitive — DreamCronDeps.isAgentIdle expects
         // the (deps) → result signature; the cron builds IsAgentIdleDeps
         // internally from getLastTurnAt / idleMinutes / now.
@@ -13356,8 +13388,10 @@ export async function startDaemon(
           countTruncationEventsSince: (agent: string, sinceMs: number) =>
             manager.getTraceCollector(agent)?.countTruncationEventsSince(agent, sinceMs) ?? 0,
         },
-        applyDreamResultPriority: (agent, outcome, isPriorityPass) =>
-          dreamMachinery.applyDreamResult(agent, outcome, isPriorityPass),
+        // The tick's measured idle minutes ride along so the dream log
+        // header records the real trigger instead of "idle 0min".
+        applyDreamResultPriority: (agent, outcome, isPriorityPass, idleMinutes) =>
+          dreamMachinery.applyDreamResult(agent, outcome, isPriorityPass, idleMinutes),
       });
       if (registration.registered) {
         dreamCronRegistrations.push(registration);
