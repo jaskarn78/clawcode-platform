@@ -888,10 +888,25 @@ export class SessionManager {
     const retrievalResolver = this.documentIngestRetrievalResolver;
     // Quick-260521-437 — schema defaults; the single source of truth when
     // the resolver is unset OR returns undefined (config block absent).
+    // Memory overhaul WP2 (2026-10-25): the document-chunk cap default is 4
+    // (was 2). Two slots were too few once the cross-ingest mirror held
+    // thousands of chunks per agent; four still leaves most of a 5-slot
+    // block to conversational memory. The zod default in config/schema.ts
+    // (`documentIngest.retrieval.maxChunksPerRetrieval`) still says 2 and
+    // wins whenever the resolver is wired, so the schema default has to
+    // move in its own package for production to see 4.
     const RETRIEVAL_DEFAULT_RECENCY_BOOST_DAYS = 2;
-    const RETRIEVAL_DEFAULT_MAX_CHUNKS_PER_RETRIEVAL = 2;
+    const RETRIEVAL_DEFAULT_MAX_CHUNKS_PER_RETRIEVAL = 4;
     const MS_PER_DAY = 24 * 60 * 60 * 1000;
-    return async (query: string) => {
+    return async (rawQuery: string) => {
+      // WP2: retrieve on the user's words. On a Discord turn the dispatcher
+      // hands over the whole `<channel ...>` envelope; its tokens used to
+      // fill every FTS term slot and dilute the query vector. Imported
+      // lazily so this region needs no change to the file's import block
+      // (other overhaul packages edit that block in parallel); ESM caches
+      // the module after the first call.
+      const { stripChannelEnvelope } = await import("../shared/channel-envelope.js");
+      const query = stripChannelEnvelope(rawQuery);
       const rerankerCfg = rerankerResolver?.();
       // Re-resolve at call time for hot-reload semantics. When the agent
       // has no DocumentStore (e.g. fresh agent before any ingest) the
@@ -935,8 +950,11 @@ export class SessionManager {
         // space the agent's migration currently reads from.
         embed: (text: string) => store.embedQuery(embedder, text),
         topK,
+        // WP2: 14 days is now the half-life of the soft recency multiplier
+        // (timeWindowMode defaults to "soft"); nothing is dropped for age.
         timeWindowDays: 14,
         tokenBudget,
+        log: self.log,
         excludeTags,
         agent: agentName,
         reranker: rerankerCfg,

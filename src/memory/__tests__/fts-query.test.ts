@@ -22,4 +22,13 @@ describe("buildFtsMatchQuery", () => {
     const q = Array.from({ length: 30 }, (_, i) => `term${i}`).join(" ");
     expect(extractFtsTerms(q)).toHaveLength(12);
   });
+
+  it("WP2: a Discord envelope contributes no terms, only the user's words do", () => {
+    const wrapped =
+      '<channel source="discord" chat_id="000000000000000001" message_id="1433000000000000000" user="jas" ts="2026-10-25 09:14 PDT">\n' +
+      "is it safe to run the migration on staging?\n" +
+      "</channel>";
+    expect(extractFtsTerms(wrapped)).toEqual(["safe", "run", "migration", "staging"]);
+    expect(buildFtsMatchQuery(wrapped)).toBe('"safe" OR "run" OR "migration" OR "staging"');
+  });
 });

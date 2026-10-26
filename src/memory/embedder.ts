@@ -47,8 +47,14 @@ type FeatureExtractionPipeline = (
   options?: { pooling?: string; normalize?: boolean },
 ) => Promise<{ tolist(): number[][] }>;
 
-/** Maximum word count before truncation (model handles ~256 tokens). */
-const MAX_WORDS = 200;
+/**
+ * Maximum word count before truncation. MiniLM's limit is 256 tokens, so
+ * 200 words is the most it can see; WP2 (2026-10-25) sized chunk parts at
+ * 220 words (memory-chunks.ts) so a part is embedded almost whole here and
+ * fully by bge-small (BGE_SMALL_MAX_WORDS = 350). Exported for tests.
+ */
+export const MINILM_MAX_WORDS = 200;
+const MAX_WORDS = MINILM_MAX_WORDS;
 
 /** v1 model id — pinned for the dual-write transition. */
 export const V1_MINILM_MODEL_ID = "Xenova/all-MiniLM-L6-v2";

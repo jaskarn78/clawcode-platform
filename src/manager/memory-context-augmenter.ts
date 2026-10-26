@@ -23,7 +23,12 @@
 
 import type { Logger } from "pino";
 
-import type { MemoryRetrievalResult } from "../memory/memory-retrieval.js";
+import {
+  retrievalResultDate,
+  retrievalSourceKind,
+  type MemoryRetrievalResult,
+} from "../memory/memory-retrieval.js";
+import { stripChannelEnvelope } from "../shared/channel-envelope.js";
 
 /** Pre-turn hybrid-RRF retriever. Returns [] to opt out (fail-open). */
 export type MemoryRetriever = (
@@ -93,7 +98,12 @@ export class RetrievalCadenceGate {
     private readonly minCosine: number = TOPIC_SHIFT_MIN_COSINE,
   ) {}
 
-  async shouldRefresh(agentName: string, query: string): Promise<CadenceVerdict> {
+  async shouldRefresh(agentName: string, rawQuery: string): Promise<CadenceVerdict> {
+    // WP2 (2026-10-25): compare the user's words, not the Discord envelope.
+    // Every Discord query shares the same ~130-char `<channel ...>` prefix,
+    // which pulled every pair of queries toward the same vector and muted
+    // the topic-shift detection.
+    const query = stripChannelEnvelope(rawQuery);
     const st = this.state.get(agentName) ?? { turnCounter: 0, lastRetrievalTurn: 0 };
     st.turnCounter += 1;
     this.state.set(agentName, st);
@@ -126,14 +136,32 @@ export class RetrievalCadenceGate {
   }
 }
 
-/** Render the `<memory-context>` wrapper for a set of retrieved chunks. */
+/**
+ * WP2: the provenance suffix of a rendered heading, "(kind, YYYY-MM-DD)" or
+ * "(kind)" when no date is known. kind is memory / chunk / document /
+ * shared (memory-retrieval.ts MemorySourceKind).
+ */
+export function memoryContextProvenance(c: MemoryRetrievalResult): string {
+  const kind = retrievalSourceKind(c);
+  const iso = retrievalResultDate(c);
+  return iso ? `(${kind}, ${iso.slice(0, 10)})` : `(${kind})`;
+}
+
+/**
+ * Render the `<memory-context>` wrapper for a set of retrieved chunks.
+ *
+ * WP2 (2026-10-25): every heading carries its source kind and date,
+ * `### <heading or path> (<kind>, <YYYY-MM-DD>)`, so the model can tell a
+ * two-year-old memory from yesterday's note and a flush log from an
+ * operator document when two recollections disagree.
+ */
 export function renderMemoryContext(
   chunks: readonly MemoryRetrievalResult[],
 ): string {
   const rendered = chunks
     .map((c) => {
       const heading = c.heading ?? c.path;
-      return `### ${heading}\n${c.body}`;
+      return `### ${heading} ${memoryContextProvenance(c)}\n${c.body}`;
     })
     .join("\n\n");
   return `<memory-context source="hybrid-rrf" chunks="${chunks.length}">\n${rendered}\n</memory-context>\n\n`;
@@ -167,7 +195,9 @@ export class MemoryContextAugmenter {
    * Returns the message unchanged on any opt-out / error path.
    */
   async augment(agentName: string, message: string): Promise<string> {
-    const query = message.trim();
+    // WP2 (2026-10-25): retrieve on the user's words. The v3 chat path
+    // hands the whole formatted Discord message here, envelope included.
+    const query = stripChannelEnvelope(message);
     if (query.length === 0) return message;
     const verdict = await this.gate.shouldRefresh(agentName, query);
     if (!verdict.refresh) return message;

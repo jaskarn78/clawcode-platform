@@ -102,11 +102,14 @@ describe("memory-retrieval RRF (Phase 90 MEM-03)", () => {
       expect(results[0].body).toContain("SGOV");
     });
 
-    it("MEM-03-R3: time window excludes old dated files, keeps vault all-time", async () => {
+    // WP2 (2026-10-25): the 14-day window is a SOFT multiplier by default;
+    // this test now opts into the hard mode it was written for, and the
+    // sibling below covers the soft default.
+    it("MEM-03-R3: hard time window excludes old dated files, keeps vault all-time", async () => {
       const now = Date.now();
       const oldMtime = now - 30 * 86_400_000;
 
-      // Old dated file — should be filtered out
+      // Old dated file: dropped by the hard window
       store.insertMemoryChunk({
         path: "/ws/memory/2026-03-01-old.md",
         chunkIndex: 0,
@@ -118,7 +121,7 @@ describe("memory-retrieval RRF (Phase 90 MEM-03)", () => {
         fileSha256: "old",
         embedding: deterministicEmbedding(100),
       });
-      // Old vault file — should be kept
+      // Old vault file: kept regardless of age
       store.insertMemoryChunk({
         path: "/ws/memory/vault/rules.md",
         chunkIndex: 0,
@@ -135,13 +138,61 @@ describe("memory-retrieval RRF (Phase 90 MEM-03)", () => {
       const results = await retrieveMemoryChunks({
         query: "anything",
         store,
-        embed: async () => qEmb, // same embedding → both semantic-match
+        embed: async () => qEmb, // same embedding: both semantic-match
         topK: 10,
         timeWindowDays: 14,
+        timeWindowMode: "hard",
       });
       const paths = results.map((r) => r.path);
       expect(paths).toContain("/ws/memory/vault/rules.md");
       expect(paths).not.toContain("/ws/memory/2026-03-01-old.md");
+    });
+
+    it("MEM-03-R3b (WP2): soft window keeps the old dated file but ranks it below a fresh one", async () => {
+      const now = Date.now();
+      const sharedEmb = await testEmbed("anything");
+      store.insertMemoryChunk({
+        path: "/ws/memory/2026-03-01-old.md",
+        chunkIndex: 0,
+        heading: "Old",
+        body: "ancient dated note",
+        tokenCount: 10,
+        scoreWeight: 0,
+        fileMtimeMs: now - 30 * 86_400_000,
+        fileSha256: "old",
+        embedding: sharedEmb,
+      });
+      store.insertMemoryChunk({
+        path: "/ws/memory/2026-04-24-fresh.md",
+        chunkIndex: 0,
+        heading: "Fresh",
+        body: "fresh dated note",
+        tokenCount: 10,
+        scoreWeight: 0,
+        fileMtimeMs: now - 1 * 86_400_000,
+        fileSha256: "fresh",
+        embedding: sharedEmb,
+      });
+
+      const results = await retrieveMemoryChunks({
+        query: "anything",
+        store,
+        embed: async () => sharedEmb,
+        topK: 10,
+        timeWindowDays: 14,
+        now,
+      });
+      const paths = results.map((r) => r.path);
+      expect(paths[0]).toBe("/ws/memory/2026-04-24-fresh.md");
+      expect(paths).toContain("/ws/memory/2026-03-01-old.md");
+      const old = results.find((r) => r.heading === "Old")!;
+      const fresh = results.find((r) => r.heading === "Fresh")!;
+      // 30 days at a 14-day half-life is below the 0.35 floor; one day is
+      // ~0.95. The two rows tie on distance, so their RRF ranks differ by
+      // one step (61/62): the ratio sits just under 0.35 / 0.95.
+      const ratio = old.fusedScore / fresh.fusedScore;
+      expect(ratio).toBeGreaterThan(0.3);
+      expect(ratio).toBeLessThan(0.4);
     });
 
     it("MEM-03-R5: topK truncates results", async () => {

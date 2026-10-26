@@ -5,6 +5,7 @@ import {
   isBgeSmallReady,
   BGE_SMALL_DIM,
   BGE_SMALL_MODEL_ID,
+  BGE_SMALL_MAX_WORDS,
   _resetBgeSmallForTests,
 } from "../embedder-bge-small.js";
 
@@ -115,7 +116,9 @@ describe("embedder-bge-small (Phase 115 D-06)", () => {
     expect(result[0]).toBe(0.5);
   });
 
-  it("embedBgeSmall truncates 200+ word input to 200 words (matches MiniLM truncation discipline)", async () => {
+  // WP2 (2026-10-25): the cap rose from 200 to 350 words so a whole chunk
+  // part (220 words plus heading) is embedded; MiniLM stays at 200.
+  it("embedBgeSmall truncates 350+ word input to 350 words (BGE_SMALL_MAX_WORDS)", async () => {
     const { pipeline } = await import("@huggingface/transformers");
 
     let capturedText: string | undefined;
@@ -137,7 +140,8 @@ describe("embedder-bge-small (Phase 115 D-06)", () => {
 
     expect(capturedText).toBeDefined();
     const wordCount = capturedText!.split(/\s+/).length;
-    expect(wordCount).toBe(200);
+    expect(wordCount).toBe(350);
+    expect(BGE_SMALL_MAX_WORDS).toBe(350);
   });
 
   it("embedBgeSmall throws EmbeddingError when pipeline returns wrong dim", async () => {

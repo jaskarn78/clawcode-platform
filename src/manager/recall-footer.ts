@@ -14,7 +14,7 @@
  * point and appends the rendered text.
  */
 
-import type { MemoryRetrievalResult } from "../memory/memory-retrieval.js";
+import { retrievalResultDate, type MemoryRetrievalResult } from "../memory/memory-retrieval.js";
 
 export interface RecalledMemory {
   readonly id: string;
@@ -28,6 +28,8 @@ export interface RecalledNote {
   /** Basename of the file (MEMORY.md) or the document slug. */
   readonly path: string;
   readonly heading: string | null;
+  /** WP2: ISO file mtime (or document ingest time); absent when unknown. */
+  readonly date?: string;
 }
 
 export interface RecallRecord {
@@ -75,10 +77,16 @@ export function summarizeRecall(
           snippet: snippetOf(c.body),
         }),
       );
-    } else if (c.path.startsWith("document:")) {
-      documents.push(Object.freeze({ path: basename(c.path), heading: c.heading }));
     } else {
-      notes.push(Object.freeze({ path: basename(c.path), heading: c.heading }));
+      // WP2: notes and documents carry their file date too.
+      const date = retrievalResultDate(c);
+      const note = Object.freeze({
+        path: basename(c.path),
+        heading: c.heading,
+        ...(date ? { date } : {}),
+      });
+      if (c.path.startsWith("document:")) documents.push(note);
+      else notes.push(note);
     }
   }
   return Object.freeze({
@@ -100,10 +108,17 @@ function fmtDate(iso: string, now: number): string | null {
   });
 }
 
-/** "(Jun 12 to Aug 30)", "(Jun 12)", or "" when no memory carries a date. */
+/**
+ * "(Jun 12 to Aug 30)", "(Jun 12)", or "" when nothing carries a date.
+ * WP2: spans memories (created_at) AND notes / documents (file date).
+ */
 export function recallDateRange(record: RecallRecord, now: number = Date.now()): string {
-  const times = record.memories
-    .map((m) => (m.createdAt ? new Date(m.createdAt).getTime() : NaN))
+  const times = [
+    ...record.memories.map((m) => m.createdAt),
+    ...record.notes.map((n) => n.date),
+    ...record.documents.map((d) => d.date),
+  ]
+    .map((iso) => (iso ? new Date(iso).getTime() : NaN))
     .filter((t) => !Number.isNaN(t));
   if (times.length === 0) return "";
   const lo = fmtDate(new Date(Math.min(...times)).toISOString(), now);
@@ -117,12 +132,13 @@ const plural = (n: number, one: string, many: string): string => `${n} ${n === 1
 /** The one-line footer. Empty string when nothing was recalled. */
 export function recallFooterLine(record: RecallRecord, now: number = Date.now()): string {
   const parts: string[] = [];
-  if (record.memories.length > 0) {
-    parts.push(`${plural(record.memories.length, "memory", "memories")}${recallDateRange(record, now)}`);
-  }
+  if (record.memories.length > 0) parts.push(plural(record.memories.length, "memory", "memories"));
   if (record.notes.length > 0) parts.push(plural(record.notes.length, "note", "notes"));
   if (record.documents.length > 0) parts.push(plural(record.documents.length, "document", "documents"));
   if (parts.length === 0) return "";
+  // WP2: the date range covers everything recalled, so it closes the line.
+  const last = parts.length - 1;
+  parts[last] = `${parts[last]}${recallDateRange(record, now)}`;
   return `*— recalled ${parts.join(", ")}*`;
 }
 
@@ -134,7 +150,8 @@ export function recallVerboseBlock(record: RecallRecord, now: number = Date.now(
     lines.push(`• ${date ? `${date}: ` : ""}${m.snippet || m.id}`);
   }
   for (const n of [...record.notes, ...record.documents]) {
-    lines.push(`• ${n.path}${n.heading ? ` › ${n.heading}` : ""}`);
+    const date = n.date ? fmtDate(n.date, now) : null;
+    lines.push(`• ${date ? `${date}: ` : ""}${n.path}${n.heading ? ` › ${n.heading}` : ""}`);
   }
   const shown = lines.slice(0, VERBOSE_MAX_LINES);
   if (lines.length > VERBOSE_MAX_LINES) shown.push(`• … and ${lines.length - VERBOSE_MAX_LINES} more`);

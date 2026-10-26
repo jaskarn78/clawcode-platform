@@ -25,11 +25,13 @@ import { EmbeddingError } from "./errors.js";
  *   - normalize: true      — L2-normalize for cosine-similarity-as-dot
  *                            (sqlite-vec int8 distance_metric=cosine).
  *
- * Truncation discipline: 200-word soft cap matches MiniLM's existing
- * `MAX_WORDS = 200` discipline in embedder.ts so a v1→v2 dual-write
- * pair embeds the same input substring (otherwise dual-write would
- * compare tail-truncated v1 against full-text v2 and recall comparisons
- * would lie).
+ * Truncation discipline (memory overhaul WP2, 2026-10-25): 350-word soft
+ * cap. bge-small's context is 512 tokens, so 350 words (~470 tokens)
+ * covers a whole WP2 chunk part (220 words plus heading) with margin.
+ * MiniLM stays at 200 words in embedder.ts because its limit is 256
+ * tokens. The two caps therefore differ: a v1/v2 dual-write pair embeds
+ * the same text only while it is under 200 words, which every WP2 chunk
+ * part is; longer legacy chunks are embedded more completely by v2.
  */
 
 /**
@@ -51,8 +53,12 @@ export const BGE_SMALL_MODEL_ID = "BAAI/bge-small-en-v1.5";
 /** Phase 115 D-06 — native dim. Same as MiniLM (no MRL truncation needed). */
 export const BGE_SMALL_DIM = 384;
 
-/** Soft-truncation cap matching MiniLM's MAX_WORDS for dual-write parity. */
-const MAX_WORDS = 200;
+/**
+ * Soft-truncation cap in words. WP2: 350 (was 200). Exported so the chunker
+ * tests can assert a chunk part fits the embedding window.
+ */
+export const BGE_SMALL_MAX_WORDS = 350;
+const MAX_WORDS = BGE_SMALL_MAX_WORDS;
 
 /**
  * Singleton-style holder so warmup() is idempotent across the daemon
@@ -94,9 +100,8 @@ export async function warmupBgeSmall(): Promise<void> {
 
 /**
  * Embed `text` to a 384-dim Float32Array using bge-small-en-v1.5.
- * Auto-warms on first call. Truncates input to 200 words (MAX_WORDS) to
- * stay within the model's 512-token context and to match the v1 MiniLM
- * truncation discipline so dual-write pairs embed the same substring.
+ * Auto-warms on first call. Truncates input to BGE_SMALL_MAX_WORDS (350)
+ * words to stay within the model's 512-token context.
  *
  * Output is mean-pooled + L2-normalized — operator can directly feed
  * into sqlite-vec cosine-distance MATCH or dot-product downstream.

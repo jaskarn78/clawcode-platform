@@ -1,9 +1,13 @@
 /**
  * Phase 90 MEM-02 — pure chunker + path-weighter + time-window filter.
  *
- * Splits workspace memory/*.md content on H2 boundaries (## headings) with
- * a soft token cap (default 800, hard cap 1000). Files with only H1/body
- * become a single chunk. Empty / whitespace-only content → zero chunks.
+ * Splits workspace memory/*.md content on H2 boundaries (## headings).
+ * Memory overhaul WP2 (2026-10-25): a section longer than about 220 words
+ * is split into parts headed "<heading> (part n/N)" so every part fits the
+ * embedding window (MiniLM embeds 200 words, bge-small 350) and a fact in
+ * the last paragraph of a long section is still reachable by vector search.
+ * Files with only H1/body become a single chunk (or parts of one). Empty /
+ * whitespace-only content → zero chunks.
  *
  * Pure functions — no I/O, no mutation of inputs. DI-friendly for the
  * MemoryScanner (Plan 90-02 Task 1) and retrieval time-window gate
@@ -17,11 +21,22 @@
  */
 const TOKEN_PER_CHAR = 0.25;
 
+/** Rough words per token, used to turn the legacy token cap into a word cap. */
+const WORDS_PER_TOKEN = 0.75;
+
 /** Default soft cap per chunk. Exported for test visibility. */
 export const DEFAULT_MAX_TOKENS = 800;
 
 /** Hard cap ratio over soft — chunk is split if tokenCount > MAX_TOKENS * 1.25. */
 const HARD_CAP_RATIO = 1.25;
+
+/**
+ * WP2: a section (or headless file) longer than this many words is split
+ * into parts. 220 words sits under both embedders' truncation caps with
+ * room for the heading line the scanner prepends, so no indexed text is
+ * silently cut before embedding.
+ */
+export const DEFAULT_MAX_WORDS_PER_PART = 220;
 
 export type MemoryChunk = Readonly<{
   heading: string | null;
@@ -31,45 +46,65 @@ export type MemoryChunk = Readonly<{
   scoreWeight: number;
 }>;
 
+/** WP2: `"Heading (part 2/5)"` → `"Heading"`; other headings unchanged. */
+export function stripPartSuffix(heading: string | null): string | null {
+  if (heading === null) return null;
+  return heading.replace(/\s\(part \d+\/\d+\)$/, "");
+}
+
 /**
  * Split markdown content on H2 (##) boundaries. Content preceding the first
- * H2 is discarded (typically just the H1 title). Oversized sections get
- * further split on blank-line paragraphs to respect maxTokens.
+ * H2 is discarded (typically just the H1 title). Oversized sections are
+ * split into parts of at most `maxWordsPerPart` words on paragraph, then
+ * line, then sentence boundaries; every part keeps the section heading
+ * with a "(part n/N)" suffix.
  *
  * Phase 90 D-20 — H2 is the canonical boundary for memory/*.md. H3/H4 are
  * treated as body content within their parent H2.
+ *
+ * `maxTokens` is kept for signature compatibility: it still bounds a part
+ * (converted to words) when a caller passes a cap tighter than
+ * `maxWordsPerPart`.
  */
 export function chunkMarkdownByH2(
   content: string,
   maxTokens: number = DEFAULT_MAX_TOKENS,
+  maxWordsPerPart: number = DEFAULT_MAX_WORDS_PER_PART,
 ): readonly MemoryChunk[] {
+  const maxWords = Math.max(
+    1,
+    Math.min(maxWordsPerPart, Math.floor(maxTokens * HARD_CAP_RATIO * WORDS_PER_TOKEN)),
+  );
+  const chunks: MemoryChunk[] = [];
+
+  const emit = (heading: string | null, body: string): void => {
+    const parts = splitIntoParts(body, maxWords);
+    const total = parts.length;
+    parts.forEach((part, i) => {
+      const partHeading =
+        total === 1
+          ? heading
+          : heading === null
+            ? `(part ${i + 1}/${total})`
+            : `${heading} (part ${i + 1}/${total})`;
+      chunks.push({
+        heading: partHeading,
+        body: part,
+        tokenCount: Math.ceil(part.length * TOKEN_PER_CHAR),
+        scoreWeight: 0,
+      });
+    });
+  };
+
   // Two-pass: decide if any H2 boundaries exist. If so, all content before
   // the first H2 is discarded (typically the document's H1 title + preamble).
-  // If not, the entire content becomes one chunk with null heading.
+  // If not, the entire content becomes one chunk (or its parts) with null heading.
   const hasH2 = /^##\s+/m.test(content);
-  const chunks: MemoryChunk[] = [];
 
   if (!hasH2) {
     const trimmed = content.trim();
     if (trimmed.length === 0) return Object.freeze(chunks);
-    const tokenCount = Math.ceil(trimmed.length * TOKEN_PER_CHAR);
-    if (tokenCount > maxTokens * HARD_CAP_RATIO) {
-      for (const sub of splitByParagraphs(trimmed, maxTokens)) {
-        chunks.push({
-          heading: null,
-          body: sub,
-          tokenCount: Math.ceil(sub.length * TOKEN_PER_CHAR),
-          scoreWeight: 0,
-        });
-      }
-    } else {
-      chunks.push({
-        heading: null,
-        body: trimmed,
-        tokenCount,
-        scoreWeight: 0,
-      });
-    }
+    emit(null, trimmed);
     return Object.freeze(chunks);
   }
 
@@ -83,24 +118,7 @@ export function chunkMarkdownByH2(
     if (!seenFirstH2) return;
     const body = currentBody.join("\n").trim();
     if (body.length === 0) return;
-    const tokenCount = Math.ceil(body.length * TOKEN_PER_CHAR);
-    if (tokenCount > maxTokens * HARD_CAP_RATIO) {
-      for (const sub of splitByParagraphs(body, maxTokens)) {
-        chunks.push({
-          heading: currentHeading,
-          body: sub,
-          tokenCount: Math.ceil(sub.length * TOKEN_PER_CHAR),
-          scoreWeight: 0,
-        });
-      }
-    } else {
-      chunks.push({
-        heading: currentHeading,
-        body,
-        tokenCount,
-        scoreWeight: 0,
-      });
-    }
+    emit(currentHeading, body);
   };
 
   for (const line of lines) {
@@ -119,33 +137,83 @@ export function chunkMarkdownByH2(
   return Object.freeze(chunks);
 }
 
+function wordCount(text: string): number {
+  const t = text.trim();
+  return t.length === 0 ? 0 : t.split(/\s+/).length;
+}
+
 /**
- * Split long body text into sub-chunks on paragraph boundaries (blank lines),
- * packing paragraphs up to maxTokens each. Pure helper — no state, no I/O.
+ * WP2: split `text` into parts of at most `maxWords` words. Paragraphs
+ * (blank-line separated) are packed greedily; a paragraph that is itself
+ * too long is split on lines (bullet lists), then sentences, then as a last
+ * resort on fixed word windows. Pure helper, no state, no I/O.
  */
-function splitByParagraphs(text: string, maxTokens: number): readonly string[] {
+export function splitIntoParts(text: string, maxWords: number): readonly string[] {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return [];
+  if (wordCount(trimmed) <= maxWords) return [trimmed];
+  const units = trimmed
+    .split(/\n\n+/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0)
+    .flatMap((p) => (wordCount(p) > maxWords ? splitLongParagraph(p, maxWords) : [p]));
+  return pack(units, maxWords, "\n\n");
+}
+
+function splitLongParagraph(paragraph: string, maxWords: number): readonly string[] {
+  const lines = paragraph.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+  if (lines.length > 1) {
+    const units = lines.flatMap((l) => (wordCount(l) > maxWords ? splitLongLine(l, maxWords) : [l]));
+    return pack(units, maxWords, "\n");
+  }
+  return splitLongLine(paragraph, maxWords);
+}
+
+function splitLongLine(line: string, maxWords: number): readonly string[] {
+  const sentences = line.split(/(?<=[.!?])\s+/).filter((s) => s.length > 0);
+  const units = sentences.flatMap((s) => (wordCount(s) > maxWords ? windowWords(s, maxWords) : [s]));
+  return pack(units, maxWords, " ");
+}
+
+function windowWords(text: string, maxWords: number): readonly string[] {
+  const words = text.trim().split(/\s+/);
+  const out: string[] = [];
+  for (let i = 0; i < words.length; i += maxWords) {
+    out.push(words.slice(i, i + maxWords).join(" "));
+  }
+  return out;
+}
+
+/** Greedy packing of units into parts of at most `maxWords` words. */
+function pack(units: readonly string[], maxWords: number, joiner: string): readonly string[] {
   const parts: string[] = [];
   let buf = "";
-  for (const para of text.split(/\n\n+/)) {
-    const projected = (buf.length + para.length + 2) * TOKEN_PER_CHAR;
-    if (projected > maxTokens && buf.length > 0) {
-      parts.push(buf.trim());
+  let bufWords = 0;
+  for (const unit of units) {
+    const n = wordCount(unit);
+    if (bufWords > 0 && bufWords + n > maxWords) {
+      parts.push(buf);
       buf = "";
+      bufWords = 0;
     }
-    buf += (buf ? "\n\n" : "") + para;
+    buf = buf.length > 0 ? `${buf}${joiner}${unit}` : unit;
+    bufWords += n;
   }
-  if (buf.trim().length > 0) parts.push(buf.trim());
+  if (buf.trim().length > 0) parts.push(buf);
   return parts;
 }
 
 /**
- * Phase 90 D-19 — path-derived retrieval-ranking weight. Additive nudge to
- * the RRF fused score at hydration time (memory-retrieval.ts). Vault content
- * (standing rules) ranks higher; archive content (old session logs) ranks
- * lower. Dated files at the memory/ root default to neutral.
+ * Phase 90 D-19 — path-derived retrieval-ranking weight. Multiplies the RRF
+ * fused score at hydration time (memory-retrieval.ts: fused * (1 + weight),
+ * memory overhaul WP2). Vault content (standing rules) ranks a little
+ * higher; archive content (old session logs) a little lower. Dated files at
+ * the memory/ root default to neutral.
  *
- * Weights are small (±0.2) so they nudge, not dominate. RRF k=60 already
- * compresses the score range to roughly [0, 0.033] per ranker.
+ * Weights are small (±0.2) so they nudge, not dominate: the multiplier stays
+ * within [0.8, 1.2] of the relevance score. (Pre-WP2 they were ADDED to the
+ * RRF score, whose range is roughly [0, 0.033] per ranker, and therefore
+ * decided the order outright.)
  */
 export function scoreWeightForPath(absPath: string): number {
   if (absPath.includes("/memory/vault/")) return 0.2;
@@ -163,6 +231,10 @@ export function scoreWeightForPath(absPath: string): number {
  * Additionally, paths beginning with `document:` are exempted (Phase 101 U6
  * cross-ingest — documents survive the standard expiry because they're
  * operator-curated artifacts, not session notes). CF-1 fix.
+ *
+ * WP2: retrieval applies this only when called with `timeWindowMode:
+ * "hard"`; the default is a soft recency multiplier (see
+ * memory-retrieval.ts softRecencyFactor). Still exported and used.
  *
  * `now` defaulted to Date.now() for production; tests pass a fixed epoch to
  * make assertions deterministic.

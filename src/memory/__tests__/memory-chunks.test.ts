@@ -3,7 +3,12 @@ import {
   chunkMarkdownByH2,
   scoreWeightForPath,
   applyTimeWindowFilter,
+  splitIntoParts,
+  stripPartSuffix,
+  DEFAULT_MAX_WORDS_PER_PART,
 } from "../memory-chunks.js";
+import { BGE_SMALL_MAX_WORDS } from "../embedder-bge-small.js";
+import { MINILM_MAX_WORDS } from "../embedder.js";
 
 describe("memory-chunks (Phase 90 MEM-02)", () => {
   describe("chunkMarkdownByH2", () => {
@@ -40,6 +45,68 @@ describe("memory-chunks (Phase 90 MEM-02)", () => {
     it("MEM-02-CH4: empty content → zero chunks", () => {
       expect(chunkMarkdownByH2("")).toHaveLength(0);
       expect(chunkMarkdownByH2("   \n  ")).toHaveLength(0);
+    });
+
+    // WP2 (2026-10-25): long sections become parts that keep the heading.
+    it("WP2-CH5: a section longer than 220 words is split into parts headed '<heading> (part n/N)'", () => {
+      const para = (i: number) => `Paragraph ${i} ` + "filler ".repeat(70).trim() + ".";
+      const body = Array.from({ length: 10 }, (_, i) => para(i)).join("\n\n"); // ~720 words
+      const lastFact = "The loading dock override code is 4471.";
+      const chunks = chunkMarkdownByH2(`# Title\n\n## Long section\n\n${body}\n\n${lastFact}\n\n## Short\n\nOne line.`);
+      const parts = chunks.filter((c) => c.heading?.startsWith("Long section"));
+      expect(parts.length).toBeGreaterThanOrEqual(4);
+      parts.forEach((c, i) => {
+        expect(c.heading).toBe(`Long section (part ${i + 1}/${parts.length})`);
+        expect(c.body.split(/\s+/).length).toBeLessThanOrEqual(DEFAULT_MAX_WORDS_PER_PART);
+        expect(stripPartSuffix(c.heading)).toBe("Long section");
+      });
+      // The last paragraph lands in the last part, intact.
+      expect(parts[parts.length - 1]!.body).toContain(lastFact);
+      // The short section is untouched and keeps its plain heading.
+      expect(chunks[chunks.length - 1]).toMatchObject({ heading: "Short", body: "One line." });
+      // Chunks keep source order.
+      expect(chunks.map((c) => c.heading)).toEqual([...parts.map((p) => p.heading), "Short"]);
+    });
+
+    it("WP2-CH6: a part fits both embedding windows (heading + 220 words under the caps)", () => {
+      expect(DEFAULT_MAX_WORDS_PER_PART + 10).toBeLessThanOrEqual(BGE_SMALL_MAX_WORDS);
+      // MiniLM sees the first 200 words: most of a part, and all of a typical one.
+      expect(MINILM_MAX_WORDS).toBeLessThanOrEqual(DEFAULT_MAX_WORDS_PER_PART);
+      expect(MINILM_MAX_WORDS).toBeGreaterThanOrEqual(DEFAULT_MAX_WORDS_PER_PART * 0.9);
+    });
+
+    it("WP2-CH7: a 3,000-word single-paragraph section is split on sentences, nothing lost", () => {
+      const sentence = "Alpha beta gamma delta epsilon zeta eta theta iota kappa.";
+      const words = 3000;
+      const sentences = Math.ceil(words / 10);
+      const body = Array.from({ length: sentences }, () => sentence).join(" ") + " The final sentence names the Kestrel account.";
+      const chunks = chunkMarkdownByH2(`## Wall\n\n${body}`);
+      expect(chunks.length).toBeGreaterThanOrEqual(13);
+      for (const c of chunks) {
+        expect(c.heading).toMatch(/^Wall \(part \d+\/\d+\)$/);
+        expect(c.body.split(/\s+/).length).toBeLessThanOrEqual(DEFAULT_MAX_WORDS_PER_PART);
+      }
+      const rejoined = chunks.map((c) => c.body).join(" ");
+      expect(rejoined.split(/\s+/).length).toBe(body.split(/\s+/).length);
+      expect(chunks[chunks.length - 1]!.body).toContain("Kestrel account");
+    });
+
+    it("WP2-CH8: a headless file longer than the cap gets '(part n/N)' headings; a short one stays null", () => {
+      const long = Array.from({ length: 30 }, (_, i) => `Line ${i} ` + "word ".repeat(20)).join("\n");
+      const parts = chunkMarkdownByH2(`# Only a title\n\n${long}`);
+      expect(parts.length).toBeGreaterThan(1);
+      expect(parts[0]!.heading).toBe(`(part 1/${parts.length})`);
+      expect(chunkMarkdownByH2("# T\n\nshort body")[0]!.heading).toBeNull();
+    });
+
+    it("WP2-CH9: splitIntoParts packs paragraphs, then lines, then sentences, then word windows", () => {
+      expect(splitIntoParts("", 5)).toEqual([]);
+      expect(splitIntoParts("one two three", 5)).toEqual(["one two three"]);
+      expect(splitIntoParts("a b c\n\nd e f\n\ng h", 6)).toEqual(["a b c\n\nd e f", "g h"]);
+      // the bullet dash counts as a word: 4 + 4 > 6, then 4 + 2 fits
+      expect(splitIntoParts("- a b c\n- d e f\n- g", 6)).toEqual(["- a b c", "- d e f\n- g"]);
+      expect(splitIntoParts("One two three. Four five six. Seven.", 4)).toEqual(["One two three.", "Four five six. Seven."]);
+      expect(splitIntoParts("w1 w2 w3 w4 w5 w6 w7", 3)).toEqual(["w1 w2 w3", "w4 w5 w6", "w7"]);
     });
   });
 

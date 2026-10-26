@@ -1,71 +1,184 @@
 /**
- * Phase 90 MEM-03 — hybrid RRF memory retrieval.
+ * Phase 90 MEM-03, hybrid RRF memory retrieval.
  *
  * Pre-turn retrieval entry point called by TurnDispatcher's
- * dispatchStream hook. Combines two rankers:
- *   1. vec_memory_chunks cosine top-20 (semantic similarity).
- *   2. memory_chunks_fts BM25-ranked top-20 (lexical match).
+ * dispatchStream hook. Combines two rankers per surface:
+ *   1. vec_memory_chunks cosine top-K (semantic similarity).
+ *   2. memory_chunks_fts BM25-ranked top-K (lexical match).
+ * plus the same pair over the agent's saved memories (vec_memories and
+ * memories_fts).
  *
  * Ranks are fused via Reciprocal Rank Fusion (RRF) with k=60 per D-RRF
- * default. Path-derived score_weight (vault/procedures/archive per D-19)
- * is additively applied post-fusion so standing rules nudge ahead of
- * dated session notes at equal distance. The D-24 time-window filter
- * drops stale dated files before top-K truncation. Token-budget cap
- * (~2000 tokens, tunable) stops accumulation to stay under the mutable-
- * suffix budget.
+ * default. Memory overhaul WP2 (2026-10-25) changed the scoring around the
+ * fusion so that relevance decides and the priors only nudge:
+ *   - the path-derived score_weight (vault/procedures/archive per D-19) is
+ *     MULTIPLICATIVE: fused * (1 + weight), weight clamped to [-0.2, 0.2].
+ *     The old additive +0.2 was six times the largest possible RRF score,
+ *     so any vault chunk in the candidate set beat every relevant memory;
+ *   - each ranker over-fetches RETRIEVAL_FETCH_K (60) candidates instead of
+ *     20, and excluded memory tags are dropped BEFORE fusion (with one
+ *     larger refetch when the filter consumed most of a full fetch), so
+ *     flush rows no longer fill the candidate window;
+ *   - the D-24 14-day window is a SOFT recency multiplier by default
+ *     (0.5 ** (ageDays / windowDays), floor 0.35) on dated chunks;
+ *     standing paths (vault, procedures, digests, cue files, documents) are
+ *     untouched. `timeWindowMode: "hard"` restores the old drop filter;
+ *   - a query-embedding failure logs once and continues with the keyword
+ *     rankers only instead of throwing away keyword recall;
+ *   - the token-budget loop skips an oversize candidate and keeps filling
+ *     instead of stopping at it (the first candidate is always emitted);
+ *   - every result carries `sourceKind` and a date (`createdAt` for memories
+ *     and shared facts, `fileMtimeMs` for chunks) so the rendered block and
+ *     the recall footer can show provenance.
  *
- * Pure module: no side-effects, no ambient state. Store + embed are DI'd
- * so the retrieval path is fully testable without a daemon. Callers
- * (SessionManager.getMemoryRetrieverForAgent) curry per-agent store/embed.
+ * Pure module: no side-effects beyond diagnostics, no ambient state. Store +
+ * embed are DI'd so the retrieval path is fully testable without a daemon.
+ * Callers (SessionManager.getMemoryRetrieverForAgent) curry per-agent
+ * store/embed.
  */
 
 import type { MemoryStore } from "./store.js";
-import { applyTimeWindowFilter } from "./memory-chunks.js";
+import { applyTimeWindowFilter, isStandingMemoryPath } from "./memory-chunks.js";
 import { calculateRelevanceScore } from "./decay.js";
 import { distanceToSimilarity, type ScoringConfig } from "./relevance.js";
 import type { QueryVector } from "./embedding-version.js";
 import { rerankTop, type RerankFn, type RerankerLogger } from "./reranker.js";
+import { stripChannelEnvelope } from "../shared/channel-envelope.js";
 
 /**
  * Query embedder. A bare Float32Array is a v1 (MiniLM) query; a tagged
- * `QueryVector` selects the space (Phase 999.119 v2 switch — use
+ * `QueryVector` selects the space (Phase 999.119 v2 switch, use
  * `store.embedQuery(embedder, text)` to follow the agent's read version).
  */
 export type EmbedFn = (text: string) => Promise<Float32Array | QueryVector>;
+
+/**
+ * WP2 provenance: where a retrieved item came from.
+ *   memory   = the agent's own saved memories (memory_save)
+ *   chunk    = a file-scanner chunk (MEMORY.md sections, daily logs, vault)
+ *   document = a cross-ingested document or image chunk (`document:<slug>`)
+ *   shared   = an owner fact from the fleet shared-facts store
+ */
+export type MemorySourceKind = "memory" | "chunk" | "document" | "shared";
 
 export type MemoryRetrievalResult = Readonly<{
   chunkId: string;
   path: string;
   heading: string | null;
   body: string;
-  /** Fused RRF score + path-derived weight (higher = better). */
+  /**
+   * Ranking score (higher = better): the RRF fused score times
+   * (1 + scoreWeight), times the soft recency factor for dated chunks.
+   */
   fusedScore: number;
-  /** Path-derived nudge (vault +0.2, procedures +0.1, archive -0.2, else 0). */
+  /** Path-derived nudge clamped to [-0.2, 0.2] (vault +0.2, procedures +0.1, archive -0.2, else 0). */
   scoreWeight: number;
   /**
-   * Phase 100-fu — surface the result originated from. "chunk" = file-scanner
-   * memory_chunks (MEMORY.md sections). "memory" = the agent's own saved
-   * memories (memory_save). Additive field — pre-existing callers that
-   * don't read it stay unaffected. The wrapper rendering in
-   * turn-dispatcher.augmentWithMemoryContext uses {heading,path,body} only,
-   * so memory-sourced results render cleanly via path="memory:<id>" and
-   * heading=null fallback.
+   * Phase 100-fu: coarse surface the result originated from. "chunk" =
+   * file-scanner memory_chunks. "memory" = the agent's own saved memories
+   * (memory_save). Kept for every pre-existing caller; `sourceKind` is the
+   * finer WP2 label.
    */
   source: "chunk" | "memory";
   /**
-   * Phase 999.124 — ISO `created_at` of a memory-sourced result, for the
-   * recall footer's date range. Absent for chunk-sourced results.
+   * WP2: memory / chunk / document / shared. Optional in the type so
+   * pre-existing literal builders (shared facts) keep compiling; every
+   * result emitted by retrieveMemoryChunks sets it. Use
+   * `retrievalSourceKind` to read it with the path-based fallback.
+   */
+  sourceKind?: MemorySourceKind;
+  /**
+   * Phase 999.124: ISO `created_at` of a memory-sourced result (or a shared
+   * fact), for the rendered heading and the recall footer's date range.
    */
   createdAt?: string;
+  /**
+   * WP2: epoch ms mtime of the file behind a chunk-sourced result (the
+   * ingest time for a document chunk). `retrievalResultDate` turns either
+   * field into one ISO date.
+   */
+  fileMtimeMs?: number;
 }>;
 
 /**
- * Phase 90 D-RRF — RRF fusion constant. 60 is the Cormack/Clarke
- * canonical value used in most RRF implementations; it compresses the
- * score range enough that small additive weights (scoreWeight ≤ 0.2)
- * act as tiebreakers rather than dominators.
+ * Phase 90 D-RRF, RRF fusion constant. 60 is the Cormack/Clarke canonical
+ * value used in most RRF implementations; it compresses the score range to
+ * roughly [0, 0.033] per ranker, which is why the path weights have to be
+ * multiplicative (see MAX_PATH_SCORE_WEIGHT).
  */
 export const RRF_K = 60;
+
+/**
+ * WP2: candidates fetched from EACH ranker before fusion. Was 20, which the
+ * 14-day window then thinned after the fact: the 20 nearest chunks filled
+ * up with out-of-window rows and the in-window ones at rank 21+ were never
+ * fetched. 60 per ranker keeps hydration cheap (a primary-key read each)
+ * while leaving room for the filters that run before ranking.
+ */
+export const RETRIEVAL_FETCH_K = 60;
+
+/**
+ * WP2: when the excluded-tag filter removes more than two thirds of a FULL
+ * memories-side fetch, that ranker is fetched once more at this multiple of
+ * RETRIEVAL_FETCH_K so a flood of flush rows cannot hide the saved memory
+ * behind them. One retry, bounded; the durable fix is a tag predicate in
+ * the store's SQL (store.ts is owned by another package).
+ */
+const MEMORY_REFETCH_MULTIPLIER = 10;
+
+/** WP2: |scoreWeight| never exceeds this; the multiplier stays in [0.8, 1.2]. */
+export const MAX_PATH_SCORE_WEIGHT = 0.2;
+
+/**
+ * WP2: lowest soft recency multiplier for a dated chunk. An old daily log
+ * is still reachable when it is the only relevant note, but at a third of
+ * the weight of a fresh one.
+ */
+export const SOFT_WINDOW_FLOOR = 0.35;
+
+/** Clamp a stored path weight to [-MAX_PATH_SCORE_WEIGHT, MAX_PATH_SCORE_WEIGHT]. */
+export function clampScoreWeight(weight: number): number {
+  if (!Number.isFinite(weight)) return 0;
+  return Math.max(-MAX_PATH_SCORE_WEIGHT, Math.min(MAX_PATH_SCORE_WEIGHT, weight));
+}
+
+/**
+ * WP2 soft time window: 0.5 ** (ageDays / windowDays), floored at
+ * SOFT_WINDOW_FLOOR. A chunk exactly one window old scores half; two
+ * windows old a quarter; anything older sits at the floor. `windowDays <= 0`
+ * disables the factor (returns 1), matching applyTimeWindowFilter's
+ * "no window" convention.
+ */
+export function softRecencyFactor(ageDays: number, windowDays: number): number {
+  if (!(windowDays > 0)) return 1;
+  const age = Number.isFinite(ageDays) ? Math.max(0, ageDays) : Number.POSITIVE_INFINITY;
+  return Math.max(SOFT_WINDOW_FLOOR, Math.pow(0.5, age / windowDays));
+}
+
+/** `sourceKind` with a path-based fallback for results built elsewhere. */
+export function retrievalSourceKind(
+  r: Readonly<{ source: "chunk" | "memory"; path: string; chunkId?: string; sourceKind?: MemorySourceKind }>,
+): MemorySourceKind {
+  if (r.sourceKind) return r.sourceKind;
+  if (r.source === "memory") return "memory";
+  if (isDocumentChunk(r.path)) return "document";
+  if ((r.chunkId ?? "").startsWith("shared:")) return "shared";
+  return "chunk";
+}
+
+/** ISO date for a result: `createdAt` first, then `fileMtimeMs`; undefined when neither parses. */
+export function retrievalResultDate(
+  r: Readonly<{ createdAt?: string; fileMtimeMs?: number }>,
+): string | undefined {
+  if (r.createdAt) {
+    const t = Date.parse(r.createdAt);
+    if (!Number.isNaN(t)) return new Date(t).toISOString();
+  }
+  if (typeof r.fileMtimeMs === "number" && Number.isFinite(r.fileMtimeMs) && r.fileMtimeMs > 0) {
+    return new Date(r.fileMtimeMs).toISOString();
+  }
+  return undefined;
+}
 
 /**
  * Phase 999.43 Plan 03 Task 2 — D-02 score formula applied to memory
@@ -243,8 +356,16 @@ export type RetrieveArgs = Readonly<{
   embed: EmbedFn;
   /** Default 5 per D-RETRIEVAL. */
   topK?: number;
-  /** Default 14 per D-24. */
+  /** Default 14 per D-24. With the default soft mode this is the half-life of the recency multiplier. */
   timeWindowDays?: number;
+  /**
+   * WP2: how `timeWindowDays` applies to dated (non-standing) chunks.
+   *   "soft" (default): multiply the fused score by
+   *     max(0.35, 0.5 ** (ageDays / windowDays)); nothing is dropped.
+   *   "hard": the pre-WP2 behavior, applyTimeWindowFilter drops chunks
+   *     older than the window.
+   */
+  timeWindowMode?: "soft" | "hard";
   /**
    * Default 1500 tokens (~6000 chars) per Phase 115 sub-scope 3 (was 2000
    * pre-115 per Phase 90 D-RETRIEVAL; lowered to leave margin for sub-scope
@@ -255,15 +376,17 @@ export type RetrieveArgs = Readonly<{
   tokenBudget?: number;
   /**
    * Phase 115 sub-scope 4 — exclude memories whose tags intersect this list
-   * from the memories-side fan-out before RRF fusion. Locked operator
-   * default ["session-summary","mid-session","raw-fallback"] removes
+   * from the memories-side candidates. Locked operator default
+   * ["session-summary","mid-session","raw-fallback"] removes
    * pollution-feedback memories that pre-115 leaked into the prompt as
    * giant blobs (research codebase-memory-retrieval.md Pain Points #3 +
    * #15). Empty / undefined → filter disabled (legacy behavior). The
    * chunks-side does NOT need this filter — memory_chunks rows don't carry
-   * these tags (file-scanner only). Defensive note: filter is applied AFTER
-   * `getMemoryForRetrieval` hydration since the helper already returns
-   * tags as part of its row read — no extra DB query.
+   * these tags (file-scanner only).
+   *
+   * WP2: the filter now runs on the raw ranker output BEFORE RRF fusion
+   * (hydration happens once per candidate id and is reused), so excluded
+   * rows no longer occupy fused rank positions.
    */
   excludeTags?: readonly string[];
   /**
@@ -371,19 +494,48 @@ const DEFAULT_MEMORY_SCORING: ScoringConfig = Object.freeze({
 });
 
 /**
- * Phase 90 MEM-03 — hybrid-RRF pre-turn retrieval.
+ * WP2: vector-side failures (query embedding, vec table MATCH) are logged
+ * to stdout once per distinct message per process; the optional `log`
+ * sink sees every occurrence. Test hook below resets the set.
+ */
+const vectorFallbackLogged = new Set<string>();
+
+/** @internal test hook */
+export function _resetVectorFallbackLogForTests(): void {
+  vectorFallbackLogged.clear();
+}
+
+function logVectorFallback(
+  args: Pick<RetrieveArgs, "log" | "agent">,
+  stage: "embed" | "vec-search",
+  err: unknown,
+): void {
+  const message = err instanceof Error ? err.message : String(err);
+  const payload = { action: "wp2-vector-fallback", stage, agent: args.agent, error: message };
+  args.log?.debug?.(payload, "memory retrieval: vector side unavailable, keyword rankers only");
+  const key = `${stage}:${message}`;
+  if (vectorFallbackLogged.has(key)) return;
+  vectorFallbackLogged.add(key);
+  console.warn("wp2-vector-fallback", JSON.stringify(payload));
+}
+
+/**
+ * Phase 90 MEM-03, hybrid-RRF pre-turn retrieval.
  *
- * Pipeline:
- *   1. Embed the query via the injected EmbedFn (MiniLM 384-dim).
- *   2. Cosine top-20 from vec_memory_chunks.
- *   3. FTS5 BM25 top-20 from memory_chunks_fts (query sanitized in store).
- *   4. RRF fuse via 1/(k+rank) with k=60.
- *   5. Hydrate metadata (path/heading/body/file_mtime_ms/score_weight).
- *   6. Apply D-19 path weighting: fusedScore += scoreWeight.
- *   7. Apply D-24 time-window filter (drop stale dated files).
- *   8. Re-sort by fusedScore desc.
- *   9. Token-budget truncate (stop when cumulative body chars > budget*4).
- *  10. topK cap.
+ * Pipeline (WP2 numbering):
+ *   1. Strip the Discord channel envelope from the query.
+ *   2. Embed the query (on failure: keyword rankers only, logged once).
+ *   3. Fetch RETRIEVAL_FETCH_K candidates from each of the four rankers.
+ *   4. Memories side: hydrate once per id, drop excluded tags BEFORE
+ *      fusion (one larger refetch when the filter ate a full fetch), rank
+ *      by similarity x importance x recency, RRF-fuse with memories_fts.
+ *   5. Chunks side: RRF-fuse vec + FTS, hydrate, apply
+ *      fused * (1 + clampedWeight) and the soft recency factor.
+ *   6. Hard window (opt-in) or nothing to drop (soft default).
+ *   7. Sort by fusedScore desc; document priority weighting; reranker.
+ *   8. Document-chunk cap.
+ *   9. Token-budget loop: skip oversize candidates, keep filling to topK,
+ *      always emit the first.
  *
  * Returns a frozen readonly array so callers can't accidentally mutate the
  * retrieval set between turns.
@@ -392,54 +544,115 @@ export async function retrieveMemoryChunks(
   args: RetrieveArgs,
 ): Promise<readonly MemoryRetrievalResult[]> {
   const topK = args.topK ?? 5;
-  // Phase 115 sub-scope 3 — was 2000; lowered to 1500 to align with the
+  // Phase 115 sub-scope 3, was 2000; lowered to 1500 to align with the
   // wired-through defaults.memoryRetrievalTokenBudget. Operator override via
   // YAML; per-agent override on agentSchema. See SessionManager.getMemoryRetriever
   // ForAgent for the resolution chain.
   const tokenBudget = args.tokenBudget ?? 1500;
-  // Phase 999.187 — 0 (or negative) disables the window; see applyTimeWindowFilter.
+  // Phase 999.187, 0 (or negative) disables the window; see applyTimeWindowFilter.
   const windowDays = args.timeWindowDays ?? 14;
+  const timeWindowMode = args.timeWindowMode ?? "soft";
   const now = args.now ?? Date.now();
 
-  if (args.query.trim().length === 0) return Object.freeze([]);
+  // WP2 query hygiene: the pre-turn query arrives as the whole Discord
+  // `<channel ...>` envelope on every Discord turn. Strip it here as well as
+  // in the callers so no entry point (lazy tool, scripts) can leak envelope
+  // tokens into the keyword rankers or the query vector. Idempotent.
+  const query = stripChannelEnvelope(args.query);
+  if (query.trim().length === 0) return Object.freeze([]);
 
-  const qEmb = await args.embed(args.query);
+  // WP2 (e): a query-embedding failure (model download, ONNX crash, warmup
+  // window after a restart) used to throw here and discard keyword recall
+  // with it. Now the vector side is simply empty and FTS carries the turn.
+  let qEmb: Float32Array | QueryVector | null = null;
+  try {
+    qEmb = await args.embed(query);
+  } catch (err) {
+    logVectorFallback(args, "embed", err);
+  }
+  const vecSearch = <T>(run: () => T, empty: T): T => {
+    try {
+      return run();
+    } catch (err) {
+      logVectorFallback(args, "vec-search", err);
+      return empty;
+    }
+  };
 
-  // Phase 100-fu — fan out chunk-side AND memory-side searches in parallel.
+  // Phase 100-fu: fan out chunk-side AND memory-side searches in parallel.
   // The chunks side is the file-scanner content (MEMORY.md). The memories
-  // side is the agent's own saved memories (memory_save). Pre-100-fu only
-  // chunks were searched, so the agent's saved memory was invisible in the
-  // pre-turn <memory-context> block. After 100-fu both surface together
-  // ranked by RRF — the agent sees relevant content regardless of which
-  // store wrote it.
-  // Phase 999.187 — the memories side gets a keyword ranker too
-  // (memories_fts); guarded so older store doubles without it still work.
+  // side is the agent's own saved memories (memory_save). Both surface
+  // together ranked by RRF so the agent sees relevant content regardless of
+  // which store wrote it. Phase 999.187: the memories side gets a keyword
+  // ranker too (memories_fts); guarded so older store doubles without it
+  // still work. WP2: RETRIEVAL_FETCH_K per ranker instead of 20.
+  const fetchK = RETRIEVAL_FETCH_K;
   const memoriesFtsFn = (args.store as { searchMemoriesFts?: MemoryStore["searchMemoriesFts"] })
     .searchMemoriesFts;
-  const [vecTop, ftsTop, memoriesTop, memoriesFtsTop] = await Promise.all([
-    Promise.resolve(args.store.searchMemoryChunksVec(qEmb, 20)),
-    Promise.resolve(args.store.searchMemoryChunksFts(args.query, 20)),
-    Promise.resolve(args.store.searchMemoriesVec(qEmb, 20)),
-    Promise.resolve(
-      typeof memoriesFtsFn === "function" ? memoriesFtsFn.call(args.store, args.query, 20) : [],
-    ),
+  const runMemoriesFts = (k: number): ReadonlyArray<Readonly<{ memory_id: string; rank: number }>> =>
+    typeof memoriesFtsFn === "function" ? memoriesFtsFn.call(args.store, query, k) : [];
+  const emptyVec: ReadonlyArray<Readonly<{ chunk_id: string; distance: number }>> = [];
+  const emptyMemVec: ReturnType<MemoryStore["searchMemoriesVec"]> = [];
+  const [vecTop, ftsTop, memoriesVecRaw, memoriesFtsRaw] = await Promise.all([
+    Promise.resolve(qEmb ? vecSearch(() => args.store.searchMemoryChunksVec(qEmb!, fetchK), emptyVec) : emptyVec),
+    Promise.resolve(args.store.searchMemoryChunksFts(query, fetchK)),
+    Promise.resolve(qEmb ? vecSearch(() => args.store.searchMemoriesVec(qEmb!, fetchK), emptyMemVec) : emptyMemVec),
+    Promise.resolve(runMemoriesFts(fetchK)),
   ]);
 
   // Chunks side: RRF-fuse vec + FTS as before.
   const fusedChunks = rrfFuse(vecTop, ftsTop, RRF_K);
 
-  // Memories side: pseudo-RRF score from rank position (vec is the sole
-  // ranker since memories has no FTS index). 1/(k+rank+1) keeps the score
-  // scale identical to chunk-side fused scores so they sort cleanly in a
-  // single combined list.
+  // WP2 (c): memories-side tag exclusion BEFORE fusion. Hydrate each
+  // candidate id once (the row read already returns tags, so the filter
+  // costs no extra query) and reuse the row at emission time. A memory
+  // that vanished between the ranker and hydration is a stale skip, not a
+  // tag drop, so the diagnostic below still reflects filter activity.
+  const excludeTags = args.excludeTags ?? [];
+  const memoryMeta = new Map<string, ReturnType<MemoryStore["getMemoryForRetrieval"]>>();
+  const droppedMemoryIds = new Set<string>();
+  const hydrateMemory = (id: string): ReturnType<MemoryStore["getMemoryForRetrieval"]> => {
+    if (!memoryMeta.has(id)) memoryMeta.set(id, args.store.getMemoryForRetrieval(id));
+    return memoryMeta.get(id) ?? null;
+  };
+  const isAllowedMemory = (id: string): boolean => {
+    const meta = hydrateMemory(id);
+    if (!meta) return false;
+    if (excludeTags.length > 0 && meta.tags.some((t) => excludeTags.includes(t))) {
+      droppedMemoryIds.add(id);
+      return false;
+    }
+    return true;
+  };
+  const keepAllowed = <T extends { memory_id: string }>(rows: readonly T[]): T[] =>
+    rows.filter((r) => isAllowedMemory(r.memory_id));
+  // A FULL fetch that the filter thinned to under a third means excluded
+  // rows (mid-session flush summaries, typically) crowd this ranker: fetch
+  // once more, wider, so the saved memory behind them can still surface.
+  const refetchNeeded = (rawCount: number, keptCount: number): boolean =>
+    excludeTags.length > 0 && rawCount >= fetchK && keptCount * 3 < fetchK;
+
+  let memoriesTop = keepAllowed(memoriesVecRaw);
+  if (qEmb && refetchNeeded(memoriesVecRaw.length, memoriesTop.length)) {
+    memoriesTop = keepAllowed(
+      vecSearch(() => args.store.searchMemoriesVec(qEmb!, fetchK * MEMORY_REFETCH_MULTIPLIER), emptyMemVec),
+    );
+  }
+  let memoriesFtsTop = keepAllowed(memoriesFtsRaw);
+  if (refetchNeeded(memoriesFtsRaw.length, memoriesFtsTop.length)) {
+    memoriesFtsTop = keepAllowed(runMemoriesFts(fetchK * MEMORY_REFETCH_MULTIPLIER));
+  }
+
+  // Memories side: pseudo-RRF score from rank position. 1/(k+rank+1) keeps
+  // the score scale identical to chunk-side fused scores so they sort
+  // cleanly in a single combined list.
   //
-  // Phase 999.119 pass 2 — the rank is now the COMBINED order, not raw
-  // vector order: semantic similarity weighted with the same importance ×
-  // recency decay that SemanticSearch (the explicit memory_lookup path)
-  // has always applied. Two memories at equal distance no longer tie on
-  // insertion order — the important, recently-used one leads; a decayed
-  // cold row needs a clearly closer match to outrank it. Only the
-  // memories-side order changes; cross-surface fusion is untouched.
+  // Phase 999.119 pass 2: the rank is the COMBINED order, not raw vector
+  // order: semantic similarity weighted with the same importance x recency
+  // decay that SemanticSearch (the explicit memory_lookup path) has always
+  // applied. Two memories at equal distance no longer tie on insertion
+  // order; the important, recently-used one leads; a decayed cold row needs
+  // a clearly closer match to outrank it.
   const scoring = args.scoring ?? DEFAULT_MEMORY_SCORING;
   const nowDate = new Date(now);
   const memoriesRanked = memoriesTop
@@ -457,14 +670,14 @@ export async function retrieveMemoryChunks(
           scoring.decayWeight,
     }))
     .sort((a, b) => b.combined - a.combined || a.vectorRank - b.vectorRank);
-  // Phase 999.187 — RRF-fuse the combined-ranked vector list with the
+  // Phase 999.187: RRF-fuse the combined-ranked vector list with the
   // keyword list, exactly as the chunks side does. A memory found by BOTH
   // rankers scores up to 2/(k+1) and can outrank a chunk found by one; a
   // memory found by keyword alone (an exact ticker, a name) now surfaces at
   // all, which the vector-only side could not guarantee.
   //
   // Keyword ties (equal bm25 rank, e.g. two memories with the same words)
-  // are broken by the combined order, so importance × recency still decides
+  // are broken by the combined order, so importance x recency still decides
   // between otherwise-identical candidates instead of FTS row order.
   const combinedIndex = new Map(memoriesRanked.map((r, i) => [r.memory_id, i] as const));
   const memoriesFtsOrdered = [...memoriesFtsTop].sort(
@@ -478,10 +691,6 @@ export async function retrieveMemoryChunks(
     memoriesFtsOrdered.map((r) => ({ chunk_id: r.memory_id, rank: r.rank })),
     RRF_K,
   );
-  const memoriesScored = memoriesFused.map((f) => ({
-    memory_id: f.chunk_id,
-    score: f.score,
-  }));
 
   type Hydrated = {
     chunkId: string;
@@ -492,85 +701,76 @@ export async function retrieveMemoryChunks(
     fusedScore: number;
     scoreWeight: number;
     source: "chunk" | "memory";
-    /** Phase 999.124 — memory-sourced rows carry their created_at for the recall footer. */
+    sourceKind: MemorySourceKind;
+    /** Phase 999.124: memory-sourced rows carry their created_at for the recall footer. */
     createdAt?: string;
   };
   const hydrated: Hydrated[] = [];
 
-  // Hydrate chunk-side
+  // Hydrate chunk-side. WP2 (b): the path weight multiplies the fused score
+  // (clamped to +-0.2, so the multiplier stays within [0.8, 1.2]) instead of
+  // being added to it. WP2 (c): dated chunks decay softly with age; standing
+  // paths (vault, procedures, digests, cue files, documents) keep full weight.
   for (const f of fusedChunks) {
     const meta = args.store.getMemoryChunk(f.chunk_id);
     if (!meta) continue;
+    const weight = clampScoreWeight(meta.score_weight);
+    let score = f.score * (1 + weight);
+    if (timeWindowMode === "soft" && windowDays > 0 && !isStandingMemoryPath(meta.path)) {
+      score *= softRecencyFactor((now - meta.file_mtime_ms) / 86_400_000, windowDays);
+    }
     hydrated.push({
       chunkId: f.chunk_id,
       path: meta.path,
       heading: meta.heading,
       body: meta.body,
       file_mtime_ms: meta.file_mtime_ms,
-      fusedScore: f.score + meta.score_weight,
-      scoreWeight: meta.score_weight,
+      fusedScore: score,
+      scoreWeight: weight,
       source: "chunk",
+      sourceKind: isDocumentChunk(meta.path) ? "document" : "chunk",
     });
   }
 
   // Hydrate memory-side. Memories don't have path/heading/file_mtime_ms,
   // so we synthesize values that keep downstream rendering and the
   // time-window filter both happy:
-  //   - path: "memory:<id>" — the time-window filter only excludes paths
-  //     that fail the cutoff AND aren't under /memory/vault/ or
-  //     /memory/procedures/. Synthetic memory: paths trivially fail the
-  //     vault/procedures check, so the file_mtime_ms gate decides. We pass
-  //     `now` as file_mtime_ms (memories are always "fresh" — the agent
-  //     just saved them; mtime is a chunk-file concept) so the cutoff
-  //     comparison ALWAYS passes.
-  //   - heading: null — turn-dispatcher's renderer falls back to path on
-  //     null heading, producing "### memory:<id>\n<body>" in the prompt.
-  //   - score_weight: 0 — no path-derived nudge for memories.
-  //
-  // Phase 115 sub-scope 4 — `excludeTags` filter applied here AFTER the
-  // hydration call (which already returns tags via getMemoryForRetrieval).
-  // No second DB lookup needed. The filter only fires on the memories-side
-  // (chunks-side rows from MEMORY.md / file scanner don't carry these
-  // tags). When a memory's tags intersect excludeTags it is dropped from
-  // the hydrated set BEFORE time-window + token-budget passes, preventing
-  // pollution-feedback memories from consuming any of the budget. The
-  // null-meta path (memory deleted between vec-search and hydration) is
-  // counted as a stale-skip, NOT a tag-drop, so the diagnostic accurately
-  // reflects filter activity vs. data-race silently.
-  const excludeTags = args.excludeTags ?? [];
-  let memTagDroppedCount = 0;
-  for (const m of memoriesScored) {
-    const meta = args.store.getMemoryForRetrieval(m.memory_id);
+  //   - path: "memory:<id>". Synthetic memory: paths trivially fail the
+  //     standing-path check, so the file_mtime_ms gate decides. We pass
+  //     `now` as file_mtime_ms (memories are always "fresh"; their own
+  //     importance x recency decay already ran in the combined rank) so the
+  //     hard cutoff always passes and the soft factor is 1.
+  //   - heading: null. The renderer falls back to the path.
+  //   - score_weight: 0, no path-derived nudge for memories.
+  // The excluded-tag filter already ran before fusion, so every id here is
+  // allowed and its row is in the hydration cache.
+  for (const f of memoriesFused) {
+    const meta = hydrateMemory(f.chunk_id);
     if (!meta) continue;
-    if (
-      excludeTags.length > 0 &&
-      meta.tags.some((t) => excludeTags.includes(t))
-    ) {
-      memTagDroppedCount += 1;
-      continue;
-    }
     hydrated.push({
-      chunkId: m.memory_id,
-      path: `memory:${m.memory_id}`,
+      chunkId: f.chunk_id,
+      path: `memory:${f.chunk_id}`,
       heading: null,
       body: meta.content,
       file_mtime_ms: now,
-      fusedScore: m.score,
+      fusedScore: f.score,
       scoreWeight: 0,
       source: "memory",
+      sourceKind: "memory",
       createdAt: meta.created_at,
     });
   }
-  // Phase 115 sub-scope 4 — operator-visible diagnostic when the filter
+  // Phase 115 sub-scope 4: operator-visible diagnostic when the filter
   // drops one or more rows. Helps operators spot when an agent's
   // pollution-feedback memories are being suppressed (good signal: filter
   // is doing work) vs always at zero (filter inactive). Two channels:
-  //   1. console.info — fires unconditionally in production. Daemon
+  //   1. console.info, fires unconditionally in production. Daemon
   //      captures stdout into structured logs via systemd. Mirrors the
   //      T01 phase115-quickwin pattern (session-adapter.ts).
-  //   2. args.log?.debug?.() — optional sink injected by tests via vi.fn()
+  //   2. args.log?.debug?.(), optional sink injected by tests via vi.fn()
   //      (and by future operator-facing surfaces that want structured
   //      access without grep on stdout).
+  const memTagDroppedCount = droppedMemoryIds.size;
   if (memTagDroppedCount > 0) {
     const payload = {
       action: "phase115-tag-filter",
@@ -582,23 +782,26 @@ export async function retrieveMemoryChunks(
     args.log?.debug?.(payload, "phase115-tag-filter dropped memories");
   }
 
-  const windowed = [...applyTimeWindowFilter(hydrated, windowDays, now)];
+  // WP2 (c): the hard window is opt-in; the soft multiplier already ran
+  // at hydration time and drops nothing.
+  const windowed: Hydrated[] =
+    timeWindowMode === "hard" ? [...applyTimeWindowFilter(hydrated, windowDays, now)] : hydrated;
   windowed.sort((a: Hydrated, b: Hydrated) => b.fusedScore - a.fusedScore);
 
-  // Phase 999.43 Plan 03 Task 2 — D-02 priority weighting for
+  // Phase 999.43 Plan 03 Task 2, D-02 priority weighting for
   // `document:` prefix candidates BEFORE the optional reranker gate.
   // When `documentPriority` is omitted (legacy callers, tests) the
   // pipeline runs unchanged. When present, document candidates are
-  // scaled by agentWeight × contentWeight × recencyBoost and re-sorted
+  // scaled by agentWeight x contentWeight x recencyBoost and re-sorted
   // so pre-rerank rank reflects priority. The reranker (next step) then
-  // operates on the priority-weighted ordering — reranker logic itself
+  // operates on the priority-weighted ordering; reranker logic itself
   // is unchanged (Phase 101 Plan 04 invariant honored).
   let prioritized: Hydrated[] = windowed;
   if (args.documentPriority) {
     const weighted = applyDocumentPriorityWeight<Hydrated>(windowed, {
       getDocumentRow: args.documentPriority.getDocumentRow,
       agentWeight: args.documentPriority.agentWeight,
-      // Quick-260521-437 — thread the operator-tunable recency window
+      // Quick-260521-437: thread the operator-tunable recency window
       // through; undefined falls back to the legacy 7-day window inside
       // applyDocumentPriorityWeight.
       recencyWindowMs: args.documentPriority.recencyWindowMs,
@@ -614,12 +817,12 @@ export async function retrieveMemoryChunks(
     prioritized = sorted.map(({ weightedFused: _drop, ...rest }) => rest);
   }
 
-  // Phase 101 Plan 04 (D-04, U9, SC-10) — optional bge-reranker-base
-  // cross-encoder pass applied to the post-time-window, RRF-sorted set
-  // BEFORE the token-budget loop. Takes `reranker.topNToRerank` candidates,
+  // Phase 101 Plan 04 (D-04, U9, SC-10): optional bge-reranker-base
+  // cross-encoder pass applied to the RRF-sorted set BEFORE the
+  // token-budget loop. Takes `reranker.topNToRerank` candidates,
   // re-scores via `(query, passage)` pairs, returns the top
   // `reranker.finalTopK` in rerank-order. The downstream token-budget +
-  // topK cap then runs over this reordered list — so a more-relevant
+  // topK cap then runs over this reordered list, so a more-relevant
   // candidate that was rank 6 under raw RRF can surface into the kept
   // set when rerank elevates it to top-5.
   //
@@ -631,7 +834,7 @@ export async function retrieveMemoryChunks(
   let postRerank: Hydrated[] = prioritized;
   if (args.reranker && args.reranker.enabled && prioritized.length > 0) {
     const candidates = prioritized.slice(0, args.reranker.topNToRerank);
-    const reranked = await rerankTop<Hydrated>(args.query, candidates, {
+    const reranked = await rerankTop<Hydrated>(query, candidates, {
       topK: Math.min(args.reranker.finalTopK, candidates.length),
       timeoutMs: args.reranker.timeoutMs,
       logger: args.reranker.logger,
@@ -641,18 +844,18 @@ export async function retrieveMemoryChunks(
     postRerank = [...reranked];
   }
 
-  // Quick-260521-437 — document-chunk cap. Stops one cross-ingested
+  // Quick-260521-437: document-chunk cap. Stops one cross-ingested
   // image/document dump (which can flood `memory_chunks` with dozens of
-  // `document:`-prefixed chunks, each priority-weighted ~2.9×) from
+  // `document:`-prefixed chunks, each priority-weighted ~2.9x) from
   // dominating every subsequent turn's `<memory-context>` block.
   //
   // Runs AFTER the reranker (so it operates on the actually-emitted
   // ordering) and BEFORE the token-budget loop + topK slice (so a dropped
   // high-ranked document chunk frees a slot for a lower-ranked NON-document
-  // chunk to reach the topK window — eviction-with-replacement, not bare
+  // chunk to reach the topK window: eviction-with-replacement, not bare
   // trimming). The cap is an UPPER BOUND, never a quota: a retrieval whose
   // only candidates are document chunks still returns them up to the cap,
-  // so document searchability is preserved. Fail-open — when the cap is
+  // so document searchability is preserved. Fail-open: when the cap is
   // undefined or <= 0 the pass is skipped and behavior is unchanged.
   let capped: Hydrated[] = postRerank;
   if (args.documentChunkCap !== undefined && args.documentChunkCap > 0) {
@@ -668,17 +871,21 @@ export async function retrieveMemoryChunks(
     });
   }
 
-  // Token budget truncation. ~4 chars/token — stop accumulating when the
-  // next chunk would push cumulative body chars past budget*4. Always emit
-  // at least the first chunk (don't leave the caller with an empty block
-  // just because it's a big one). Applied across BOTH surfaces (chunks +
-  // memories) so a flood of large memories can't blow the prompt budget.
+  // Token budget truncation. ~4 chars/token. WP2 (f): a candidate that
+  // would push cumulative body chars past budget*4 is SKIPPED and the loop
+  // keeps filling from the next candidates until topK results are emitted,
+  // instead of breaking at the first oversize one (which let a single large
+  // top-ranked chunk evict every smaller relevant chunk behind it). The
+  // first candidate is always emitted so the caller never gets an empty
+  // block just because the best hit is big. Applied across BOTH surfaces
+  // (chunks + memories) so a flood of large memories can't blow the budget.
   const out: MemoryRetrievalResult[] = [];
   let acc = 0;
-  const limited = capped.slice(0, topK);
-  for (const h of limited) {
+  const maxChars = tokenBudget * 4;
+  for (const h of capped) {
+    if (out.length >= topK) break;
     const len = h.body.length;
-    if (out.length > 0 && acc + len > tokenBudget * 4) break;
+    if (out.length > 0 && acc + len > maxChars) continue;
     out.push(
       Object.freeze({
         chunkId: h.chunkId,
@@ -688,13 +895,16 @@ export async function retrieveMemoryChunks(
         fusedScore: h.fusedScore,
         scoreWeight: h.scoreWeight,
         source: h.source,
+        sourceKind: h.sourceKind,
+        ...(h.createdAt ? { createdAt: h.createdAt } : {}),
+        ...(h.source === "chunk" ? { fileMtimeMs: h.file_mtime_ms } : {}),
       }),
     );
     acc += len;
   }
 
-  // Phase 999.119 — the memories that actually reach the prompt count as
-  // USED: touch accessed_at (not access_count — see
+  // Phase 999.119: the memories that actually reach the prompt count as
+  // USED: touch accessed_at (not access_count, see
   // MemoryStore.touchAccessedAt) so the relevance-decay clock that drives
   // cold-tiering is reset by real use instead of by age alone. Best-effort
   // and guarded: test doubles for `store` do not implement it.

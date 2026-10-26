@@ -15,8 +15,16 @@
  * ranking a hybrid fuser wants. The index tokenizer is `porter`, so "decided"
  * finds "decision" without prefix wildcards.
  *
+ * Memory overhaul WP2 (2026-10-25): the Discord `<channel ...>` envelope is
+ * stripped before tokenising. On a Discord turn the raw message starts with
+ * about 130 characters of envelope, and its tokens (channel, source,
+ * discord, chat_id, two snowflake ids, user, ts, the date parts) filled all
+ * twelve term slots, so the user's words never reached BM25.
+ *
  * Pure: no I/O.
  */
+
+import { stripChannelEnvelope } from "../shared/channel-envelope.js";
 
 export const FTS_MAX_TERMS = 12;
 
@@ -36,7 +44,8 @@ const TOKEN_RE = /[a-z0-9_]+/g;
 
 /** Tokens that survive sanitising, stopword removal and dedupe, in order. */
 export function extractFtsTerms(raw: string, maxTerms: number = FTS_MAX_TERMS): readonly string[] {
-  const all = (raw.toLowerCase().match(TOKEN_RE) ?? []).filter((t) => t.length >= 2);
+  const text = stripChannelEnvelope(raw);
+  const all = (text.toLowerCase().match(TOKEN_RE) ?? []).filter((t) => t.length >= 2);
   const kept: string[] = [];
   const seen = new Set<string>();
   const pick = (t: string) => {
