@@ -58,4 +58,14 @@ export type DocumentSearchResult = {
    * treat retrieval of an aged image path as best-effort.
    */
   readonly sourceImagePath?: string | null;
+  /**
+   * Memory overhaul (2026-10-25) WP3: provenance from the `documents` row so
+   * the search_documents tool can tell the agent what the document is, when
+   * it arrived and who sent it. All null when the row is missing.
+   */
+  readonly filename?: string | null;
+  readonly ingestedAt?: string | null;
+  readonly userName?: string | null;
+  readonly channelName?: string | null;
+  readonly sourceKind?: string | null;
 };

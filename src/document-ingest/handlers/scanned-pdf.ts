@@ -14,29 +14,12 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { writeFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
 import sharp from "sharp";
 import type { BatchedPage } from "../types.js";
 import { DIMENSION_MAX_PX, MAX_PAGES, IngestError } from "../page-batch.js";
-
-/** DPI for pdftoppm raster — 150 is the sharp/quality sweet spot for OCR. */
-const RENDER_DPI = 150;
-
-/** Spawn a child process and resolve when it exits successfully. */
-function runProcess(cmd: string, args: readonly string[]): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ["ignore", "ignore", "pipe"] });
-    let stderr = "";
-    child.stderr.on("data", (b) => {
-      stderr += b.toString();
-    });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`${cmd} exited ${code}: ${stderr.trim()}`));
-    });
-  });
-}
+// WP3 — the process runner and DPI live in pdf-render.ts so the text-PDF
+// handler renders text-less pages with the same settings.
+import { RENDER_DPI, runProcess } from "../pdf-render.js";
 
 export async function handleScannedPdf(
   buffer: Buffer,

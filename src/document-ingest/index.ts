@@ -119,7 +119,18 @@ export async function ingest(
   buf: Buffer,
   filename: string,
   opts: IngestOptions = {},
-): Promise<IngestResult & { text: string; pages: readonly BatchedPage[] }> {
+): Promise<
+  IngestResult & {
+    text: string;
+    pages: readonly BatchedPage[];
+    /**
+     * WP3 — per-page text in page order (OCR output included), so callers
+     * can map chunk offsets inside `text` back to a page number for the
+     * contextual chunk header. `text` is `pageTexts.join("\n\n").trim()`.
+     */
+    pageTexts: readonly string[];
+  }
+> {
   const type = await detectDocumentType(buf, filename);
   const slug = basename(filename).replace(/\.[^.]+$/, "") || "document";
 
@@ -157,6 +168,10 @@ export async function ingest(
     const t0 = performance.now();
     if (page.text !== undefined && page.text.length > 0) {
       pageTexts.push(page.text);
+    } else if (page.imageBuffer !== undefined && opts.backend === "none") {
+      // WP3 — an explicit "none" backend means no OCR at all (previously it
+      // fell through the paid auto-chain).
+      pageTexts.push("");
     } else if (page.imageBuffer !== undefined) {
       // Phase 101 Plan 02 T03/T04 — thread the operator's explicit backend
       // override through to ocrPage so D-08 Mistral selectability + per-tier
@@ -196,5 +211,6 @@ export async function ingest(
     telemetry,
     text,
     pages,
+    pageTexts,
   };
 }

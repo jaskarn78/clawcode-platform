@@ -110,6 +110,8 @@ function facadeFor(phase: EmbeddingMigrationPhase): CrossIngestMigrationPhase {
 export interface CrossIngestChunk {
   readonly index: number;
   readonly content: string;
+  /** WP3 — per-chunk heading override; defaults to the document heading. */
+  readonly heading?: string;
 }
 
 /** Args for {@link crossIngestToMemory}. */
@@ -117,6 +119,13 @@ export interface CrossIngestArgs {
   readonly agent: string;
   readonly docSlug: string;
   readonly chunks: ReadonlyArray<CrossIngestChunk>;
+  /**
+   * WP3 (2026-10-25) — heading stored on every mirror row (and indexed by
+   * FTS). Callers pass the original filename so <memory-context> renders
+   * "invoice-10432.pdf" instead of "document:1729…-invoice-10432-pdf". Never
+   * null: when omitted the docSlug is used.
+   */
+  readonly heading?: string | null;
   /**
    * P1-CROSSINGEST — PRECOMPUTED embeddings, index-aligned (positionally) with
    * `chunks`. The caller computes these once in the dedicated embed worker
@@ -192,6 +201,10 @@ export async function crossIngestToMemory(
 
   const path = `document:${args.docSlug}`;
   const fileMtimeMs = Date.now();
+  const docHeading =
+    typeof args.heading === "string" && args.heading.trim().length > 0
+      ? args.heading.trim()
+      : args.docSlug;
 
   // Idempotency: a re-ingest of the same docSlug DELETEs all prior rows
   // across memory_chunks + vec_memory_chunks + vec_memory_chunks_v2 +
@@ -215,7 +228,9 @@ export async function crossIngestToMemory(
     const chunkId = args.memoryStore.insertMemoryChunk({
       path,
       chunkIndex: chunk.index,
-      heading: null,
+      // WP3 — the heading is the filename (never null) so the rendered
+      // memory context names the document.
+      heading: chunk.heading ?? docHeading,
       body: chunk.content,
       tokenCount,
       // Documents are operator-curated artifacts; score_weight matches

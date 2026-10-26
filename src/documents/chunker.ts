@@ -104,3 +104,31 @@ function findWordPosition(text: string, words: readonly string[], wordIndex: num
   while (pos < text.length && /\s/.test(text[pos])) pos++;
   return pos;
 }
+
+/**
+ * Rebuild the whitespace-normalized source text from chunks that
+ * `chunkText` produced with the same `targetTokens` / `overlapTokens`.
+ *
+ * Chunk i (i > 0) starts `stepWords` after chunk i-1, so its first
+ * `overlapWords` words repeat the tail of the previous chunk; dropping them
+ * and joining the rest restores the original word sequence. Chunk contents
+ * must be passed in chunk order and must not carry a contextual header
+ * (callers strip it with `stripChunkHeader` first).
+ */
+export function reassembleChunkedText(
+  contents: readonly string[],
+  targetTokens = 500,
+  overlapTokens = 50,
+): string {
+  const targetWords = Math.max(1, Math.round(targetTokens * WORDS_PER_TOKEN));
+  const overlapWords = Math.max(0, Math.round(overlapTokens * WORDS_PER_TOKEN));
+  const stepWords = Math.max(1, targetWords - overlapWords);
+  const repeated = targetWords - stepWords;
+  const words: string[] = [];
+  contents.forEach((content, i) => {
+    const w = content.split(/\s+/).filter(Boolean);
+    if (i === 0) words.push(...w);
+    else words.push(...w.slice(repeated));
+  });
+  return words.join(" ");
+}
