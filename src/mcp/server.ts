@@ -6,6 +6,7 @@ import { z } from "zod/v4";
 import { sendIpcRequest } from "../ipc/client.js";
 import { CV2_FILES_SCHEMA, CV2_SPEC_SCHEMA } from "./cv2-spec-schema.js";
 import { renderScheduleList, type SchedulesIpcResult } from "./schedule-list.js";
+import { formatMemorySaveText, type MemorySaveIpcResult } from "../memory/tools/memory-save-text.js";
 
 // P2 (memory program) — the socket path is computed INLINE instead of
 // imported from daemon.js: that value-import dragged the entire ~15k-line
@@ -156,12 +157,12 @@ export const TOOL_DEFINITIONS = {
   // demand; edit / archive let the agent curate Tier 1 (MEMORY.md / USER.md).
   clawcode_memory_search: {
     description:
-      "Search this agent's memory (FTS5 + sqlite-vec hybrid). Returns top-K snippets with memory IDs.",
+      "Search this agent's memory (FTS5 + sqlite-vec hybrid): saved memories, memory files and owner facts. Returns top-K dated snippets with memory IDs.",
     ipcMethod: "clawcode-memory-search",
   },
   clawcode_memory_recall: {
     description:
-      "Fetch the full body of a memory by ID (returned from clawcode_memory_search hits).",
+      "Fetch the full body of a memory by ID (returned from clawcode_memory_search hits, including shared:<id> owner facts).",
     ipcMethod: "clawcode-memory-recall",
   },
   clawcode_memory_edit: {
@@ -173,6 +174,17 @@ export const TOOL_DEFINITIONS = {
     description:
       "Promote a found chunk into MEMORY.md or USER.md (agent-curated Tier 2 → Tier 1 archive).",
     ipcMethod: "clawcode-memory-archive",
+  },
+  // Memory overhaul 2026-10-25 (WP5) - corrections on saved memories.
+  clawcode_memory_forget: {
+    description:
+      "Retire a saved memory that is wrong or no longer applies (marked forgotten, hidden from search; nothing is deleted).",
+    ipcMethod: "clawcode-memory-forget",
+  },
+  clawcode_memory_update: {
+    description:
+      "Correct a saved memory: stores the corrected text as a new memory and marks the old one superseded by it.",
+    ipcMethod: "clawcode-memory-update",
   },
   verify_claim: {
     description:
@@ -1667,6 +1679,9 @@ export function createMcpServer(
   server.tool(
     "memory_save",
     "Save a piece of knowledge, decision, or important context to your long-term memory for future recall. " +
+      "One durable fact per call, with absolute dates (YYYY-MM-DD, never 'today' or 'next week'). " +
+      "The result says whether it was created, was already stored (duplicate), or superseded an older similar memory. " +
+      "To correct or retire a saved memory use clawcode_memory_update or clawcode_memory_forget. " +
       "Use scope='owner' for a durable fact about your OWNER as a person (preferences, constraints, standing " +
       "instructions) so every agent they own recalls it too; keep scope='agent' (default) for anything task- or agent-specific.",
     {
@@ -1690,17 +1705,12 @@ export function createMcpServer(
           tags,
           importance,
           ...(scope === "owner" ? { scope } : {}),
-        }))) as { id: string; scope?: string; owner?: string; action?: string };
+        }))) as MemorySaveIpcResult;
+        // Memory overhaul 2026-10-25 (WP5) - the text says whether the
+        // memory was created, dropped as a duplicate, or superseded an
+        // older similar memory.
         return {
-          content: [
-            {
-              type: "text" as const,
-              text:
-                result.scope === "owner"
-                  ? `Owner fact ${result.action === "refreshed" ? "refreshed" : "saved"} for ${result.owner} (id: ${result.id}); every agent they own will recall it.`
-                  : `Memory saved (id: ${result.id})`,
-            },
-          ],
+          content: [{ type: "text" as const, text: formatMemorySaveText(result) }],
         };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1731,11 +1741,18 @@ export function createMcpServer(
     "clawcode_memory_search",
     "Search this agent's memory (FTS5 + sqlite-vec hybrid) across ALL time — dated notes, standing " +
       "notes, digests, saved memories and the owner's shared facts. Returns top-K snippets with memory IDs. " +
-      "Use clawcode_memory_recall(memoryId) to fetch full body.",
+      "Each hit carries kind (memory = saved memory, file = memory file section, owner-fact), createdAt, " +
+      "and tags or path; when two hits disagree, prefer the newer one. Superseded and forgotten memories are " +
+      "not returned. Use clawcode_memory_recall(memoryId) to fetch full body.",
     {
       query: z.string().describe("What to search for in your memory"),
       k: z.number().int().min(1).max(50).default(10).describe("Top-K hits to return (1-50)"),
-      includeTags: z.array(z.string()).optional().describe("Only return memories with at least one of these tags"),
+      includeTags: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Only return saved memories with at least one of these tags (memory file sections and owner facts have no tags and are dropped when this is set)",
+        ),
       excludeTags: z.array(z.string()).optional().describe("Drop memories whose tags intersect this list"),
       agent: z.string().describe("Your agent name (pass your own name)"),
     },
@@ -1769,7 +1786,9 @@ export function createMcpServer(
   // Tool: clawcode_memory_recall — fetch full body by id.
   server.tool(
     "clawcode_memory_recall",
-    "Fetch the full body of a memory by ID. Use the memoryId returned from a clawcode_memory_search hit.",
+    "Fetch the full body of a memory by ID. Use the memoryId returned from a clawcode_memory_search hit " +
+      "(owner facts use their shared:<id> id). A memory that was replaced or forgotten still recalls, " +
+      "flagged with supersededBy so you can fetch the current version.",
     {
       memoryId: z.string().describe("Memory ID returned from clawcode_memory_search"),
       agent: z.string().describe("Your agent name (pass your own name)"),
@@ -1863,6 +1882,80 @@ export function createMcpServer(
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: "text" as const, text: `Failed to archive memory: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // Memory overhaul 2026-10-25 (WP5) - corrections on saved memories. Both
+  // write, so neither goes through the per-Turn idempotent cache, and both
+  // are on the researcher deny list (research-tool-policy.ts).
+  //
+  // Tool: clawcode_memory_forget - retire a saved memory (nothing deleted).
+  server.tool(
+    "clawcode_memory_forget",
+    "Retire one of your saved memories that is wrong or no longer applies. Nothing is deleted: the memory " +
+      "is marked forgotten and stops appearing in search, retrieval and the hot tier. Takes a saved-memory id " +
+      "(a clawcode_memory_search hit with kind 'memory', or a memory_save id). To replace it with corrected " +
+      "text, use clawcode_memory_update instead.",
+    {
+      id: z.string().describe("Saved memory id to retire"),
+      reason: z.string().describe("Why it no longer applies (written to the operator log)"),
+      agent: z.string().describe("Your agent name (pass your own name)"),
+    },
+    async ({ id, reason, agent }) => {
+      try {
+        const result = (await sendIpcRequest(SOCKET_PATH, "clawcode-memory-forget", withIdentity(agent, {
+          agent,
+          id,
+          reason,
+        }))) as Record<string, unknown>;
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(result, null, 2) },
+          ],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text" as const, text: `Failed to forget memory: ${msg}` }],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // Tool: clawcode_memory_update - store a correction that supersedes the old row.
+  server.tool(
+    "clawcode_memory_update",
+    "Correct one of your saved memories. The corrected text is stored as a new memory (dated now) and the " +
+      "old one is marked as superseded by it, so only the correction appears in search and retrieval; the " +
+      "old text is kept for audit. Write absolute dates (YYYY-MM-DD). Tags carry over unless you pass new ones. " +
+      "Returns the new id.",
+    {
+      id: z.string().describe("Saved memory id to correct"),
+      content: z.string().describe("The full corrected memory text"),
+      tags: z.array(z.string()).optional().describe("Replacement tags (omit to keep the old memory's tags)"),
+      agent: z.string().describe("Your agent name (pass your own name)"),
+    },
+    async ({ id, content, tags, agent }) => {
+      try {
+        const result = (await sendIpcRequest(SOCKET_PATH, "clawcode-memory-update", withIdentity(agent, {
+          agent,
+          id,
+          content,
+          ...(tags ? { tags } : {}),
+        }))) as Record<string, unknown>;
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(result, null, 2) },
+          ],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text" as const, text: `Failed to update memory: ${msg}` }],
           isError: true,
         };
       }

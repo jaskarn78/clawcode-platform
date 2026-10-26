@@ -13,6 +13,7 @@ export {
   SEARCH_INPUT_SCHEMA,
   type SearchInput,
   type SearchHit,
+  type SearchHitKind,
   type SearchDeps,
   type SearchResult,
 } from "./clawcode-memory-search.js";

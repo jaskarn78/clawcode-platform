@@ -10,7 +10,8 @@
  * "duplicate" of some third memory.
  *
  * Source, importance, tags and turn lineage are carried over from the
- * old row unless the caller supplies new tags.
+ * old row unless the caller supplies new tags. A row that is already
+ * superseded or forgotten is refused with a pointer to its successor.
  *
  * Scope: rows in the agent's own `memories` table only (a memory file
  * section is edited through `clawcode_memory_edit`; a `shared:<id>` owner
@@ -19,6 +20,7 @@
 
 import { z } from "zod/v4";
 import type { MemoryStore } from "../store.js";
+import { FORGOTTEN_MARKER } from "../types.js";
 
 export const UPDATE_INPUT_SCHEMA = z.object({
   id: z.string().min(1).max(200),
@@ -77,6 +79,19 @@ export async function clawcodeMemoryUpdate(
     return Object.freeze({ ok: false, error: "memory not found in this agent's store" });
   }
 
+  const retiredError = (supersededBy: string): UpdateResult =>
+    Object.freeze({
+      ok: false,
+      error:
+        supersededBy === FORGOTTEN_MARKER
+          ? "this memory was forgotten; save the corrected fact with memory_save instead"
+          : `this memory was already replaced by ${supersededBy}; update that id instead`,
+    });
+
+  if (existing.supersededBy) {
+    return retiredError(existing.supersededBy);
+  }
+
   if (existing.content === parsed.content && parsed.tags === undefined) {
     return Object.freeze({
       ok: false,
@@ -85,13 +100,25 @@ export async function clawcodeMemoryUpdate(
   }
 
   const embedding = await deps.embed(parsed.content);
+
+  // The embed above awaited, so re-read the old row: if another writer
+  // retired it meanwhile, stop before writing an orphan correction. The
+  // re-check and the insert below run synchronously, with no gap.
+  const current = deps.store.peekById(oldId);
+  if (!current) {
+    return Object.freeze({ ok: false, error: "memory not found in this agent's store" });
+  }
+  if (current.supersededBy) {
+    return retiredError(current.supersededBy);
+  }
+
   const outcome = deps.store.insertWithStatus(
     {
       content: parsed.content,
-      source: existing.source,
-      importance: existing.importance,
-      tags: parsed.tags ?? existing.tags,
-      ...(existing.sourceTurnIds ? { sourceTurnIds: existing.sourceTurnIds } : {}),
+      source: current.source,
+      importance: current.importance,
+      tags: parsed.tags ?? current.tags,
+      ...(current.sourceTurnIds ? { sourceTurnIds: current.sourceTurnIds } : {}),
       supersedes: oldId,
     },
     embedding,
@@ -103,6 +130,7 @@ export async function clawcodeMemoryUpdate(
       agent: deps.agentName,
       memoryId: outcome.entry.id,
       supersedes: oldId,
+      status: outcome.status,
       action: "memory-updated",
     },
     "[diag] clawcode-memory-update: memory replaced",

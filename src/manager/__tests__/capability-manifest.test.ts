@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildCapabilityManifest } from "../capability-manifest.js";
+import { buildCapabilityManifest, buildMemoryProtocol } from "../capability-manifest.js";
 import type { ResolvedAgentConfig } from "../../shared/types.js";
 
 /**
@@ -169,7 +169,11 @@ describe("buildCapabilityManifest", () => {
     expect(manifest).not.toContain("Scheduled tasks");
   });
 
-  it("CM-4: minimal agent (no features) returns empty string", () => {
+  // Memory overhaul 2026-10-25 (WP5) - CM-4 / CM-4b / CM-ADV-MINIMAL used
+  // to pin "" for a minimal agent. The memory protocol is now emitted for
+  // every agent, so a minimal agent gets exactly that section and nothing
+  // else (no capabilities header, no bullets, no advisor block).
+  it("CM-4: minimal agent (no features) returns only the memory protocol", () => {
     const cfg = makeConfig({
       dream: undefined,
       schedules: [],
@@ -178,7 +182,9 @@ describe("buildCapabilityManifest", () => {
     });
 
     const manifest = buildCapabilityManifest(cfg);
-    expect(manifest).toBe("");
+    expect(manifest).toBe(buildMemoryProtocol(cfg).trimStart());
+    expect(manifest.startsWith("## Memory protocol")).toBe(true);
+    expect(manifest).not.toContain("Your ClawCode Capabilities");
   });
 
   it("CM-4b: agent with only memoryAutoLoad enabled (no dream/schedules/skills/gsd) still returns empty", () => {
@@ -193,7 +199,7 @@ describe("buildCapabilityManifest", () => {
     });
 
     const manifest = buildCapabilityManifest(cfg);
-    expect(manifest).toBe("");
+    expect(manifest).toBe(buildMemoryProtocol(cfg).trimStart());
   });
 
   it("CM-5: dream bullet uses the agent's actual idleMinutes + model (no hallucination)", () => {
@@ -587,7 +593,7 @@ describe("buildCapabilityManifest", () => {
     expect((manifest.match(/## Advisor protocol/g) ?? []).length).toBe(1);
   });
 
-  it("CM-ADV-MINIMAL: baseline agent (no opt-ins) still returns '' — advisor block does NOT itself force a non-empty manifest", () => {
+  it("CM-ADV-MINIMAL: baseline agent (no opt-ins) gets no advisor block, only the memory protocol", () => {
     // Matches CM-4 / CM-4b philosophy: the advisor bullet only rides
     // alongside other opt-ins. Truly minimal agents pay no prompt cost.
     const cfg = makeConfig({
@@ -600,7 +606,8 @@ describe("buildCapabilityManifest", () => {
     });
 
     const manifest = buildCapabilityManifest(cfg);
-    expect(manifest).toBe("");
+    expect(manifest).toBe(buildMemoryProtocol(cfg).trimStart());
+    expect(manifest).not.toContain("Advisor");
   });
 
   it("CM-MCP-VAULT-2: 1password server without mcpEnvOverrides → no vault-scoped annotation (inherits daemon scope)", () => {
@@ -622,5 +629,50 @@ describe("buildCapabilityManifest", () => {
     const manifest = buildCapabilityManifest(cfg);
     expect(manifest).toContain("1password");
     expect(manifest).not.toMatch(/vault-scoped/);
+  });
+});
+
+describe("memory protocol (memory overhaul 2026-10-25, WP5)", () => {
+  const minimal = (overrides: Partial<ResolvedAgentConfig> = {}): ResolvedAgentConfig =>
+    makeConfig({ dream: undefined, schedules: [], skills: [], gsd: undefined, mcpServers: [], ...overrides });
+
+  it("names the right tool for each job and the save / correct rules", () => {
+    const protocol = buildCapabilityManifest(minimal());
+    expect(protocol).toContain("## Memory protocol");
+    expect(protocol).toContain("`clawcode_memory_search`");
+    expect(protocol).toMatch(/saved memories and your memory files/);
+    expect(protocol).toContain("`search_documents`");
+    expect(protocol).toContain("`memory_save`");
+    expect(protocol).toMatch(/absolute dates \(YYYY-MM-DD/);
+    expect(protocol).toContain("`clawcode_memory_update(id, content)`");
+    expect(protocol).toContain("`clawcode_memory_forget(id, reason)`");
+    expect(protocol).toMatch(/MEMORY\.md and USER\.md are your short, curated index/);
+    expect(protocol).toContain("`clawcode_memory_recall(memoryId)`");
+  });
+
+  it("is present exactly once for an opted-in agent too", () => {
+    const manifest = buildCapabilityManifest(
+      makeConfig({ dream: { enabled: true, idleMinutes: 30, model: "haiku" }, gsd: { projectDir: "/tmp/p" } }),
+    );
+    expect(manifest).toContain("Your ClawCode Capabilities");
+    expect((manifest.match(/## Memory protocol/g) ?? []).length).toBe(1);
+    expect(manifest).toContain("`clawcode_memory_update` / `clawcode_memory_forget`");
+  });
+
+  it("follows memoryAutoLoad and memoryRetrievalTopK instead of promising memory that was not loaded", () => {
+    const loaded = buildMemoryProtocol(minimal());
+    expect(loaded).toMatch(/loaded into this prompt at session start/);
+    expect(loaded).toMatch(/retrieved for you before each turn/);
+
+    const bare = buildMemoryProtocol(minimal({ memoryAutoLoad: false, memoryRetrievalTopK: 0 }));
+    expect(bare).toMatch(/NOT loaded into this session/);
+    expect(bare).toMatch(/Nothing is retrieved for you automatically/);
+    expect(bare).not.toMatch(/loaded into this prompt at session start/);
+    expect(bare).not.toMatch(/retrieved for you before each turn/);
+  });
+
+  it("contains no em dashes", () => {
+    expect(buildMemoryProtocol(minimal())).not.toContain("\u2014");
+    expect(buildMemoryProtocol(minimal({ memoryAutoLoad: false, memoryRetrievalTopK: 0 }))).not.toContain("\u2014");
   });
 });

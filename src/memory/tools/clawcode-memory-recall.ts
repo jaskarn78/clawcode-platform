@@ -26,6 +26,7 @@
 import { z } from "zod/v4";
 import type { MemoryStore } from "../store.js";
 import { SHARED_FACT_PATH, type SharedFactsStore } from "../shared-facts-store.js";
+import { FORGOTTEN_MARKER } from "../types.js";
 
 export const RECALL_INPUT_SCHEMA = z.object({
   memoryId: z.string().min(1).max(200),
@@ -68,6 +69,8 @@ export interface RecallResult {
    */
   readonly supersededBy?: string;
   readonly supersededAt?: string;
+  /** WP5 - plain-language hint that rides along with `supersededBy`. */
+  readonly note?: string;
   readonly error?: string;
 }
 
@@ -112,12 +115,24 @@ export async function clawcodeMemoryRecall(
     });
   }
 
-  // 1. Try memories table first. getById bumps access_count + accessed_at —
-  //    that's intended (the agent recalled a memory; mark it as accessed).
-  //    A superseded row is still returned (the agent may hold its id from
-  //    an earlier turn) and flagged so the successor can be preferred.
-  const mem = deps.store.getById(id);
+  // 1. Try memories table first. For a live row getById bumps
+  //    access_count + accessed_at, which is intended (the agent recalled a
+  //    memory; mark it as accessed). WP5: a superseded row is still
+  //    returned (the agent may hold its id from an earlier turn), read
+  //    without the access bump and flagged so the successor is preferred.
+  const peeked = deps.store.peekById(id);
+  const mem = peeked && !peeked.supersededBy ? (deps.store.getById(id) ?? peeked) : peeked;
   if (mem) {
+    const retired = mem.supersededBy
+      ? {
+          supersededBy: mem.supersededBy,
+          ...(mem.supersededAt ? { supersededAt: mem.supersededAt } : {}),
+          note:
+            mem.supersededBy === FORGOTTEN_MARKER
+              ? "This memory was forgotten and no longer applies."
+              : `This memory was replaced by ${mem.supersededBy}; recall that id for the current version.`,
+        }
+      : {};
     return Object.freeze({
       ok: true,
       memoryId: id,
@@ -126,8 +141,7 @@ export async function clawcodeMemoryRecall(
       source: mem.source,
       importance: mem.importance,
       created_at: mem.createdAt,
-      ...(mem.supersededBy ? { supersededBy: mem.supersededBy } : {}),
-      ...(mem.supersededAt ? { supersededAt: mem.supersededAt } : {}),
+      ...retired,
     });
   }
 

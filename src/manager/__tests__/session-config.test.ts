@@ -369,8 +369,10 @@ The full context of its creation spans multiple paragraphs of detail.
         { ...makeConfig({ name: "test-agent" }), identity: "X" } as any,
       ],
     }));
-    // Total prompt still small (budget enforcement on tool/admin path)
-    expect(result.systemPrompt.length).toBeLessThan(longToolDefs.length + 500);
+    // Total prompt still small (budget enforcement on tool/admin path).
+    // Memory overhaul 2026-10-25 (WP5): the memory protocol (about 1.5K
+    // chars) is now in every agent's prompt, so it gets its own allowance.
+    expect(result.systemPrompt.length).toBeLessThan(longToolDefs.length + 500 + 1600);
   });
 
   it("v1.5 prompt size is not larger than v1.4 equivalent for typical sources", async () => {

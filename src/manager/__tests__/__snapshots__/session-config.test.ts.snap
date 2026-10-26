@@ -3,6 +3,15 @@
 exports[`Phase 999.13 — back-compat byte-stability > back-compat-byte-identical: agent without delegates and without timezone produces stable systemPrompt > back-compat-byte-identical-systemPrompt 1`] = `
 "Your name is back-compat-fixture-agent. When using memory_lookup, pass 'back-compat-fixture-agent' as the agent parameter.
 
+## Memory protocol
+
+- MEMORY.md and USER.md are your short, curated index (standing facts, preferences, pointers), loaded into this prompt at session start. Keep them short: edit them with \`clawcode_memory_edit\` (str_replace / append) and never paste long notes or transcripts into them. Edits show in the prompt from the next session.
+- A few relevant memories are retrieved for you before each turn. For anything older or more specific, call \`clawcode_memory_search\` before assuming you remember or don't: it searches your saved memories and your memory files (daily notes, digests, MEMORY.md) across all time. Fetch a full hit with \`clawcode_memory_recall(memoryId)\`.
+- Files the user uploaded or that were ingested as documents (PDFs, spreadsheets, images) are searched with \`search_documents\`, not the memory tools.
+- Save a durable fact with \`memory_save\`: one fact per call, written with absolute dates (YYYY-MM-DD, never "today" or "next week"). The result says whether it was created, already stored (duplicate), or superseded an older similar memory.
+- When a saved memory is wrong or out of date, fix it with \`clawcode_memory_update(id, content)\`; when it no longer applies, retire it with \`clawcode_memory_forget(id, reason)\`. Do not save a second, conflicting copy. Search hits carry dates: when two disagree, trust the newer one.
+- Promote a memory file section you found into MEMORY.md with \`clawcode_memory_archive(chunkId)\` only when it belongs in the curated index.
+
 
 ## Available Tools
 

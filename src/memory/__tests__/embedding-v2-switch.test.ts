@@ -241,7 +241,9 @@ describe("retrieval + dedup + dual-write under v2", () => {
     store.insertEmbeddingV2(a.id, quantizeInt8(unit(0)));
     const db = store.getDatabase();
     const decision = checkForDuplicate(unit(0), db, { similarityThreshold: 0.85 });
-    expect(decision.action).toBe("merge");
+    // WP5 - cosine 1.0 is a true duplicate (the drop band), not a merge.
+    // The deprecated mergeMemory helper is still exercised below.
+    expect(decision.action).toBe("duplicate");
     mergeMemory(db, a.id, { content: "merged content", importance: 0.5, tags: [], embedding: unit(0) });
     expect(store.getEmbeddingV2(a.id)).toBeNull();
     expect(store.countMemoriesMissingV2Embedding()).toBe(1);

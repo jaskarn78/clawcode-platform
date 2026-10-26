@@ -316,19 +316,24 @@ describe("MemoryStore", () => {
       return arr;
     }
 
-    it("merges near-duplicate embedding instead of creating two entries", () => {
+    // Memory overhaul 2026-10-25 (WP5) - these two tests used to pin the
+    // destructive merge (content replaced, tags unioned). Dedup is now
+    // non-destructive: a true duplicate (cosine >= 0.95) is dropped and the
+    // existing row is returned untouched.
+    it("drops a true duplicate instead of creating two entries and returns the existing row", () => {
       store = new MemoryStore(":memory:", { enabled: true, similarityThreshold: 0.85 });
       const vec = directionalEmbedding(0, 1.0);
 
-      store.insert({ content: "original", source: "manual" }, vec);
-      store.insert({ content: "duplicate", source: "manual" }, vec);
+      const first = store.insert({ content: "original", source: "manual" }, vec);
+      const second = store.insert({ content: "duplicate", source: "manual" }, vec);
 
+      expect(second.id).toBe(first.id);
       const list = store.listRecent(100);
       expect(list.length).toBe(1);
-      expect(list[0].content).toBe("duplicate");
+      expect(list[0].content).toBe("original");
     });
 
-    it("merged entry keeps max importance and union of tags", () => {
+    it("a dropped duplicate never changes the existing row's importance, tags or access_count", () => {
       store = new MemoryStore(":memory:", { enabled: true, similarityThreshold: 0.85 });
       const vec = directionalEmbedding(0, 1.0);
 
@@ -343,8 +348,10 @@ describe("MemoryStore", () => {
 
       const list = store.listRecent(100);
       expect(list.length).toBe(1);
-      expect(list[0].importance).toBe(0.8);
-      expect([...list[0].tags].sort()).toEqual(["a", "b"]);
+      expect(list[0].content).toBe("original");
+      expect(list[0].importance).toBe(0.3);
+      expect([...list[0].tags]).toEqual(["a"]);
+      expect(list[0].accessCount).toBe(0);
     });
 
     it("skipDedup creates new entry even with duplicate embedding", () => {
@@ -817,13 +824,15 @@ describe("MemoryStore", () => {
       const vec = new Float32Array(384);
       vec[0] = 1.0;
 
-      // No origin_id on either insert → dedup merge path fires as before.
+      // No origin_id on either insert: the dedup path fires. WP5 - a true
+      // duplicate is dropped (the first row survives unchanged) where the
+      // pre-WP5 merge overwrote it with the second text.
       store.insert({ content: "original", source: "manual" }, vec);
       store.insert({ content: "duplicate", source: "manual" }, vec);
 
       const list = store.listRecent(100);
       expect(list.length).toBe(1);
-      expect(list[0].content).toBe("duplicate");
+      expect(list[0].content).toBe("original");
     });
 
     it("duplicate-origin_id insert preserves the FIRST row's createdAt (CLI upserted-vs-skipped contract)", () => {

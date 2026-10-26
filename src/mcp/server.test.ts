@@ -45,7 +45,15 @@ describe("TOOL_DEFINITIONS", () => {
     // 38 = +2 workflow_status, cancel_workflow — 999.165
     // 40 = +2 steer_workflow, edit_workflow — 999.165 slice 3
     // 39 = -1 trainingpeaks_connect_link (public build has no training subsystem)
-    expect(Object.keys(TOOL_DEFINITIONS).length).toBe(39);
+    // 41 = +2 clawcode_memory_forget, clawcode_memory_update (memory overhaul WP5)
+    expect(Object.keys(TOOL_DEFINITIONS).length).toBe(41);
+  });
+
+  it("defines clawcode_memory_forget + clawcode_memory_update tools (memory overhaul WP5)", () => {
+    expect(TOOL_DEFINITIONS.clawcode_memory_forget.ipcMethod).toBe("clawcode-memory-forget");
+    expect(TOOL_DEFINITIONS.clawcode_memory_forget.description).toContain("forgotten");
+    expect(TOOL_DEFINITIONS.clawcode_memory_update.ipcMethod).toBe("clawcode-memory-update");
+    expect(TOOL_DEFINITIONS.clawcode_memory_update.description).toContain("superseded");
   });
 
   it("defines schedule_recurring tool", () => {

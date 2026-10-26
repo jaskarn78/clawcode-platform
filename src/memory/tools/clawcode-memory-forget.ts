@@ -22,6 +22,7 @@
 
 import { z } from "zod/v4";
 import type { MemoryStore } from "../store.js";
+import { FORGOTTEN_MARKER } from "../types.js";
 
 export const FORGET_INPUT_SCHEMA = z.object({
   id: z.string().min(1).max(200),
@@ -94,7 +95,7 @@ export async function clawcodeMemoryForget(
   const at = new Date().toISOString();
   const marked = deps.store.forget(id, at);
   if (!marked) {
-    // Raced with another supersession between the peek and the update.
+    // The store only marks a live row; another writer retired it first.
     const again = deps.store.peekById(id);
     return Object.freeze({
       ok: true,
@@ -120,7 +121,7 @@ export async function clawcodeMemoryForget(
     ok: true,
     id,
     status: "forgotten" as const,
-    supersededBy: "forgotten",
+    supersededBy: FORGOTTEN_MARKER,
     supersededAt: at,
   });
 }

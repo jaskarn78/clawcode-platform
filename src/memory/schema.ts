@@ -36,13 +36,7 @@ export const decayConfigSchema = z.object({
 /** Schema for memory deduplication configuration. */
 export const dedupConfigSchema = z.object({
   enabled: z.boolean().default(true),
-  // Memory overhaul 2026-10-25 (WP5): dedup is non-destructive. A new memory
-  // whose cosine to the nearest live memory is at or above
-  // `duplicateThreshold` is dropped (the existing id is returned); one that
-  // lands between `similarityThreshold` and `duplicateThreshold` is inserted
-  // and the older row is marked superseded by it. Nothing is overwritten.
   similarityThreshold: z.number().min(0).max(1).default(0.85),
-  duplicateThreshold: z.number().min(0).max(1).optional(),
 });
 
 /** Schema for tier configuration. */
@@ -123,7 +117,6 @@ export const memoryConfigSchema = z.object({
   deduplication: dedupConfigSchema.default(() => ({
     enabled: true,
     similarityThreshold: 0.85,
-    duplicateThreshold: 0.95,
   })),
   tiers: tierConfigSchema.default(() => ({
     hotAccessThreshold: 3,

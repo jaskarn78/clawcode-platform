@@ -55,6 +55,9 @@ describe("IPC_METHODS", () => {
       "clawcode-memory-recall",
       "clawcode-memory-edit",
       "clawcode-memory-archive",
+      // Memory overhaul 2026-10-25 (WP5) - clawcode_memory_forget / _update
+      "clawcode-memory-forget",
+      "clawcode-memory-update",
       // Phase 999.14 MCP-10 — operator escape hatches for stale-binding sweep
       "threads-prune-stale",
       "threads-prune-agent",

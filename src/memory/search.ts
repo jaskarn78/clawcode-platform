@@ -31,6 +31,12 @@ const DEFAULT_SCORING_CONFIG: ScoringConfig = {
   halfLifeDays: 30,
 };
 
+/**
+ * Memory overhaul 2026-10-25 (WP5) - extra KNN rows fetched so superseded
+ * memories (filtered after the vec0 k cut) cannot starve the result set.
+ */
+const SUPERSEDED_HEADROOM = 16;
+
 const SELECT_COLUMNS = `m.id, m.content, m.source, m.importance, m.access_count,
         m.tags, m.created_at, m.updated_at, m.accessed_at, m.tier,
         m.source_turn_ids, v.distance`;
@@ -58,8 +64,10 @@ export class SemanticSearch {
     this.scoringConfig = scoringConfig ?? DEFAULT_SCORING_CONFIG;
 
     // Memory overhaul 2026-10-25 (WP5) - superseded rows keep their vectors
-    // so the KNN still sees them; the join filter hides them. The 2x
-    // over-fetch below leaves headroom for the rows it drops.
+    // so the KNN still returns them; the join filter drops them after the
+    // k cut. search() asks for SUPERSEDED_HEADROOM extra rows and keeps the
+    // first 2x topK live ones, so the re-rank pool is unchanged when
+    // nothing is superseded.
     this.searchStmtV1 = db.prepare(`
       SELECT ${SELECT_COLUMNS}
       FROM vec_memories v
@@ -102,10 +110,14 @@ export class SemanticSearch {
     const q = toQueryVector(queryEmbedding);
     // Over-fetch by 2x for re-ranking headroom
     const fetchK = topK * 2;
-    const rawRows =
+    // WP5 - the KNN k counts superseded rows that the join then drops;
+    // ask for headroom and keep the nearest fetchK live rows.
+    const knnK = fetchK + SUPERSEDED_HEADROOM;
+    const rawRows = (
       q.version === "v2"
-        ? (this.searchStmtV2.all(int8ToBuffer(q.vector), fetchK) as SearchRow[])
-        : (this.searchStmtV1.all(q.vector, fetchK) as SearchRow[]);
+        ? (this.searchStmtV2.all(int8ToBuffer(q.vector), knnK) as SearchRow[])
+        : (this.searchStmtV1.all(q.vector, knnK) as SearchRow[])
+    ).slice(0, fetchK);
     const rows =
       q.version === "v2"
         ? rawRows.map((r) => ({ ...r, distance: normalizeDistance(r.distance, "v2") }))

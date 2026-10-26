@@ -36,13 +36,13 @@ export type MemoryEntry = {
   /**
    * Memory overhaul 2026-10-25 (WP5) - supersession. The id of the memory
    * that replaced this one, or `FORGOTTEN_MARKER` when an agent retired it
-   * with clawcode_memory_forget. Null (or absent on a row read through a
-   * statement that does not select the column) means the memory is live.
-   * Superseded rows stay in the table but are excluded from every search
-   * and retrieval path by default.
+   * with clawcode_memory_forget. Absent (or null) means the memory is live;
+   * the store only sets the key on a retired row. Superseded rows stay in
+   * the table but are excluded from the default search, retrieval, listing
+   * and hot-tier paths.
    */
   readonly supersededBy?: string | null;
-  /** ISO timestamp of the supersession; null while the memory is live. */
+  /** ISO timestamp of the supersession; absent or null while the memory is live. */
   readonly supersededAt?: string | null;
 };
 
@@ -92,11 +92,13 @@ export type CreateMemoryInput = {
    */
   readonly origin_id?: string;
   /**
-   * Memory overhaul 2026-10-25 (WP5) - explicit supersession. When set, the
-   * named row is marked `superseded_by = <new id>` inside the same
-   * transaction as the insert (clawcode_memory_update uses this with
-   * `skipDedup: true` so a correction never collides with a third memory).
-   * Ignored when the named row does not exist.
+   * Memory overhaul 2026-10-25 (WP5) - explicit supersession (the
+   * clawcode_memory_update path). When set, the named row is marked
+   * `superseded_by = <new id>` inside the same transaction as the insert,
+   * and the similarity dedup probe is skipped, so a correction can never be
+   * dropped as a duplicate of some third memory. Only a live row is
+   * retired; a missing or already superseded row is left alone and the
+   * insert reports "created".
    */
   readonly supersedes?: string;
 };

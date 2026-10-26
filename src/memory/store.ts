@@ -91,9 +91,11 @@ type PreparedStatements = {
   /** Phase 999.119 — retrieval-side recency touch (no access_count bump). */
   readonly touchAccessedAt: Statement;
   /**
-   * Memory overhaul 2026-10-25 (WP5) - mark a memory superseded. Bound as
-   * (superseded_by, superseded_at, id). The row stays in place with its
-   * vectors; every default search path filters `superseded_by IS NULL`.
+   * Memory overhaul 2026-10-25 (WP5) - mark a LIVE memory superseded. Bound
+   * as (superseded_by, superseded_at, id); a row that is already superseded
+   * is left alone (0 changes). The row keeps its content, vectors and links;
+   * every default read path filters `superseded_by IS NULL`. A hot row is
+   * dropped to warm so it stops holding a hot-tier slot.
    */
   readonly markSuperseded: Statement;
   /** WP5 - `listRecent` including superseded rows (operator / audit view). */
@@ -170,8 +172,8 @@ type DedupStoreConfig = {
   readonly similarityThreshold: number;
   /**
    * Memory overhaul 2026-10-25 (WP5) - floor of the drop band (a true
-   * duplicate is not stored). Optional so the resolved agent config, which
-   * predates the knob, still type-checks; the store fills the default.
+   * duplicate is not stored). Optional and not exposed in the agent YAML;
+   * the store fills DEDUP_DUPLICATE_THRESHOLD (0.95).
    */
   readonly duplicateThreshold?: number;
 };
@@ -185,6 +187,12 @@ const DEFAULT_DEDUP_CONFIG: Required<DedupStoreConfig> = {
 
 /** WP5 - optional flag for the read paths that hide superseded rows by default. */
 export type SupersededReadOpts = Readonly<{ includeSuperseded?: boolean }>;
+
+/**
+ * WP5 - extra KNN rows `searchMemoriesVec` fetches so superseded memories,
+ * filtered after the vec0 k cut, cannot starve the result set.
+ */
+const SUPERSEDED_KNN_HEADROOM = 16;
 
 export class MemoryStore {
   private readonly db: DatabaseType;
@@ -220,11 +228,12 @@ export class MemoryStore {
 
   constructor(dbPath: string, dedupConfig?: DedupStoreConfig) {
     this.dbPath = dbPath;
-    // WP5 - merge over the defaults so a config that predates
-    // `duplicateThreshold` (the resolved agent config) still gets 0.95.
+    // WP5 - the resolved agent config carries only enabled +
+    // similarityThreshold; the duplicate floor falls back to 0.95.
     this.dedupConfig = {
-      ...DEFAULT_DEDUP_CONFIG,
-      ...(dedupConfig ?? {}),
+      enabled: dedupConfig?.enabled ?? DEFAULT_DEDUP_CONFIG.enabled,
+      similarityThreshold:
+        dedupConfig?.similarityThreshold ?? DEFAULT_DEDUP_CONFIG.similarityThreshold,
       duplicateThreshold:
         dedupConfig?.duplicateThreshold ?? DEFAULT_DEDUP_CONFIG.duplicateThreshold,
     };
@@ -291,7 +300,14 @@ export class MemoryStore {
    * Phase 115 D-08 dual-write extension: when `opts.embeddingV2` is
    * provided, ALSO writes `vec_memories_v2` inside the SAME transaction.
    * Phase 107 atomic-cascade invariant: either all THREE rows commit
-   * (memories + vec_memories + vec_memories_v2) or NONE do.
+   * (memories + vec_memories + vec_memories_v2) or NONE do — a throw
+   * inside the transaction (e.g. v2 INSERT fails) rolls back the v1
+   * write too.
+   *
+   * The opts.embeddingV2 path is consumed by:
+   *   - The wave-4 dual-write hook in MemoryStore callers (when
+   *     EmbeddingV2Migrator.currentWriteVersions() includes "v2").
+   *   - The `insertWithDualWrite` convenience wrapper below (this plan).
    *
    * Memory overhaul 2026-10-25 (WP5): thin wrapper over
    * `insertWithStatus` that keeps the pre-existing return shape (the
@@ -311,20 +327,25 @@ export class MemoryStore {
    * Memory overhaul 2026-10-25 (WP5) - dedup-aware insert that reports
    * what happened. Dedup is NON-DESTRUCTIVE: nothing is ever overwritten.
    *
-   *   - cosine to the nearest live memory >= duplicateThreshold (0.95):
-   *     the new content is dropped; `{ status: "duplicate", entry: existing }`.
-   *     The existing row's accessed_at is touched (a restated fact is in
-   *     use) but its access_count, content, tags and links are untouched.
-   *   - similarityThreshold (0.85) <= cosine < duplicateThreshold: the new
-   *     row is written and the older row is marked
+   *   - cosine to the nearest eligible live memory >= the duplicate floor
+   *     (0.95): the new content is dropped; `{ status: "duplicate",
+   *     entry: existing }`. The existing row's accessed_at is touched (a
+   *     restated fact is in use) but its access_count, content, tags and
+   *     links are untouched.
+   *   - similarityThreshold (0.85) <= cosine < duplicate floor: the new row
+   *     is written and the older row is marked
    *     `superseded_by = <new id>, superseded_at = now` inside the same
    *     transaction; `{ status: "superseded", entry: new, supersedes: old }`.
    *   - otherwise `{ status: "created" }`.
+   * Eligibility (live rows without a summary, flush or digest tag, see
+   * DEDUP_EXCLUDED_TAGS) is decided by `checkForDuplicate`.
    *
    * `input.supersedes` names a row to retire explicitly (the correction
    * path used by clawcode_memory_update). It implies `skipDedup`: the
    * caller has already decided what this content replaces, so a third
-   * memory is never pulled into the comparison.
+   * memory is never pulled into the comparison. Only a live row is
+   * retired; when the named row is missing or already superseded the new
+   * row is still written and the status is "created".
    *
    * The origin_id path keeps its INSERT OR IGNORE contract and reports a
    * collision as `status: "duplicate"` with the existing row.
@@ -354,7 +375,7 @@ export class MemoryStore {
       let supersedes: string | undefined = explicitSupersedes;
       let similarity: number | undefined;
 
-      // Dedup probe — only when origin_id is absent AND dedup is enabled AND
+      // Dedup probe: only when origin_id is absent AND dedup is enabled AND
       // the caller did not opt out (skipDedup or an explicit supersedes).
       if (
         !hasOriginId &&
@@ -456,9 +477,9 @@ export class MemoryStore {
           }
         }
 
-        // WP5 - explicit supersession, same transaction as the new row so a
+        // WP5 - supersession in the same transaction as the new row, so a
         // crash can never leave the old row retired with no successor.
-        if (supersedes !== undefined && supersedes !== id) {
+        if (supersedes !== undefined) {
           const marked = this.stmts.markSuperseded.run(id, now, supersedes);
           supersededRow = marked.changes > 0;
         }
@@ -515,8 +536,6 @@ export class MemoryStore {
           input.sourceTurnIds && input.sourceTurnIds.length > 0
             ? Object.freeze([...input.sourceTurnIds])
             : null,
-        supersededBy: null,
-        supersededAt: null,
       });
       if (supersededRow && supersedes !== undefined) {
         return Object.freeze({
@@ -563,9 +582,10 @@ export class MemoryStore {
   /**
    * Memory overhaul 2026-10-25 (WP5) - mark `oldId` as replaced by
    * `newId`. The old row keeps its content, vectors and links; it simply
-   * stops surfacing in search, retrieval and listing. Returns true when a
-   * row was marked. Marking a row that is already superseded re-points it
-   * (explicit intent wins); `newId` must be a different id.
+   * stops surfacing in search, retrieval, listing and the hot tier.
+   * Only a LIVE row is marked: returns false when `oldId` is missing or
+   * already superseded (its existing pointer is kept), or when the two ids
+   * are equal.
    */
   supersede(oldId: string, newId: string, at?: string): boolean {
     if (oldId === newId) return false;
@@ -596,12 +616,11 @@ export class MemoryStore {
    */
   forget(id: string, at?: string): boolean {
     try {
-      const result = this.db
-        .prepare(
-          `UPDATE memories SET superseded_by = ?, superseded_at = ?
-           WHERE id = ? AND superseded_by IS NULL`,
-        )
-        .run(FORGOTTEN_MARKER, at ?? new Date().toISOString(), id);
+      const result = this.stmts.markSuperseded.run(
+        FORGOTTEN_MARKER,
+        at ?? new Date().toISOString(),
+        id,
+      );
       return result.changes > 0;
     } catch (error) {
       const message =
@@ -1511,15 +1530,18 @@ export class MemoryStore {
   /**
    * List memories filtered by tier, ordered by accessed_at descending.
    * Returns a frozen array of MemoryEntry objects.
+   *
+   * WP5 - superseded rows are never listed, so a corrected or forgotten
+   * memory can never be injected as a hot memory.
    */
   listByTier(tier: MemoryTier, limit: number): readonly MemoryEntry[] {
     try {
       const rows = this.db
         .prepare(
           `SELECT id, content, source, updated_at, accessed_at, importance,
-                  access_count, tags, created_at, tier, source_turn_ids,
-                  superseded_by, superseded_at
-           FROM memories WHERE tier = ? ORDER BY accessed_at DESC LIMIT ?`,
+                  access_count, tags, created_at, tier, source_turn_ids
+           FROM memories WHERE tier = ? AND superseded_by IS NULL
+           ORDER BY accessed_at DESC LIMIT ?`,
         )
         .all(tier, limit) as MemoryRow[];
       return Object.freeze(rows.map(rowToEntry));
@@ -2537,9 +2559,10 @@ export class MemoryStore {
    *     or "forgotten" (FORGOTTEN_MARKER) when an agent retired it with no
    *     successor. NULL = live.
    *   - `memories.superseded_at` - ISO timestamp of the supersession.
-   *   - `idx_memories_superseded` - the default read paths filter on
-   *     `superseded_by IS NULL`; the index keeps the NOT IN / join filters
-   *     a lookup instead of a scan as retired rows accumulate.
+   *   - `idx_memories_superseded` - partial index over the retired rows
+   *     only (live rows are NULL and stay out of it), so the FTS path's
+   *     `NOT IN (SELECT id ... WHERE superseded_by IS NOT NULL)` and a
+   *     "what replaced X" lookup read the small retired set, not the table.
    *
    * PRAGMA-check + ALTER pattern identical to migrateSourceTurnIds. No
    * backfill: every pre-existing row is live.
@@ -2555,7 +2578,8 @@ export class MemoryStore {
       this.db.exec("ALTER TABLE memories ADD COLUMN superseded_at TEXT DEFAULT NULL");
     }
     this.db.exec(
-      "CREATE INDEX IF NOT EXISTS idx_memories_superseded ON memories(superseded_by)",
+      `CREATE INDEX IF NOT EXISTS idx_memories_superseded
+         ON memories(superseded_by) WHERE superseded_by IS NOT NULL`,
     );
   }
 
@@ -2794,23 +2818,17 @@ export class MemoryStore {
   ): ReadonlyArray<Readonly<{ memory_id: string; rank: number }>> {
     const match = buildFtsMatchQuery(query);
     if (!match) return [];
+    // WP5 - superseded rows are filtered BEFORE the LIMIT (the FTS table
+    // keeps their tokens; the memories row carries the flag). The subquery
+    // reads only the partial idx_memories_superseded index.
+    const liveFilter = opts?.includeSuperseded
+      ? ""
+      : " AND memory_id NOT IN (SELECT id FROM memories WHERE superseded_by IS NOT NULL)";
     try {
-      // WP5 - superseded rows are filtered BEFORE the LIMIT (the FTS table
-      // keeps their tokens; the memories row carries the flag).
-      if (opts?.includeSuperseded) {
-        return this.db
-          .prepare(
-            `SELECT memory_id, rank FROM memories_fts
-             WHERE memories_fts MATCH ? ORDER BY rank LIMIT ?`,
-          )
-          .all(match, limit) as ReadonlyArray<{ memory_id: string; rank: number }>;
-      }
       return this.db
         .prepare(
           `SELECT memory_id, rank FROM memories_fts
-           WHERE memories_fts MATCH ?
-             AND memory_id NOT IN (SELECT id FROM memories WHERE superseded_by IS NOT NULL)
-           ORDER BY rank LIMIT ?`,
+           WHERE memories_fts MATCH ?${liveFilter} ORDER BY rank LIMIT ?`,
         )
         .all(match, limit) as ReadonlyArray<{ memory_id: string; rank: number }>;
     } catch {
@@ -2848,10 +2866,11 @@ export class MemoryStore {
     const q = toQueryVector(queryEmbedding);
     // WP5 - superseded rows keep their vectors, so the KNN still returns
     // them and the join filter drops them AFTER the k cut. Over-fetch and
-    // slice so a run of retired near-duplicates cannot starve the caller.
+    // slice so a run of retired near-duplicates cannot starve the caller;
+    // with nothing superseded the result is the same nearest `limit` rows.
     const includeSuperseded = opts?.includeSuperseded === true;
     const liveFilter = includeSuperseded ? "" : " AND m.superseded_by IS NULL";
-    const k = includeSuperseded ? limit : Math.max(limit * 2, limit + 8);
+    const k = includeSuperseded ? limit : limit + SUPERSEDED_KNN_HEADROOM;
     try {
       // Phase 999.119 pass 2 — JOIN memories so the retriever gets the
       // recency/importance signals without a second lookup, and so a vec
@@ -3043,9 +3062,12 @@ export class MemoryStore {
                superseded_by, superseded_at
         FROM memories WHERE id = ?
       `),
-      markSuperseded: this.db.prepare(
-        "UPDATE memories SET superseded_by = ?, superseded_at = ? WHERE id = ?",
-      ),
+      markSuperseded: this.db.prepare(`
+        UPDATE memories
+        SET superseded_by = ?, superseded_at = ?,
+            tier = CASE WHEN tier = 'hot' THEN 'warm' ELSE tier END
+        WHERE id = ? AND superseded_by IS NULL
+      `),
       insertSessionLog: this.db.prepare(`
         INSERT INTO session_logs (id, date, file_path, entry_count, created_at)
         VALUES (?, ?, ?, ?, ?)
@@ -3056,24 +3078,24 @@ export class MemoryStore {
       deleteLinksFrom: this.db.prepare(
         "DELETE FROM memory_links WHERE source_id = ?",
       ),
+      // WP5 - graph neighbours are live rows only, so GraphSearch's 1-hop
+      // expansion (memory_lookup) never surfaces a superseded memory.
       getBacklinks: this.db.prepare(`
         SELECT m.id, m.content, m.source, m.importance, m.access_count, m.tags,
                m.created_at, m.updated_at, m.accessed_at, m.tier, m.source_turn_ids,
-               m.superseded_by, m.superseded_at,
                ml.link_text
         FROM memory_links ml
         JOIN memories m ON ml.source_id = m.id
-        WHERE ml.target_id = ?
+        WHERE ml.target_id = ? AND m.superseded_by IS NULL
         ORDER BY m.created_at DESC
       `),
       getForwardLinks: this.db.prepare(`
         SELECT m.id, m.content, m.source, m.importance, m.access_count, m.tags,
                m.created_at, m.updated_at, m.accessed_at, m.tier, m.source_turn_ids,
-               m.superseded_by, m.superseded_at,
                ml.link_text
         FROM memory_links ml
         JOIN memories m ON ml.target_id = m.id
-        WHERE ml.source_id = ?
+        WHERE ml.source_id = ? AND m.superseded_by IS NULL
         ORDER BY m.created_at DESC
       `),
       checkMemoryExists: this.db.prepare(
@@ -3182,7 +3204,10 @@ function rowToEntry(row: MemoryRow): MemoryEntry {
     accessedAt: row.accessed_at,
     tier: (row.tier ?? "warm") as MemoryTier,
     sourceTurnIds,
-    supersededBy: row.superseded_by ?? null,
-    supersededAt: row.superseded_at ?? null,
+    // WP5 - the supersession keys are present only on retired rows, so a
+    // live entry keeps exactly the pre-WP5 shape.
+    ...(row.superseded_by
+      ? { supersededBy: row.superseded_by, supersededAt: row.superseded_at ?? null }
+      : {}),
   });
 }

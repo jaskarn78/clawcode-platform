@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { MemoryStore } from "../store.js";
-import { checkForDuplicate, mergeMemory } from "../dedup.js";
+import { checkForDuplicate, mergeMemory, DEDUP_EXCLUDED_TAGS } from "../dedup.js";
 import type { DedupConfig, MergeInput } from "../dedup.js";
 import { MemoryError } from "../errors.js";
 
@@ -36,6 +36,14 @@ function directionalEmbedding(dim: number, value: number): Float32Array {
 
 const DEFAULT_CONFIG: DedupConfig = { similarityThreshold: 0.85 };
 
+/** Unit vector whose cosine to `directionalEmbedding(0, 1)` is exactly `c`. */
+function cosineTo0(c: number): Float32Array {
+  const arr = new Float32Array(384);
+  arr[0] = c;
+  arr[1] = Math.sqrt(1 - c * c);
+  return arr;
+}
+
 describe("checkForDuplicate", () => {
   let store: MemoryStore;
 
@@ -53,7 +61,7 @@ describe("checkForDuplicate", () => {
     expect(result).toEqual({ action: "insert" });
   });
 
-  it("returns merge when existing memory has similarity above threshold", () => {
+  it("returns duplicate when the nearest live memory is at or above 0.95 cosine (WP5)", () => {
     store = createTestStore();
     const db = store.getDatabase();
 
@@ -64,16 +72,73 @@ describe("checkForDuplicate", () => {
       existingVec,
     );
 
-    // Query with a very similar vector (also pointing in dim 0)
-    // Cosine similarity should be ~1.0 (well above 0.85)
+    // Query with an identical vector: cosine ~1.0, inside the drop band.
     const queryVec = directionalEmbedding(0, 1.0);
     const result = checkForDuplicate(queryVec, db, DEFAULT_CONFIG);
 
-    expect(result.action).toBe("merge");
-    if (result.action === "merge") {
+    expect(result.action).toBe("duplicate");
+    if (result.action === "duplicate") {
       expect(result.existingId).toBe(entry.id);
-      expect(result.similarity).toBeGreaterThanOrEqual(0.85);
+      expect(result.similarity).toBeGreaterThanOrEqual(0.95);
     }
+  });
+
+  it("returns supersede when the threshold <= cosine < 0.95 (WP5)", () => {
+    store = createTestStore();
+    const db = store.getDatabase();
+    const entry = store.insert(
+      { content: "deadline is March 3", source: "manual" },
+      directionalEmbedding(0, 1.0),
+    );
+
+    const result = checkForDuplicate(cosineTo0(0.9), db, DEFAULT_CONFIG);
+
+    expect(result.action).toBe("supersede");
+    if (result.action === "supersede") {
+      expect(result.existingId).toBe(entry.id);
+      expect(result.similarity).toBeCloseTo(0.9, 3);
+    }
+  });
+
+  it("ignores superseded rows and summary / flush / digest rows (WP5)", () => {
+    store = createTestStore();
+    const db = store.getDatabase();
+    const retired = store.insert(
+      { content: "old fact", source: "manual", skipDedup: true },
+      directionalEmbedding(0, 1.0),
+    );
+    const successor = store.insert(
+      { content: "unrelated", source: "manual", skipDedup: true },
+      directionalEmbedding(5, 1.0),
+    );
+    expect(store.supersede(retired.id, successor.id)).toBe(true);
+    expect(DEDUP_EXCLUDED_TAGS).toEqual([
+      "session-summary",
+      "mid-session",
+      "raw-fallback",
+      "weekly-digest",
+      "monthly-digest",
+    ]);
+    for (const tag of DEDUP_EXCLUDED_TAGS) {
+      store.insert(
+        { content: `summary ${tag}`, source: "conversation", tags: [tag], skipDedup: true },
+        directionalEmbedding(0, 1.0),
+      );
+    }
+
+    expect(checkForDuplicate(directionalEmbedding(0, 1.0), db, DEFAULT_CONFIG)).toEqual({
+      action: "insert",
+    });
+  });
+
+  it("a threshold above 0.95 drops only at or above that threshold and has no supersede band (WP5)", () => {
+    store = createTestStore();
+    const db = store.getDatabase();
+    store.insert({ content: "fact", source: "manual" }, directionalEmbedding(0, 1.0));
+
+    const strict: DedupConfig = { similarityThreshold: 0.97 };
+    expect(checkForDuplicate(cosineTo0(0.96), db, strict)).toEqual({ action: "insert" });
+    expect(checkForDuplicate(cosineTo0(0.98), db, strict).action).toBe("duplicate");
   });
 
   it("returns insert when existing memory has similarity below threshold", () => {

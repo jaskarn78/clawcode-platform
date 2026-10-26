@@ -52,29 +52,40 @@ export interface SearchHit {
   readonly memoryId: string;
   /** Optional heading from a memory_chunks row. */
   readonly heading?: string | null;
-  /** Snippet — first 500 chars of the body, regardless of source. */
+  /** Snippet capped at 500 chars (Pain Point #2: prevents giant-blob leaks). */
   readonly snippet: string;
   /** Fused RRF + path-derived score. Higher is better. */
   readonly score: number;
   /**
-   * Where the hit came from: a memory file section ("chunk"), a saved
-   * memory ("memory") or one of the owner's shared facts ("owner-fact",
-   * WP5; recall it with the same `shared:<id>` id).
+   * Retrieval surface: memory_chunks ("chunk", which also carries the
+   * owner's shared facts) or the memories table ("memory"). Kept as the
+   * pre-WP5 two-value field; `kind` below is the finer label.
    */
-  readonly source: "chunk" | "memory" | "owner-fact";
+  readonly source: "chunk" | "memory";
   /** Path of the originating file (memory_chunks) or synthetic memory:<id> (memories). */
   readonly path?: string;
   /**
-   * WP5 - when the content dates from: the saved memory's created_at, the
-   * memory file's mtime for a chunk, or the owner fact's created_at. ISO.
-   * Lets the agent prefer the fresher of two contradicting hits.
+   * Memory overhaul 2026-10-25 (WP5) - what the hit is: a saved memory
+   * ("memory"), a section of a memory file such as a daily note, digest or
+   * MEMORY.md ("file"), or one of the owner's shared facts ("owner-fact",
+   * recall it with the same `shared:<id>` id).
+   */
+  readonly kind: SearchHitKind;
+  /**
+   * WP5 - when the content dates from (ISO): the saved memory's
+   * created_at, the memory file's mtime for a file section, or the owner
+   * fact's created_at. Lets the agent prefer the fresher of two
+   * contradicting hits.
    */
   readonly createdAt?: string;
-  /** WP5 - tags of a saved memory (empty for chunks and owner facts). */
+  /** WP5 - tags of a saved memory (absent for file sections and owner facts). */
   readonly tags?: ReadonlyArray<string>;
   /** WP5 - the saved memory's `source` column (manual, conversation, consolidation ...). */
-  readonly sourceKind?: string;
+  readonly memorySource?: string;
 }
+
+/** WP5 - finer hit label than `SearchHit.source`. */
+export type SearchHitKind = "memory" | "file" | "owner-fact";
 
 export interface SearchDeps {
   readonly store: MemoryStore;
@@ -123,6 +134,18 @@ const SNIPPET_MAX_CHARS = 500;
 const SHARED_ID_PREFIX = "shared:";
 
 /**
+ * WP5 - the store as the retriever sees it when `includeTags` is set: the
+ * same store minus `touchAccessedAt`, so the retriever does not reset the
+ * decay clock of memories the tag filter then drops (it skips the touch
+ * when the method is absent). The tool touches only the hits it returns.
+ */
+function storeWithoutRetrievalTouch(store: MemoryStore): MemoryStore {
+  return Object.create(store, {
+    touchAccessedAt: { value: undefined, enumerable: false },
+  }) as MemoryStore;
+}
+
+/**
  * Phase 115 Plan 05 sub-scope 7 — `clawcode_memory_search` tool body.
  *
  * Pure-DI: no daemon imports, no fs imports. Production wiring at the
@@ -135,9 +158,14 @@ export async function clawcodeMemorySearch(
 ): Promise<SearchResult> {
   const parsed = SEARCH_INPUT_SCHEMA.parse(input);
 
+  const tagFilter =
+    parsed.includeTags && parsed.includeTags.length > 0
+      ? new Set(parsed.includeTags)
+      : undefined;
+
   const chunks = await retrieveMemoryChunks({
     query: parsed.query,
-    store: deps.store,
+    store: tagFilter ? storeWithoutRetrievalTouch(deps.store) : deps.store,
     // Phase 999.119 v2 switch — follow the agent's read version.
     embed: (q) =>
       typeof deps.embedder.embedForVersion === "function"
@@ -177,21 +205,26 @@ export async function clawcodeMemorySearch(
     const memoryId = c.chunkId ?? "";
     if (memoryId.length === 0) continue;
     const body = c.body ?? "";
-    const isOwnerFact = memoryId.startsWith(SHARED_ID_PREFIX);
+    const kind: SearchHitKind =
+      c.source === "memory"
+        ? "memory"
+        : memoryId.startsWith(SHARED_ID_PREFIX)
+          ? "owner-fact"
+          : "file";
     // WP5 - provenance per hit. Both lookups are side-effect free (no
     // access bump): getMemoryForRetrieval for saved memories, getMemoryChunk
-    // for file sections. A retriever that already carries createdAt wins.
+    // for file sections. A date the retriever already carries wins.
     let createdAt = c.createdAt;
     let tags: ReadonlyArray<string> | undefined;
-    let sourceKind: string | undefined;
-    if (c.source === "memory") {
+    let memorySource: string | undefined;
+    if (kind === "memory") {
       const meta = deps.store.getMemoryForRetrieval(memoryId);
       if (meta) {
         createdAt = createdAt ?? meta.created_at;
         tags = meta.tags;
-        sourceKind = meta.source;
+        memorySource = meta.source;
       }
-    } else if (!isOwnerFact && createdAt === undefined) {
+    } else if (kind === "file" && createdAt === undefined) {
       const chunk = deps.store.getMemoryChunk(memoryId);
       if (chunk && Number.isFinite(chunk.file_mtime_ms) && chunk.file_mtime_ms > 0) {
         createdAt = new Date(chunk.file_mtime_ms).toISOString();
@@ -202,27 +235,35 @@ export async function clawcodeMemorySearch(
       heading: c.heading,
       snippet: body.length > SNIPPET_MAX_CHARS ? body.slice(0, SNIPPET_MAX_CHARS) : body,
       score: c.fusedScore ?? 0,
-      source: isOwnerFact ? "owner-fact" : c.source,
+      source: c.source,
       path: c.path,
+      kind,
       ...(createdAt ? { createdAt } : {}),
       ...(tags ? { tags } : {}),
-      ...(sourceKind ? { sourceKind } : {}),
+      ...(memorySource ? { memorySource } : {}),
     });
+  }
+
+  if (!tagFilter) {
+    return { hits: Object.freeze(hits), agentName: deps.agentName };
   }
 
   // Optional includeTags filter, applied post-retrieval. Tags exist only on
-  // saved memories, so when the filter is set, chunk and owner-fact hits
+  // saved memories: when the filter is set, file sections and owner facts
   // (no tags) are dropped and a saved memory is kept only when its tags
-  // intersect the list. The tags were read above without touching access
-  // state, so filtered-out rows are never counted as accessed (WP5).
-  if (parsed.includeTags && parsed.includeTags.length > 0) {
-    const wanted = new Set(parsed.includeTags);
-    const filtered = hits.filter((h) => {
-      if (h.source !== "memory") return false;
-      return (h.tags ?? []).some((t) => wanted.has(t));
-    });
-    return { hits: Object.freeze(filtered), agentName: deps.agentName };
+  // intersect the list. With no filter every hit is kept (above). WP5: the
+  // tags were read without an access bump and the retriever's recency
+  // touch was withheld, so only the memories actually returned are touched.
+  const filtered = hits.filter(
+    (h) => h.kind === "memory" && (h.tags ?? []).some((t) => tagFilter.has(t)),
+  );
+  const keptMemoryIds = filtered.map((h) => h.memoryId);
+  if (keptMemoryIds.length > 0) {
+    try {
+      deps.store.touchAccessedAt(keptMemoryIds);
+    } catch {
+      /* bookkeeping never fails a search */
+    }
   }
-
-  return { hits: Object.freeze(hits), agentName: deps.agentName };
+  return { hits: Object.freeze(filtered), agentName: deps.agentName };
 }

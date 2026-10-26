@@ -156,3 +156,19 @@ describe("research hook — researcher tool enforcement (999.173)", () => {
     });
   });
 });
+
+describe("researcher tool policy: memory corrections (memory overhaul WP5)", () => {
+  it.each([["mcp__clawcode__clawcode_memory_forget"], ["mcp__clawcode__clawcode_memory_update"]])(
+    "denies %s (it changes the memory store)",
+    (tool) => {
+      expect(decideResearcherTool(tool, {}, OFF).deny).toBe(true);
+    },
+  );
+
+  it("lists both in disallowedTools (layer 1) and still allows recall", () => {
+    const list = researcherDisallowedTools({ allowBash: false, deniedTools: [] });
+    expect(list).toContain("mcp__clawcode__clawcode_memory_forget");
+    expect(list).toContain("mcp__clawcode__clawcode_memory_update");
+    expect(decideResearcherTool("mcp__clawcode__clawcode_memory_recall", {}, OFF)).toEqual({ deny: false });
+  });
+});

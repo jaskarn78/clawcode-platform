@@ -18564,8 +18564,19 @@ export async function routeMethod(
 
       const embedder = manager.getEmbedder();
       const embedding = await embedder.embed(content);
-      const entry = store.insert({ content, source: "conversation", importance, tags }, embedding);
-      return { id: entry.id };
+      // Memory overhaul 2026-10-25 (WP5) - report what dedup did so the
+      // agent is told the truth: "created", "duplicate" (nothing stored,
+      // `id` is the existing memory) or "superseded" (new row stored, the
+      // older near-duplicate `supersedes` is now hidden from search).
+      const outcome = store.insertWithStatus(
+        { content, source: "conversation", importance, tags },
+        embedding,
+      );
+      return {
+        id: outcome.entry.id,
+        status: outcome.status,
+        ...(outcome.supersedes ? { supersedes: outcome.supersedes } : {}),
+      };
     }
 
     // ── Phase 115 sub-scope 7 — lazy-load memory tools ─────────────────
@@ -18648,9 +18659,17 @@ export async function routeMethod(
         );
       }
 
+      // Memory overhaul 2026-10-25 (WP5) - `shared:<id>` hits from search
+      // are recallable. Owner from the agent's OWN config, same as search.
+      const recallOwner =
+        manager.getAgentConfig(agentName)?.owner ?? configs.find((c) => c.name === agentName)?.owner;
+      const sharedForRecall = manager.getSharedFactsStore();
+      const recallOwnerFacts =
+        recallOwner && sharedForRecall ? { store: sharedForRecall, owner: recallOwner } : undefined;
+
       const result = await clawcodeMemoryRecall(
         { memoryId },
-        { store, agentName },
+        { store, agentName, ownerFacts: recallOwnerFacts },
       );
       return result;
     }
@@ -18752,6 +18771,61 @@ export async function routeMethod(
         },
       );
       return result;
+    }
+
+    // ── Memory overhaul 2026-10-25 (WP5) - corrections on saved memories ──
+    //
+    // forget retires a row (superseded_by = "forgotten"); update inserts the
+    // corrected content and marks the old row superseded by it. Nothing is
+    // deleted. Same per-agent resolution and C3 identity gate as the four
+    // lazy-load tools above.
+    case "clawcode-memory-forget": {
+      const agentName = validateStringParam(params, "agent");
+      enforceAgentIdentity(params, agentName); // C3: gate cross-agent access
+      const id = validateStringParam(params, "id");
+      const reason = validateStringParam(params, "reason");
+
+      const store = manager.getMemoryStore(agentName);
+      if (!store) {
+        throw new ManagerError(
+          `Memory store not found for agent '${agentName}' (agent may not be running)`,
+        );
+      }
+
+      const { clawcodeMemoryForget } = await import("../memory/tools/clawcode-memory-forget.js");
+      const forgetLog = logger.child({ component: "clawcode-memory-forget" });
+      return clawcodeMemoryForget(
+        { id, reason },
+        { store, agentName, log: { info: (obj, msg) => forgetLog.info(obj, msg) } },
+      );
+    }
+
+    case "clawcode-memory-update": {
+      const agentName = validateStringParam(params, "agent");
+      enforceAgentIdentity(params, agentName); // C3: gate cross-agent access
+      const id = validateStringParam(params, "id");
+      const content = validateStringParam(params, "content");
+      const tags = Array.isArray(params.tags) ? (params.tags as string[]) : undefined;
+
+      const store = manager.getMemoryStore(agentName);
+      if (!store) {
+        throw new ManagerError(
+          `Memory store not found for agent '${agentName}' (agent may not be running)`,
+        );
+      }
+
+      const { clawcodeMemoryUpdate } = await import("../memory/tools/clawcode-memory-update.js");
+      const embedder = manager.getEmbedder();
+      const updateLog = logger.child({ component: "clawcode-memory-update" });
+      return clawcodeMemoryUpdate(
+        { id, content, ...(tags ? { tags } : {}) },
+        {
+          store,
+          agentName,
+          embed: (text: string) => embedder.embed(text),
+          log: { info: (obj, msg) => updateLog.info(obj, msg) },
+        },
+      );
     }
 
     case "memory-graph": {

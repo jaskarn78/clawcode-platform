@@ -27,9 +27,10 @@ const ADVISOR_DAILY_BUDGET_HINT = 10;
  * Placement: after identity, before the mutable suffix (so it sits in
  * the cached stable prefix and is cache-friendly across turns).
  *
- * Returns the markdown block as a string. Returns "" when the agent has
- * zero notable opted-in features (a baseline agent with only
- * memoryAutoLoad shouldn't pay the prompt cost).
+ * Returns the markdown block as a string. When the agent has zero notable
+ * opted-in features (a baseline agent with only memoryAutoLoad) the
+ * capability header and bullets are skipped and only the memory protocol
+ * is returned (memory overhaul 2026-10-25, WP5: every agent needs it).
  *
  * Tier 1 fields (Phase 100-fu, 2026-04-26):
  *   - MCP servers       — list with operator-curated description+accessPattern
@@ -191,7 +192,7 @@ export function buildCapabilityManifest(
   // The bullet lists them; the longer Memory protocol section below
   // teaches the agent WHEN to call each.
   bullets.push(
-    "- **Lazy memory recall**: `clawcode_memory_search` (FTS5+vec hybrid), `clawcode_memory_recall` (full body by id), `clawcode_memory_edit` (str_replace / append on MEMORY.md / USER.md), `clawcode_memory_archive` (promote a chunk into Tier 1).",
+    "- **Lazy memory recall**: `clawcode_memory_search` (FTS5+vec hybrid), `clawcode_memory_recall` (full body by id), `clawcode_memory_edit` (str_replace / append on MEMORY.md / USER.md), `clawcode_memory_archive` (promote a chunk into Tier 1), `clawcode_memory_update` / `clawcode_memory_forget` (correct or retire a saved memory).",
   );
 
   // ---- 10b. Advisor awareness (Phase 117 Plan 08) ----
@@ -250,13 +251,19 @@ export function buildCapabilityManifest(
     );
   }
 
+  // Memory overhaul 2026-10-25 (WP5) - the memory protocol is the only
+  // place the agent is told how and when to read and write memory, so it
+  // is emitted for EVERY agent, including baseline agents that get no
+  // capability bullets (see `buildMemoryProtocol`).
+  const memoryProtocol = buildMemoryProtocol(config);
+
   // Bail out cleanly when the agent has zero notable opt-ins. We test
   // this against the SAME criteria as before Phase 100-fu (dream /
   // schedules / subagent-thread skill / GSD), because Tier 1+2 fields
   // (model+effort, conversation memory, recursion guard) are
   // unconditional once any opt-in feature is present. A baseline agent
   // (no dream, no schedules, no skill, no GSD, no fileAccess, no MCP
-  // servers beyond auto-injected ones) gets an empty string.
+  // servers beyond auto-injected ones) gets only the memory protocol.
   const hasOptIn =
     config.dream?.enabled === true ||
     config.schedules.length > 0 ||
@@ -266,23 +273,10 @@ export function buildCapabilityManifest(
     config.mcpServers.length > 0 ||
     config.skills.length > 0;
 
-  if (!hasOptIn) return "";
+  if (!hasOptIn) return memoryProtocol.trimStart();
 
   const header =
     "## Your ClawCode Capabilities\n\nYou are running on ClawCode — a multi-agent orchestration system. The following features are CURRENTLY ENABLED for you (do NOT claim ignorance about these):\n\n";
-
-  // Phase 115 sub-scope 7 — Memory protocol prose. Teaches the agent the
-  // lazy-load protocol: "Your curated memory is in MEMORY.md and USER.md.
-  // For older context, call clawcode_memory_search before assuming you
-  // remember." Comes AFTER the capabilities bullets so it lands in the
-  // cached stable prefix, but separate from the bullet list so the LLM
-  // reads it as instructions, not as a feature list.
-  const memoryProtocol =
-    "\n## Memory protocol (Phase 115)\n\n" +
-    "Your curated memory is in MEMORY.md and USER.md, always shown above. " +
-    "Recent context is retrieved for you before each turn; for anything older or more specific, call `clawcode_memory_search` (it searches all time) before assuming you remember or don't. " +
-    "Record significant new facts via `clawcode_memory_edit` (str_replace / append on MEMORY.md or USER.md). " +
-    "Promote a found chunk to permanent memory via `clawcode_memory_archive(chunkId)`.\n";
 
   // Phase 117 Plan 08 — append the Advisor protocol prose alongside the
   // memory protocol so both land in the cached stable prefix. When the
@@ -295,5 +289,43 @@ export function buildCapabilityManifest(
   const advisorProtocol =
     advisorAwareness !== null ? advisorAwareness.protocol : "";
 
-  return header + bullets.join("\n") + memoryProtocol + advisorProtocol;
+  return header + bullets.join("\n") + "\n" + memoryProtocol + advisorProtocol;
+}
+
+/**
+ * Memory overhaul 2026-10-25 (WP5) - the memory protocol section.
+ *
+ * Teaches the agent which tool answers which question (saved memories and
+ * memory files vs uploaded documents), to save durable facts with
+ * absolute dates, to correct instead of re-saving, and that MEMORY.md is a
+ * short curated index, not a dumping ground. The "loaded into this prompt"
+ * and "retrieved before each turn" sentences follow the resolved config,
+ * so a subagent with memoryAutoLoad=false or memoryRetrievalTopK=0 is not
+ * told it was given memory it was not given.
+ *
+ * Starts with a newline and ends with one, so it can follow the bullet
+ * list or stand alone.
+ */
+export function buildMemoryProtocol(config: ResolvedAgentConfig): string {
+  const autoLoaded = config.memoryAutoLoad !== false;
+  const retrievedPerTurn = (config.memoryRetrievalTopK ?? 0) > 0;
+
+  const indexLine = autoLoaded
+    ? "- MEMORY.md and USER.md are your short, curated index (standing facts, preferences, pointers), loaded into this prompt at session start. Keep them short: edit them with `clawcode_memory_edit` (str_replace / append) and never paste long notes or transcripts into them. Edits show in the prompt from the next session."
+    : "- MEMORY.md and USER.md are your short, curated index (standing facts, preferences, pointers). They are NOT loaded into this session: read them with `clawcode_memory_edit` (mode view) when you need them, and keep them short.";
+  const recallLine = retrievedPerTurn
+    ? "- A few relevant memories are retrieved for you before each turn. For anything older or more specific, call `clawcode_memory_search` before assuming you remember or don't: it searches your saved memories and your memory files (daily notes, digests, MEMORY.md) across all time. Fetch a full hit with `clawcode_memory_recall(memoryId)`."
+    : "- Nothing is retrieved for you automatically in this session. Call `clawcode_memory_search` before assuming you remember or don't: it searches your saved memories and your memory files (daily notes, digests, MEMORY.md) across all time. Fetch a full hit with `clawcode_memory_recall(memoryId)`.";
+
+  return (
+    "\n## Memory protocol\n\n" +
+    indexLine +
+    "\n" +
+    recallLine +
+    "\n" +
+    "- Files the user uploaded or that were ingested as documents (PDFs, spreadsheets, images) are searched with `search_documents`, not the memory tools.\n" +
+    "- Save a durable fact with `memory_save`: one fact per call, written with absolute dates (YYYY-MM-DD, never \"today\" or \"next week\"). The result says whether it was created, already stored (duplicate), or superseded an older similar memory.\n" +
+    "- When a saved memory is wrong or out of date, fix it with `clawcode_memory_update(id, content)`; when it no longer applies, retire it with `clawcode_memory_forget(id, reason)`. Do not save a second, conflicting copy. Search hits carry dates: when two disagree, trust the newer one.\n" +
+    "- Promote a memory file section you found into MEMORY.md with `clawcode_memory_archive(chunkId)` only when it belongs in the curated index.\n"
+  );
 }
