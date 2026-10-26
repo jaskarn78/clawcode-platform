@@ -31,7 +31,17 @@ export function chunkText(
 ): readonly ChunkInput[] {
   if (!text || !text.trim()) return [];
 
-  const words = text.split(/\s+/).filter(Boolean);
+  // One pass over the text collects every word and its start offset, so
+  // chunk boundaries resolve in O(1) instead of rescanning from offset 0 per
+  // chunk (WP3: the memory mirror chunks at about 300 words, which doubled
+  // the number of boundary lookups on large documents).
+  const words: string[] = [];
+  const wordStarts: number[] = [];
+  const wordRe = /\S+/g;
+  for (let m = wordRe.exec(text); m !== null; m = wordRe.exec(text)) {
+    words.push(m[0]);
+    wordStarts.push(m.index);
+  }
   if (words.length === 0) return [];
 
   const targetWords = Math.max(1, Math.round(targetTokens * WORDS_PER_TOKEN));
@@ -47,11 +57,10 @@ export function chunkText(
     const chunkWords = words.slice(wordStart, wordEnd);
     const content = chunkWords.join(" ");
 
-    // Find startChar: locate the first word of this chunk in the original text
-    const startChar = findWordPosition(text, words, wordStart);
+    // startChar: offset of the first word of this chunk in the original text
+    const startChar = wordStarts[wordStart];
     // endChar: position after the last character of the last word in this chunk
-    const lastWordPos = findWordPosition(text, words, wordEnd - 1);
-    const endChar = lastWordPos + words[wordEnd - 1].length;
+    const endChar = wordStarts[wordEnd - 1] + words[wordEnd - 1].length;
 
     chunks.push(Object.freeze({ content, chunkIndex, startChar, endChar }));
 
@@ -85,24 +94,6 @@ export async function chunkPdf(
   } finally {
     await parser.destroy();
   }
-}
-
-/**
- * Find the character position of a word by index in the original text.
- * Walks through whitespace-separated tokens to find the nth word's offset.
- */
-function findWordPosition(text: string, words: readonly string[], wordIndex: number): number {
-  let pos = 0;
-  for (let i = 0; i < wordIndex; i++) {
-    // Find the word at position pos
-    // Skip leading whitespace
-    while (pos < text.length && /\s/.test(text[pos])) pos++;
-    // Skip the word itself
-    pos += words[i].length;
-  }
-  // Skip whitespace to reach the target word
-  while (pos < text.length && /\s/.test(text[pos])) pos++;
-  return pos;
 }
 
 /**

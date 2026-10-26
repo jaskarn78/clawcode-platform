@@ -516,7 +516,7 @@ import {
 import { SemanticSearch } from "../memory/search.js";
 import { MemoryScanner, type MemoryScannerDeps } from "../memory/memory-scanner.js";
 import { isWithinDir, resolveMemoryRoots } from "../memory/memory-roots.js";
-import { chunkText, chunkPdf } from "../documents/chunker.js";
+import { chunkPdf } from "../documents/chunker.js";
 // Phase 999.43 Plan 02 T03 — handler body lives in auto-ingest-handler.ts;
 // the daemon case dynamic-imports it on first dispatch (memory-lookup
 // handler precedent). No top-level classifier import needed here.
@@ -7059,9 +7059,16 @@ export async function startDaemon(
       // content discriminator.
       const argsForCache: Record<string, unknown> = { ...params };
       delete argsForCache.agent;
+      // WP3: key on the agent's document corpus version so an ingest
+      // (manual or auto), a delete or a priority change makes every earlier
+      // cached search for this agent unreachable.
+      const { withCorpusVersion } = await import("../mcp/tool-cache-policy.js");
       return dispatchTool({
         tool: "search_documents",
-        args: argsForCache,
+        args: withCorpusVersion(
+          argsForCache,
+          manager.getDocumentStore(agentName)?.getVersion(),
+        ),
         agentName,
         cacheStore: toolCacheStore,
         maxSizeMb: toolCacheMaxSizeMb,
@@ -18055,15 +18062,27 @@ export async function routeMethod(
       }
 
       // Chunk + embed + persist into the DocumentStore (legacy contract
-      // preserved). Prefer the engine's extracted text when present;
-      // otherwise fall back to the legacy chunker for parity with the
-      // pre-101 daemon behavior.
+      // preserved). Prefer the engine's extracted text when present.
+      // WP3: every chunk carries the contextual header (filename, ingest
+      // date, page, part), and an empty extraction never falls back to
+      // decoding the raw file bytes (that embedded binary garbage). Only the
+      // PDF text fallback remains, with headers.
+      const { chunkWithContext, chunkForMirror, withChunkHeaders, stripChunkHeader } =
+        await import("../documents/chunk-context.js");
+      const { reassembleChunkedText } = await import("../documents/chunker.js");
+      const headerCtx = {
+        filename: path.basename(source),
+        uploadedAt: new Date().toISOString(),
+      };
+      const pageTexts = Array.isArray(ingestResult.pageTexts)
+        ? ingestResult.pageTexts
+        : undefined;
       const chunks =
         ingestResult.text.length > 0
-          ? chunkText(ingestResult.text)
-          : filePath.endsWith(".pdf")
-            ? await chunkPdf(fileBuffer)
-            : chunkText(fileBuffer.toString("utf-8"));
+          ? chunkWithContext(ingestResult.text, headerCtx, { pageTexts })
+          : filePath.toLowerCase().endsWith(".pdf")
+            ? withChunkHeaders(await chunkPdf(fileBuffer), headerCtx)
+            : [];
 
       if (chunks.length === 0) {
         const telemetryFull = {
@@ -18131,20 +18150,31 @@ export async function routeMethod(
             `MemoryStore not found for agent '${agentName}' — skipping cross-ingest`,
           );
         }
-        // P1-CROSSINGEST — crossIngest no longer embeds internally; precompute
-        // v1 here (v2 is already computed above as `embeddings`). Index-aligned
-        // with chunks. This manual operator path stays on the main thread (low
-        // volume — it is NOT the burst path the embed worker exists for).
-        const embeddingsV1: Float32Array[] = [];
-        for (const chunk of chunks) {
-          embeddingsV1.push(await embedder.embed(chunk.content));
+        // P1-CROSSINGEST: crossIngest does not embed internally. WP3: the
+        // mirror is re-chunked to about 300 words (each row embeds fully)
+        // with the same header and the filename as heading, so it gets its
+        // own v1 + v2 vectors. Its path is keyed on `source` (the same slug
+        // delete-document and the re-mirror pass compute). This manual
+        // operator path stays on the main thread (low volume; it is NOT the
+        // burst path the embed worker exists for).
+        const mirrorText =
+          ingestResult.text.length > 0
+            ? ingestResult.text
+            : reassembleChunkedText(chunks.map((c) => stripChunkHeader(c.content)));
+        const mirrorChunks = chunkForMirror(mirrorText, headerCtx, pageTexts);
+        const mirrorV1: Float32Array[] = [];
+        const mirrorV2: Int8Array[] = [];
+        for (const chunk of mirrorChunks) {
+          mirrorV1.push(await embedder.embed(chunk.content));
+          mirrorV2.push(await embedder.embedV2(chunk.content));
         }
         const crossResult = await crossIngestToMemory({
           agent: agentName,
-          docSlug,
-          chunks: chunks.map((c, i) => ({ index: i, content: c.content })),
-          precomputedV1: embeddingsV1,
-          precomputedV2: embeddings,
+          docSlug: computeDocSlug(source),
+          heading: headerCtx.filename,
+          chunks: mirrorChunks,
+          precomputedV1: mirrorV1,
+          precomputedV2: mirrorV2,
           memoryStore,
           migrationPhaseStore: new MigrationPhaseStore(memoryStore, agentName),
         });
@@ -18397,6 +18427,14 @@ export async function routeMethod(
           // has a non-NULL source_image_path (image MIME at ingest time);
           // omitted on the wire for PDF/docx/etc. ingests.
           ...(r.sourceImagePath ? { source_image_path: r.sourceImagePath } : {}),
+          // WP3: provenance from the documents row (null when unknown) so
+          // the agent can say what the document is, when it arrived and
+          // who sent it.
+          filename: r.filename ?? null,
+          ingested_at: r.ingestedAt ?? null,
+          user_name: r.userName ?? null,
+          channel_name: r.channelName ?? null,
+          source_kind: r.sourceKind ?? null,
         })),
       };
     }
@@ -18411,8 +18449,33 @@ export async function routeMethod(
         throw new ManagerError(`Document store not found for agent '${agentName}' (agent may not be running)`);
       }
 
-      const count = docStore.deleteDocument(source);
-      return { ok: true, source, chunks_deleted: count };
+      // WP3: delete the chunks, the documents provenance row (and rows
+      // recorded as exact duplicates of it), the document:<slug> memory
+      // mirror, and the agent's own inbox/archive copies (so the rescan
+      // cannot re-ingest the inbox file). Workspace files are never touched.
+      const { purgeDocument } = await import("../documents/delete.js");
+      const { attachmentInboxDir } = await import("../discord/attachments.js");
+      const { attachmentArchiveDir } = await import("../vision/image-archive.js");
+      const deleteMemoryPath = configs.find((c) => c.name === agentName)?.memoryPath;
+      const purge = await purgeDocument({
+        docStore,
+        memoryStore: manager.getMemoryStore(agentName),
+        source,
+        inboxDir: deleteMemoryPath ? attachmentInboxDir(deleteMemoryPath) : undefined,
+        archiveDir: deleteMemoryPath ? attachmentArchiveDir(deleteMemoryPath) : undefined,
+      });
+      logger.info(
+        { tag: "wp3-delete-document", agent: agentName, source, ...purge },
+        "document deleted",
+      );
+      return {
+        ok: true,
+        source,
+        chunks_deleted: purge.chunksDeleted,
+        document_rows_deleted: purge.documentRowsDeleted,
+        memory_chunks_deleted: purge.memoryChunksDeleted,
+        files_removed: purge.filesRemoved.length,
+      };
     }
 
     case "list-documents": {

@@ -171,10 +171,68 @@ export function chunkForMirror(
   return Object.freeze(chunks.map((c) => ({ index: c.chunkIndex, content: c.content })));
 }
 
-/** Strip a leading contextual header line from stored chunk content. */
+/**
+ * A header line as `buildChunkHeader` writes it: starts with the prefix and
+ * always ends with `part <i>/<n>`.
+ */
+const HEADER_LINE_RE = /^Document: .*\| part \d+\/\d+$/;
+
+/** True when `line` is a contextual header line. */
+export function isChunkHeaderLine(line: string): boolean {
+  return HEADER_LINE_RE.test(line);
+}
+
+/**
+ * Strip a leading contextual header line from stored chunk content. Content
+ * whose first line is not a header (legacy chunks, or text that merely
+ * starts with "Document: ") is returned unchanged.
+ */
 export function stripChunkHeader(content: string): string {
   if (!content.startsWith(CHUNK_HEADER_PREFIX)) return content;
   const nl = content.indexOf("\n");
-  if (nl === -1) return "";
-  return content.slice(nl + 1);
+  const firstLine = nl === -1 ? content : content.slice(0, nl);
+  if (!isChunkHeaderLine(firstLine)) return content;
+  return nl === -1 ? "" : content.slice(nl + 1);
+}
+
+/**
+ * Prepend the contextual header to chunks that were produced elsewhere
+ * (for example `chunkPdf`). `total` is the number of chunks.
+ */
+export function withChunkHeaders(
+  chunks: readonly ChunkInput[],
+  ctx: DocumentChunkContext,
+): readonly ChunkInput[] {
+  const total = chunks.length;
+  return Object.freeze(
+    chunks.map((chunk) =>
+      Object.freeze({
+        ...chunk,
+        content: `${buildChunkHeader(ctx, { part: chunk.chunkIndex + 1, total })}\n${chunk.content}`,
+      }),
+    ),
+  );
+}
+
+/**
+ * WP3 (g): the single chunk stored when neither text extraction nor the
+ * image caption produced anything. Never the raw file bytes. The header
+ * line keeps it findable by filename, date and sender.
+ */
+export function buildEmptyDocumentStub(
+  ctx: DocumentChunkContext,
+  kind: "image" | "file",
+): ChunkInput {
+  const name = clean(ctx.filename) ?? "unknown";
+  const date = formatUploadDate(ctx.uploadedAt);
+  const sentence =
+    `${kind === "image" ? "Image" : "File"} ${name}` +
+    (date ? ` uploaded ${date}` : "") +
+    "; no text could be extracted";
+  return Object.freeze({
+    content: `${buildChunkHeader(ctx, { part: 1, total: 1 })}\n${sentence}`,
+    chunkIndex: 0,
+    startChar: 0,
+    endChar: 0,
+  });
 }

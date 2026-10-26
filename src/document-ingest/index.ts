@@ -124,9 +124,10 @@ export async function ingest(
     text: string;
     pages: readonly BatchedPage[];
     /**
-     * WP3 — per-page text in page order (OCR output included), so callers
-     * can map chunk offsets inside `text` back to a page number for the
-     * contextual chunk header. `text` is `pageTexts.join("\n\n").trim()`.
+     * WP3: per-page text in page order (OCR output included), one entry per
+     * page in `pages` (empty string for a page that produced nothing), so
+     * callers can map chunk offsets inside `text` back to a page number for
+     * the contextual chunk header. `text` is `pageTexts.join("\n\n").trim()`.
      */
     pageTexts: readonly string[];
   }
@@ -169,7 +170,7 @@ export async function ingest(
     if (page.text !== undefined && page.text.length > 0) {
       pageTexts.push(page.text);
     } else if (page.imageBuffer !== undefined && opts.backend === "none") {
-      // WP3 — an explicit "none" backend means no OCR at all (previously it
+      // WP3: an explicit "none" backend means no OCR at all (previously it
       // fell through the paid auto-chain).
       pageTexts.push("");
     } else if (page.imageBuffer !== undefined) {
@@ -182,6 +183,10 @@ export async function ingest(
       });
       pageTexts.push(r.text);
       if (ocrUsed === "none") ocrUsed = r.backend;
+    } else {
+      // WP3: keep pageTexts index-aligned with pages so a page number can
+      // be recovered from a text offset.
+      pageTexts.push("");
     }
     // Per-page wall-clock + amortized dispatch share. Rounded to integer
     // ms to keep the log line shape stable (downstream sqlite/jq filters

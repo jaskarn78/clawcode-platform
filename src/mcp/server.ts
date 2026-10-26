@@ -217,7 +217,8 @@ export const TOOL_DEFINITIONS = {
     ipcMethod: "set-doc-priority",
   },
   search_documents: {
-    description: "Search across ingested documents for relevant content",
+    description:
+      "Search the files, PDFs, screenshots and images that were uploaded or ingested for this agent. Returns exact chunks with provenance (filename, upload date, sender, channel, page) and the Source to filter on.",
     ipcMethod: "search-documents",
   },
   delete_document: {
@@ -2218,9 +2219,14 @@ export function createMcpServer(
   server.tool(
     "ingest_document",
     "Robustly ingest a PDF/docx/xlsx/image into the agent's document store + memory. " +
-      "Single entry point for document handling — handles type detection, OCR fallback " +
-      "(Tesseract → Claude vision), and structured extraction via zod schemas " +
-      "(taskHint='high-precision' uses Sonnet, default Haiku). Pass " +
+      "Single entry point for document handling: type detection, OCR fallback " +
+      "(Tesseract, then Claude vision; scanned pages inside a text PDF are OCRed too), and structured extraction via zod schemas " +
+      "(taskHint='high-precision' uses Sonnet, default Haiku). Every stored chunk starts with a " +
+      "header line 'Document: <filename> | uploaded <date> | page <p> | part <i>/<n>'. Afterwards " +
+      "find the content with search_documents (exact chunks with provenance; pass the returned " +
+      "Source to search one document) or clawcode_memory_search. Files sent in Discord are " +
+      "usually ingested automatically, so search_documents first before re-ingesting. A file with " +
+      "no extractable text stores 0 chunks. Pass " +
       "extract='structured'|'both' + schemaName to also produce a validated JSON " +
       "output (ExtractedTaxReturn shipped today). Use force=true to bypass the " +
       "<doc-slug>-<date>.json cache (D-07 schema-version re-extract).",
@@ -2412,15 +2418,31 @@ export function createMcpServer(
     // source_image_path field so agents know they can `Read` the underlying
     // image when shape semantics (charts, graphs, candlesticks) matter
     // beyond the OCR'd text.
-    "Search across ingested documents for relevant content. For image " +
-      "attachments, results may include an Image: <path> line — use the Read " +
-      "tool on that path to re-look at the source image when chart shape, " +
-      "trend direction, or visual layout matters beyond OCR text.",
+    "Search the documents ingested for you: files, PDFs, spreadsheets, screenshots and images " +
+      "sent in Discord (indexed automatically when attachment ingest is on) and anything ingested " +
+      "with ingest_document. Use it when the user refers to something they sent or uploaded " +
+      "earlier, or when a <memory-context> hit names a document and you need the exact text. " +
+      "Each result shows: score (relevance after priority and recency weighting, higher is " +
+      "better) and similarity (raw semantic closeness, 0 to 1); Source (the stored path or id, " +
+      "pass it back as `source` to search inside that one document) and the chunk number; File, " +
+      "Uploaded and From (original filename, upload date, sender and channel) when known; an " +
+      "Image: <path> line for image attachments, which you can open with the Read tool when " +
+      "chart shape, colors or layout matter beyond the text; then the chunk text, which starts " +
+      "with a 'Document: <filename> | uploaded <date> | ... | page <p> | part <i>/<n>' header. " +
+      "An image whose text could not be extracted is a one-line stub saying so; Read its Image " +
+      "path to look at it.",
     {
       agent: z.string().describe("Your agent name"),
       query: z.string().describe("Search query"),
       limit: z.number().int().min(1).max(20).default(5).describe("Max results (default 5)"),
-      source: z.string().optional().describe("Filter to a specific document source"),
+      source: z
+        .string()
+        .optional()
+        .describe(
+          "Restrict the search to one document: the exact Source value from an earlier result or " +
+            "list_documents. Applied before ranking, so it returns that document's best chunks " +
+            "even when other documents would score higher.",
+        ),
     },
     async ({ agent, query, limit, source }) => {
       return invokeWithCache(
@@ -2431,23 +2453,69 @@ export function createMcpServer(
           const result = await sendIpcRequest(SOCKET_PATH, "search-documents", withIdentity(agent, {
             agent, query, limit, source,
           }));
-          const r = result as { results: readonly { chunk_id: string; source: string; chunk_index: number; content: string; similarity: number; context_before: string | null; context_after: string | null; source_image_path?: string }[] };
+          const r = result as {
+            results: readonly {
+              chunk_id: string;
+              source: string;
+              chunk_index: number;
+              content: string;
+              similarity: number;
+              weighted_score?: number;
+              context_before: string | null;
+              context_after: string | null;
+              source_image_path?: string;
+              // WP3 provenance (null when unknown).
+              filename?: string | null;
+              ingested_at?: string | null;
+              user_name?: string | null;
+              channel_name?: string | null;
+              source_kind?: string | null;
+            }[];
+          };
           if (r.results.length === 0) {
-            return { content: [{ type: "text" as const, text: "No matching documents found." }] };
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: source
+                    ? `No matching chunks in "${source}". Check the Source value with list_documents.`
+                    : "No matching documents found.",
+                },
+              ],
+            };
           }
           const formatted = r.results.map((hit, i) => {
+            const score =
+              typeof hit.weighted_score === "number"
+                ? `score: ${hit.weighted_score.toFixed(3)}, `
+                : "";
             const parts = [
-              `--- Result ${i + 1} (similarity: ${hit.similarity.toFixed(3)}) ---`,
+              `--- Result ${i + 1} (${score}similarity: ${hit.similarity.toFixed(3)}) ---`,
               `Source: ${hit.source} [chunk ${hit.chunk_index}]`,
             ];
+            // WP3: provenance from the documents row, when known.
+            const prov: string[] = [];
+            if (hit.filename) prov.push(`File: ${hit.filename}`);
+            if (hit.ingested_at) prov.push(`Uploaded: ${hit.ingested_at.slice(0, 10)}`);
+            const from = [
+              hit.user_name ? hit.user_name : null,
+              hit.channel_name ? `#${hit.channel_name.replace(/^#/, "")}` : null,
+            ].filter((x): x is string => x !== null);
+            if (from.length > 0) prov.push(`From: ${from.join(" in ")}`);
+            if (hit.source_kind) prov.push(`Kind: ${hit.source_kind}`);
+            if (prov.length > 0) parts.push(prov.join(" | "));
             // Phase 999.43-fu2 Path A T03 — surface persisted image path so
             // the agent can Read it for chart/graph shape re-look.
             if (hit.source_image_path) {
               parts.push(`Image: ${hit.source_image_path}`);
             }
-            if (hit.context_before) parts.push(`[...] ${hit.context_before}`);
+            // WP3: adjacent chunks are context only; drop their header lines
+            // (the hit's own header stays as the first line of its text).
+            const noHeader = (t: string): string =>
+              t.replace(/^Document: [^\n]*\| part \d+\/\d+\n/, "");
+            if (hit.context_before) parts.push(`[...] ${noHeader(hit.context_before)}`);
             parts.push(hit.content);
-            if (hit.context_after) parts.push(`${hit.context_after} [...]`);
+            if (hit.context_after) parts.push(`${noHeader(hit.context_after)} [...]`);
             return parts.join("\n");
           }).join("\n\n");
           return { content: [{ type: "text" as const, text: formatted }] };

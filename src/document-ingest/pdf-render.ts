@@ -1,13 +1,16 @@
 /**
- * WP3 (2026-10-25) — shared pdftoppm page rendering.
+ * WP3 (2026-10-25): shared pdftoppm page rendering.
  *
- * `renderPdfPageToPng` rasterizes ONE page of a PDF buffer to a PNG via
- * `pdftoppm -f N -l N` (poppler-utils, the documented deploy prereq). The
- * scanned-PDF handler renders whole documents the same way; the text-PDF
- * handler uses this per-page variant for pages that have no text layer.
+ * `renderPdfPagesToPng` rasterizes selected pages of a PDF buffer to PNG via
+ * `pdftoppm -f A -l B` (poppler-utils, the documented deploy prereq). The
+ * PDF is written to a temp file once and each contiguous run of requested
+ * pages is rendered with one pdftoppm call. The scanned-PDF handler renders
+ * whole documents with the same process runner and DPI; the text-PDF
+ * handler uses this for pages that have no text layer.
  *
- * Best effort by design: when the binary is missing or the render fails the
- * promise resolves to null and the caller leaves the page text-less.
+ * Best effort by design: when the binary is missing or a render fails the
+ * affected pages are simply absent from the returned map and the caller
+ * leaves them text-less.
  */
 
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
@@ -34,41 +37,73 @@ export function runProcess(cmd: string, args: readonly string[]): Promise<void> 
   });
 }
 
-/** Renderer contract the text-PDF handler accepts (injectable for tests). */
-export type PdfPageRenderer = (
-  pdf: Buffer,
-  pageNumber: number,
-) => Promise<Buffer | null>;
-
 /**
- * Render page `pageNumber` (1-based) of `pdf` to a PNG buffer, or null when
- * rendering is unavailable or fails.
+ * Renderer contract the text-PDF handler accepts (injectable for tests):
+ * PNG buffers keyed by 1-based page number. Pages that could not be
+ * rendered are missing from the map.
  */
-export const renderPdfPageToPng: PdfPageRenderer = async (pdf, pageNumber) => {
-  if (!Number.isInteger(pageNumber) || pageNumber < 1) return null;
+export type PdfPagesRenderer = (
+  pdf: Buffer,
+  pageNumbers: readonly number[],
+) => Promise<ReadonlyMap<number, Buffer>>;
+
+/** Group sorted, de-duplicated page numbers into contiguous [first, last] runs. */
+export function contiguousRuns(pageNumbers: readonly number[]): Array<[number, number]> {
+  const sorted = [...new Set(pageNumbers)]
+    .filter((n) => Number.isInteger(n) && n >= 1)
+    .sort((a, b) => a - b);
+  const runs: Array<[number, number]> = [];
+  for (const n of sorted) {
+    const last = runs[runs.length - 1];
+    if (last && n === last[1] + 1) last[1] = n;
+    else runs.push([n, n]);
+  }
+  return runs;
+}
+
+/** Page number from a pdftoppm output name such as `page-07.png`. */
+function pageFromOutputName(name: string): number | null {
+  const m = /-(\d+)\.png$/.exec(name);
+  return m ? Number.parseInt(m[1], 10) : null;
+}
+
+export const renderPdfPagesToPng: PdfPagesRenderer = async (pdf, pageNumbers) => {
+  const out = new Map<number, Buffer>();
+  const runs = contiguousRuns(pageNumbers);
+  if (runs.length === 0) return out;
   let tmp: string | null = null;
   try {
     tmp = await mkdtemp(join(tmpdir(), "phase101-page-"));
     const pdfPath = join(tmp, "input.pdf");
-    const outPrefix = join(tmp, "page");
     await writeFile(pdfPath, pdf);
-    await runProcess("pdftoppm", [
-      "-r",
-      String(RENDER_DPI),
-      "-png",
-      "-f",
-      String(pageNumber),
-      "-l",
-      String(pageNumber),
-      pdfPath,
-      outPrefix,
-    ]);
-    const entries = await readdir(tmp);
-    const png = entries.find((f) => f.startsWith("page") && f.endsWith(".png"));
-    if (!png) return null;
-    return await readFile(join(tmp, png));
+    for (const [first, last] of runs) {
+      const outPrefix = join(tmp, `run${first}`);
+      try {
+        await runProcess("pdftoppm", [
+          "-r",
+          String(RENDER_DPI),
+          "-png",
+          "-f",
+          String(first),
+          "-l",
+          String(last),
+          pdfPath,
+          outPrefix,
+        ]);
+      } catch {
+        // Missing binary or a bad page range: leave these pages unrendered.
+        continue;
+      }
+    }
+    for (const name of await readdir(tmp)) {
+      if (!name.startsWith("run") || !name.endsWith(".png")) continue;
+      const page = pageFromOutputName(name);
+      if (page === null) continue;
+      out.set(page, await readFile(join(tmp, name)));
+    }
+    return out;
   } catch {
-    return null;
+    return out;
   } finally {
     if (tmp) await rm(tmp, { recursive: true, force: true }).catch(() => undefined);
   }

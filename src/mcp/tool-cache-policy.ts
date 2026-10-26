@@ -89,6 +89,9 @@ export const DEFAULT_TOOL_CACHE_POLICY: Readonly<
   web_fetch_url:                 { ttlSeconds: 300,  keyStrategy: "cross-agent" },
 
   // Per-agent document corpus — 30min, agent-scoped (Phase 90 lock).
+  // WP3: the daemon adds the agent's corpus version to the key
+  // (withCorpusVersion), so an ingest, delete or priority change makes every
+  // earlier entry for that agent unreachable at once.
   search_documents:              { ttlSeconds: 1800, keyStrategy: "per-agent" },
 
   // mysql_query — 60s read-only patterns; never cache writes.
@@ -155,6 +158,28 @@ export function isReadOnlySql(query: string): boolean {
   return /^(select|with|show|describe|desc|explain|values|table)\b/.test(
     trimmed,
   );
+}
+
+/**
+ * WP3 (2026-10-25): cache-key component that carries a per-agent corpus
+ * version (DocumentStore.getVersion()). The version moves on every ingest,
+ * delete, provenance upsert and priority change, so including it in the
+ * key invalidates all of the agent's earlier search_documents entries
+ * without a delete API on the cache store. Stale rows age out by TTL/LRU.
+ */
+export const CORPUS_VERSION_ARG = "__corpus_version";
+
+/**
+ * Return `args` with the corpus version added under CORPUS_VERSION_ARG.
+ * `version` undefined (no document store open) leaves the args unchanged.
+ */
+export function withCorpusVersion(
+  args: Readonly<Record<string, unknown>>,
+  version: number | undefined,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...args };
+  if (version !== undefined) out[CORPUS_VERSION_ARG] = version;
+  return out;
 }
 
 /**

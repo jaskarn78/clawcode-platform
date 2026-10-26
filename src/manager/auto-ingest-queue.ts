@@ -28,7 +28,7 @@ import { join } from "node:path";
 import type { Logger } from "pino";
 import { imageWorkGovernor } from "./image-work-governor.js";
 import { attachmentInboxDir } from "../discord/attachments.js";
-import type { DocumentStore } from "../documents/store.js";
+import { documentNeedsRetry, type DocumentStore } from "../documents/store.js";
 import type { AutoIngestAttachmentParams } from "./auto-ingest-handler.js";
 
 const TAG = "p1-auto-ingest-queue";
@@ -38,8 +38,11 @@ export const MAX_QUEUE_DEPTH = 200;
 
 /**
  * Rescan only re-enqueues files younger than this. Matches the 24 h attachment
- * retention window; older files are either already in docStore (skipped) or
+ * retention window (the attachment-cleanup check sweeps the same inbox
+ * directory); older files are either already in docStore (skipped) or
  * stale. A 10-min rescan cadence gives ~144× margin inside this window.
+ * WP3: a file whose row says the last attempt stored only a stub or failed
+ * is re-enqueued until MAX_INGEST_ATTEMPTS (3) attempts have been made.
  */
 export const RESCAN_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
@@ -89,6 +92,15 @@ export type AutoIngestQueueDeps = {
   readonly getDocumentStore: (agent: string) => DocumentStore | undefined;
   /** Live list of agents with autoIngestAttachments===true (for boot rescan). */
   readonly listIngestAgents: () => ReadonlyArray<IngestAgentRef>;
+  /**
+   * WP3 (optional): the embed-worker batch embedder (the same function the
+   * handler deps use). When wired, the heartbeat re-mirror pass embeds
+   * through the worker instead of inline on the main thread.
+   */
+  readonly embedBoth?: (
+    texts: readonly string[],
+    includeV1: boolean,
+  ) => Promise<{ readonly v1: Float32Array[] | null; readonly v2: Int8Array[] }>;
 };
 
 export class AutoIngestQueue {
@@ -119,6 +131,20 @@ export class AutoIngestQueue {
 
   get depth(): number {
     return this.queue.length;
+  }
+
+  /** WP3: the worker embedder wired at boot, if any (see AutoIngestQueueDeps). */
+  get embedBoth(): AutoIngestQueueDeps["embedBoth"] {
+    return this.deps?.embedBoth;
+  }
+
+  /**
+   * WP3: true when nothing is queued or being processed. The heartbeat
+   * re-mirror pass only runs while the queue is idle so it never competes
+   * with a live ingest.
+   */
+  get idle(): boolean {
+    return this.queue.length === 0 && this.inFlight.size === 0;
   }
 
   /** True if `source` is already queued or being processed (idempotent enqueue). */
@@ -265,7 +291,10 @@ export class AutoIngestQueue {
         continue;
       }
       scanned++;
-      if (docStore?.getDocumentRow(fullPath)) continue; // already ingested
+      // Already ingested, unless the last attempt stored only a stub or
+      // failed and the attempt cap is not reached yet (WP3).
+      const row = docStore?.getDocumentRow(fullPath) ?? null;
+      if (row !== null && !documentNeedsRetry(row)) continue;
       if (this.isTracked(fullPath)) continue; // already queued / in-flight
       const result = this.enqueue(reconstructParams(agent, fullPath, entry, size));
       if ("queued" in result) enqueued++;

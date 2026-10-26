@@ -303,3 +303,21 @@ describe("resolveToolCachePolicy — operator overrides", () => {
     expect(p.cacheable!({ query: "DELETE FROM x" })).toBe(false);
   });
 });
+
+describe("withCorpusVersion (WP3 search_documents invalidation)", () => {
+  it("adds the version so a corpus change yields a different per-agent key", async () => {
+    const { withCorpusVersion, CORPUS_VERSION_ARG, buildCacheKey } = await import(
+      "../tool-cache-policy.js"
+    );
+    const args = { query: "invoice total", limit: 5 };
+    const before = buildCacheKey("search_documents", withCorpusVersion(args, 100), "fin", "per-agent");
+    const same = buildCacheKey("search_documents", withCorpusVersion({ limit: 5, query: "invoice total" }, 100), "fin", "per-agent");
+    const after = buildCacheKey("search_documents", withCorpusVersion(args, 101), "fin", "per-agent");
+    expect(same).toBe(before);
+    expect(after).not.toBe(before);
+    expect(withCorpusVersion(args, 7)[CORPUS_VERSION_ARG]).toBe(7);
+    expect(withCorpusVersion(args, undefined)).toEqual(args);
+    // The caller's object is not mutated.
+    expect(args).toEqual({ query: "invoice total", limit: 5 });
+  });
+});

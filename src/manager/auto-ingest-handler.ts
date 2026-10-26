@@ -32,13 +32,21 @@ import {
   classifyAttachment,
   type ContentClass,
 } from "../documents/auto-ingest-classifier.js";
-import type {
-  DocumentStore,
-  DocumentRowInput,
+import {
+  MAX_INGEST_ATTEMPTS,
+  type DocumentStore,
+  type DocumentRow,
+  type DocumentRowInput,
+  type IngestStatus,
 } from "../documents/store.js";
 import type { MemoryStore } from "../memory/store.js";
-import { chunkText, chunkPdf } from "../documents/chunker.js";
 import type { ChunkInput } from "../documents/chunker.js";
+import {
+  buildEmptyDocumentStub,
+  chunkForMirror,
+  chunkWithContext,
+  type DocumentChunkContext,
+} from "../documents/chunk-context.js";
 import {
   type ingest as IngestEngineFn,
   computeDocSlug,
@@ -47,6 +55,7 @@ import {
   crossIngestToMemory,
   MigrationPhaseStore,
 } from "../document-ingest/cross-ingest.js";
+import { displayFilenameFor } from "../document-ingest/remirror.js";
 import type { ResolvedAgentConfig } from "../shared/types.js";
 import { ManagerError } from "../shared/errors.js";
 import { renderAnalysisText, type ImageAnalysis } from "../vision/types.js";
@@ -93,6 +102,12 @@ export type AutoIngestAttachmentParams = {
   readonly message_id: string;
   readonly user_id: string;
   readonly user_name: string;
+  /**
+   * WP3 (2026-10-25): Discord channel name for the contextual chunk header
+   * ("from <user> in #<channel>"). Optional; omitted from the header when
+   * absent (the bridge does not send it yet).
+   */
+  readonly channel_name?: string;
   /**
    * 999.156 — "transcript": a finished transcription the operator asked to be
    * retrievable. Ingested even when the agent's `autoIngestAttachments` flag
@@ -317,7 +332,27 @@ export async function handleAutoIngestAttachment(
   const perfNow = deps.perfNow ?? (() => performance.now());
   const handlerStartedAt = perfNow();
 
+  // WP3: retry bookkeeping. A previous attempt that stored only a stub or
+  // failed left a row with ingest_status "empty" or "failed"; this attempt
+  // counts on from it and keeps that row's provenance when the rescan
+  // re-enqueued the file without Discord coordinates.
+  let existingRow: DocumentRow | null = null;
+  let attempt = 1;
+
   try {
+    existingRow = docStore.getDocumentRow(source);
+    attempt = (existingRow?.ingest_attempts ?? 0) + 1;
+    const prov = mergeProvenance(params, existingRow, nowIso);
+    const headerCtx: DocumentChunkContext = {
+      filename:
+        filename.trim().length > 0
+          ? filename
+          : displayFilenameFor(source, existingRow?.filename),
+      uploadedAt: prov.ingestedAt,
+      userName: prov.userName,
+      channelName: prov.channelName,
+    };
+
     const fileBuffer = await readFileFn(filePath);
 
     const isImageMime =
@@ -427,73 +462,55 @@ export async function handleAutoIngestAttachment(
       }
     }
 
-    // Match manual-path chunker cascade over the MERGED text (OCR + image
-    // summary + chart shape).
-    const chunks: readonly ChunkInput[] =
-      mergedText.length > 0
-        ? chunkText(mergedText)
-        : filePath.endsWith(".pdf")
-          ? await chunkPdf(fileBuffer)
-          : chunkText(fileBuffer.toString("utf-8"));
+    // WP3: every chunk carries the contextual header (filename, upload date,
+    // sender, channel, page, part) in its indexed text. When extraction and
+    // the caption both produced nothing, a one-line stub is stored instead of
+    // the raw file bytes, and the row is marked "empty" so the rescan retries
+    // it at most MAX_INGEST_ATTEMPTS times.
+    const pageTexts = Array.isArray(ingestResult.pageTexts)
+      ? ingestResult.pageTexts
+      : undefined;
+    const hasText = mergedText.trim().length > 0;
+    const ingestStatus: IngestStatus = hasText ? "ok" : "empty";
+    const chunks: readonly ChunkInput[] = hasText
+      ? chunkWithContext(mergedText, headerCtx, { pageTexts })
+      : [buildEmptyDocumentStub(headerCtx, isImageMime ? "image" : "file")];
 
-    if (chunks.length === 0) {
-      // Nothing to embed → no retrievable doc → no provenance row.
-      const durationMs = Math.round(perfNow() - handlerStartedAt);
-      logger.info(
-        {
-          tag: "phase999.43-autoingest",
-          agent: agentName,
-          channelId,
-          messageId,
-          userId,
-          userName,
-          filename,
-          mimeType,
-          size,
-          eligible: true,
-          contentClass,
-          agentWeight,
-          contentWeight,
-          reason: "no chunks produced (empty text)",
-          chunksCreated: 0,
-          docSource: source,
-          visionSource,
-          durationMs,
-        },
-        "phase999.43-autoingest skipped — no chunks",
-      );
-      return {
-        ok: true,
-        skipped: true,
-        reason: "no chunks produced (empty text)",
-      };
-    }
-
-    // P1-EMBED-WORKER — embed off the main event loop in the dedicated worker.
-    // v2 (bge int8) feeds docStore.ingest AND crossIngest's v2 write; v1 (MiniLM
-    // float32) is computed only when cross-ingest will run (memoryStore present),
-    // since crossIngest writes the v1 vec row unconditionally. Fetch memoryStore
-    // first so it drives `includeV1`.
-    const memoryStore = deps.getMemoryStore(agentName);
+    // P1-EMBED-WORKER: embed off the main event loop in the dedicated worker.
+    // The document chunks need only v2 (bge int8, the vec_document_chunks
+    // column type); the memory mirror below is chunked and embedded
+    // separately.
     const chunkTexts = chunks.map((c) => c.content);
-    const { v1, v2 } = await deps.embedBoth(chunkTexts, memoryStore != null);
+    const { v2 } = await deps.embedBoth(chunkTexts, false);
 
     const result = docStore.ingest(source, chunks, v2);
 
     // Best-effort cross-ingest into memory_chunks (matches manual path).
-    // P1-CROSSINGEST — pass the SAME precomputed embeddings; crossIngest does no
-    // embedding of its own (no second resident ONNX model copy on the main loop).
+    // WP3: the mirror is re-chunked to about 300 words so each row embeds
+    // fully, carries the same header, uses the filename as its heading and
+    // gets its own v1 + v2 vectors from the worker (crossIngest does no
+    // embedding of its own). Stubs are not mirrored. A failure here is
+    // repaired later by the rescan's re-mirror pass.
+    const memoryStore = deps.getMemoryStore(agentName);
+    let memoryChunksWritten = 0;
     try {
-      if (memoryStore) {
-        await crossIngestToMemory({
+      if (memoryStore && ingestStatus === "ok") {
+        const mirrorChunks = chunkForMirror(mergedText, headerCtx, pageTexts);
+        const mirrorVecs = await deps.embedBoth(
+          mirrorChunks.map((c) => c.content),
+          true,
+        );
+        const cross = await crossIngestToMemory({
           agent: agentName,
           docSlug: computeDocSlug(filePath),
-          chunks: chunks.map((c, i) => ({ index: i, content: c.content })),
-          precomputedV1: v1,
-          precomputedV2: v2,
+          heading: headerCtx.filename,
+          chunks: mirrorChunks,
+          precomputedV1: mirrorVecs.v1,
+          precomputedV2: mirrorVecs.v2,
           memoryStore,
           migrationPhaseStore: new MigrationPhaseStore(memoryStore, agentName),
         });
+        memoryChunksWritten = cross.chunksWritten;
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -532,10 +549,10 @@ export async function handleAutoIngestAttachment(
     const row: DocumentRowInput = {
       source,
       agentName,
-      channelId,
-      messageId,
-      userId,
-      ingestedAt: nowIso(),
+      channelId: prov.channelId,
+      messageId: prov.messageId,
+      userId: prov.userId,
+      ingestedAt: prov.ingestedAt,
       sourceKind: isTranscript ? "transcript" : "discord_attachment",
       autoClassifiedClass: contentClass,
       overrideClass: null,
@@ -545,10 +562,45 @@ export async function handleAutoIngestAttachment(
       contentSha256,
       imageDhash,
       visionJson: analysis !== null ? JSON.stringify(analysis) : null,
+      filename: headerCtx.filename,
+      userName: prov.userName,
+      channelName: prov.channelName,
+      ingestStatus,
+      ingestAttempts: attempt,
     };
     docStore.upsertDocumentRow(row);
 
     const durationMs = Math.round(perfNow() - handlerStartedAt);
+    if (ingestStatus === "empty") {
+      const reason =
+        `no text could be extracted; stored a stub ` +
+        `(attempt ${attempt} of ${MAX_INGEST_ATTEMPTS})`;
+      logger.info(
+        {
+          tag: "phase999.43-autoingest",
+          agent: agentName,
+          channelId,
+          messageId,
+          userId,
+          userName,
+          filename,
+          mimeType,
+          size,
+          eligible: true,
+          contentClass,
+          agentWeight,
+          contentWeight,
+          reason,
+          chunksCreated: result.chunksCreated,
+          docSource: source,
+          visionSource,
+          attempt,
+          durationMs,
+        },
+        "phase999.43-autoingest stored a stub, no text extracted",
+      );
+      return { ok: true, skipped: true, reason };
+    }
     logger.info(
       {
         tag: "phase999.43-autoingest",
@@ -574,6 +626,8 @@ export async function handleAutoIngestAttachment(
           : {}),
         ...(nearDupOf !== null ? { nearDupOf } : {}),
         archived: archivePath !== null,
+        memoryChunksWritten,
+        attempt,
         durationMs,
       },
       "phase999.43-autoingest dispatched",
@@ -607,11 +661,119 @@ export async function handleAutoIngestAttachment(
         agentWeight,
         contentWeight,
         error: msg,
+        attempt,
         durationMs,
       },
       "phase999.43-autoingest dispatch failed",
     );
+    // WP3: record the failed attempt so the rescan retries it at most
+    // MAX_INGEST_ATTEMPTS times instead of every 10 minutes for 24 hours.
+    recordFailedAttempt({
+      docStore,
+      existingRow,
+      params,
+      attempt,
+      contentClass,
+      contentWeight,
+      agentWeight,
+      isTranscript,
+      nowIso,
+      logger,
+    });
     return { ok: false, skipped: false, error: msg };
+  }
+}
+
+/** Provenance for this attempt: the request's values, else the prior row's. */
+type MergedProvenance = {
+  readonly channelId: string | null;
+  readonly messageId: string | null;
+  readonly userId: string | null;
+  readonly userName: string | null;
+  readonly channelName: string | null;
+  readonly ingestedAt: string;
+};
+
+/**
+ * WP3: a rescan-recovered retry carries empty Discord sentinels; keep the
+ * provenance the first attempt recorded instead of overwriting it, and keep
+ * the first attempt's ingest date (the upload date the header shows).
+ */
+function mergeProvenance(
+  params: AutoIngestAttachmentParams,
+  existing: DocumentRow | null,
+  nowIso: () => string,
+): MergedProvenance {
+  const pick = (
+    value: string | undefined,
+    prev: string | null | undefined,
+  ): string | null => {
+    if (typeof value === "string" && value.length > 0) return value;
+    if (typeof prev === "string" && prev.length > 0) return prev;
+    return value ?? null;
+  };
+  return {
+    channelId: pick(params.channel_id, existing?.channel_id),
+    messageId: pick(params.message_id, existing?.message_id),
+    userId: pick(params.user_id, existing?.user_id),
+    userName: pick(params.user_name, existing?.user_name) || null,
+    channelName: pick(params.channel_name, existing?.channel_name) || null,
+    ingestedAt: existing?.ingested_at ?? nowIso(),
+  };
+}
+
+/**
+ * WP3: persist a failed attempt. An existing row only gets its status and
+ * attempt count updated (its chunks and provenance stay); otherwise a
+ * chunk-less row is written so the rescan can count attempts. Never throws.
+ */
+function recordFailedAttempt(args: {
+  readonly docStore: DocumentStore;
+  readonly existingRow: DocumentRow | null;
+  readonly params: AutoIngestAttachmentParams;
+  readonly attempt: number;
+  readonly contentClass: ContentClass;
+  readonly contentWeight: number;
+  readonly agentWeight: number;
+  readonly isTranscript: boolean;
+  readonly nowIso: () => string;
+  readonly logger: Logger;
+}): void {
+  const { docStore, params } = args;
+  try {
+    if (args.existingRow) {
+      docStore.setIngestOutcome(params.file_path, "failed", args.attempt);
+      return;
+    }
+    const prov = mergeProvenance(params, null, args.nowIso);
+    docStore.upsertDocumentRow({
+      source: params.file_path,
+      agentName: params.agent,
+      channelId: prov.channelId,
+      messageId: prov.messageId,
+      userId: prov.userId,
+      ingestedAt: prov.ingestedAt,
+      sourceKind: args.isTranscript ? "transcript" : "discord_attachment",
+      autoClassifiedClass: args.contentClass,
+      overrideClass: null,
+      contentWeight: args.contentWeight,
+      agentWeightAtIngest: args.agentWeight,
+      filename: params.filename || null,
+      userName: prov.userName,
+      channelName: prov.channelName,
+      ingestStatus: "failed",
+      ingestAttempts: args.attempt,
+    });
+  } catch (err) {
+    args.logger.warn(
+      {
+        tag: "phase999.43-autoingest",
+        agent: params.agent,
+        docSource: params.file_path,
+        err: err instanceof Error ? err.message : String(err),
+      },
+      "phase999.43-autoingest could not record the failed attempt",
+    );
   }
 }
 
@@ -684,6 +846,9 @@ function recordExactDuplicate(args: {
     sourceImagePath: original.source_image_path,
     contentSha256: args.contentSha256,
     duplicateOf: original.source,
+    filename: params.filename || null,
+    userName: params.user_name || null,
+    channelName: params.channel_name || null,
   });
   const reason = `exact duplicate of ${original.source}`;
   args.logger.info(

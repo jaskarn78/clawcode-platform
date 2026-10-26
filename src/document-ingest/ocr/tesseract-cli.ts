@@ -6,7 +6,7 @@
  * `scripts/deploy-clawdy.sh` (T06). On dev boxes lacking the binary, the
  * orchestrator (`./index.ts`) falls back to the WASM backend.
  *
- * WP3 (2026-10-25) — confidence is real: the page is recognized with the
+ * WP3 (2026-10-25): confidence is real. The page is recognized with the
  * `tsv` output config, the text is rebuilt from the word rows and the
  * confidence is the mean word confidence divided by 100. Only when the tsv
  * output is unavailable (older binary, unparseable output) does the backend
@@ -19,7 +19,7 @@
  * spawn.
  */
 
-import { writeFile, unlink, mkdtemp } from "node:fs/promises";
+import { writeFile, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { nanoid } from "nanoid";
@@ -51,7 +51,7 @@ export type TesseractCliOptions = {
 
 const BASE_CONFIG = Object.freeze({
   lang: "eng",
-  // psm 6: assume a single uniform block of text — best for cropped pages.
+  // psm 6: assume a single uniform block of text, best for cropped pages.
   // oem 1: LSTM neural-net engine (the modern default).
   psm: 6,
   oem: 1,
@@ -155,7 +155,14 @@ export async function ocrPageTesseract(
   const imgPath = join(tmp, `${nanoid()}.png`);
   await writeFile(imgPath, imageBuffer);
   try {
-    const tsvOut = await recognize(imgPath, { ...BASE_CONFIG, presets: ["tsv"] });
+    let tsvOut = "";
+    try {
+      tsvOut = await recognize(imgPath, { ...BASE_CONFIG, presets: ["tsv"] });
+    } catch {
+      // tsv renderer unavailable on this binary: fall through to plain text
+      // (which rethrows if the binary itself is missing).
+      tsvOut = "";
+    }
     const parsed = parseTesseractTsv(tsvOut ?? "");
     if (parsed !== null) {
       const confidence =
@@ -168,6 +175,8 @@ export async function ocrPageTesseract(
     const confidence = trimmed.length === 0 ? 0 : FALLBACK_CONFIDENCE;
     return { text: trimmed, confidence, backend: "tesseract-cli" };
   } finally {
-    await unlink(imgPath).catch(() => undefined);
+    // Remove the whole temp dir (the previous unlink left one empty
+    // phase101-tess-* dir behind per page).
+    await rm(tmp, { recursive: true, force: true }).catch(() => undefined);
   }
 }

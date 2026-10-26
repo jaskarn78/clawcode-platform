@@ -17,7 +17,7 @@ import { writeFile } from "node:fs/promises";
 import sharp from "sharp";
 import type { BatchedPage } from "../types.js";
 import { DIMENSION_MAX_PX, MAX_PAGES, IngestError } from "../page-batch.js";
-// WP3 — the process runner and DPI live in pdf-render.ts so the text-PDF
+// WP3: the process runner and DPI live in pdf-render.ts so the text-PDF
 // handler renders text-less pages with the same settings.
 import { RENDER_DPI, runProcess } from "../pdf-render.js";
 

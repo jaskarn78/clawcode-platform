@@ -1,17 +1,24 @@
 /**
- * WP3 (2026-10-25) — re-mirror documents whose memory mirror is missing.
+ * WP3 (2026-10-25): re-mirror documents whose memory mirror is missing.
  *
  * `document_chunks` is what the search_documents tool reads; the per-turn
  * retriever and clawcode_memory_search read `memory_chunks` under
  * `document:<slug>`. The mirror is written best-effort at ingest time, so a
- * memory-store hiccup leaves a document that only search_documents can
- * find (the live system had 13,458 document chunks and 665 mirror rows).
+ * memory-store hiccup (or a document ingested before cross-ingest existed)
+ * leaves a document that only search_documents can find. The live system
+ * had 13,458 document chunks and 665 mirror rows on one agent.
  *
- * The inbox rescan check calls `remirrorMissingDocuments` every cycle with a
- * small per-cycle cap: for each source with chunks but no
+ * The heartbeat rescan check calls `remirrorMissingDocuments` every cycle
+ * with a small per-cycle cap: for each source with chunks but no
  * `document:<slug>` ledger row, the document text is rebuilt from its
- * stored chunks, re-chunked to about 300 words with the contextual header,
- * embedded (v1 and v2) and written through `crossIngestToMemory`.
+ * stored chunks (headers stripped, overlap removed), re-chunked to about
+ * 300 words with the contextual header, embedded (v1 and v2) and written
+ * through `crossIngestToMemory`.
+ *
+ * Sources whose last ingest stored only a stub ("empty") or failed are not
+ * mirrored. A source that cannot produce a mirror (no text after rebuild,
+ * or repeated failures) is remembered in-process and skipped so it can
+ * never block the rest of the backlog.
  */
 
 import { basename } from "node:path";
@@ -29,6 +36,10 @@ import { crossIngestToMemory, MigrationPhaseStore } from "./cross-ingest.js";
 
 /** Default number of documents re-mirrored per rescan cycle. */
 export const DEFAULT_REMIRROR_PER_CYCLE = 10;
+/** Default cap on mirror chunks embedded per cycle (at least one document always runs). */
+export const DEFAULT_REMIRROR_CHUNK_BUDGET = 300;
+/** A source that failed this many times in this process is skipped. */
+export const REMIRROR_MAX_FAILURES = 3;
 
 export type RemirrorEmbed = (
   texts: readonly string[],
@@ -41,15 +52,38 @@ export type RemirrorDeps = {
   readonly embed: RemirrorEmbed;
   readonly logger?: Logger;
   readonly maxDocuments?: number;
+  readonly chunkBudget?: number;
+  /**
+   * Per-agent skip state (failures per source, and sources that produced
+   * nothing). Defaults to a module-level map keyed by agent.
+   */
+  readonly state?: RemirrorState;
 };
+
+export type RemirrorState = {
+  readonly failures: Map<string, number>;
+  readonly unmirrorable: Set<string>;
+};
+
+const STATE_BY_AGENT = new Map<string, RemirrorState>();
+
+function stateFor(agent: string): RemirrorState {
+  let st = STATE_BY_AGENT.get(agent);
+  if (!st) {
+    st = { failures: new Map(), unmirrorable: new Set() };
+    STATE_BY_AGENT.set(agent, st);
+  }
+  return st;
+}
 
 export type RemirrorResult = {
   /** Sources with chunks that were checked for a mirror. */
   readonly checked: number;
-  /** Sources that had no mirror before this run. */
+  /** Sources that had no mirror before this run (and are eligible). */
   readonly missing: number;
   readonly remirrored: number;
   readonly failed: number;
+  readonly chunksWritten: number;
 };
 
 /** The memory_chunks path for a source. */
@@ -66,14 +100,22 @@ export function displayFilenameFor(source: string, stored?: string | null): stri
   return basename(source).replace(/^\d{10,}-/, "");
 }
 
-/** Sources (chunk order) whose `document:<slug>` mirror ledger row is missing. */
+/**
+ * Sources whose `document:<slug>` mirror ledger row is missing, excluding
+ * stub/failed ingests and sources listed in `skip`.
+ */
 export function findDocumentsMissingMirror(
   docStore: DocumentStore,
   memoryStore: MemoryStore,
+  skip: ReadonlySet<string> = new Set(),
 ): readonly string[] {
   const out: string[] = [];
   for (const source of docStore.listSources()) {
-    if (memoryStore.getMemoryFileSha256(mirrorPathFor(source)) === null) out.push(source);
+    if (skip.has(source)) continue;
+    if (memoryStore.getMemoryFileSha256(mirrorPathFor(source)) !== null) continue;
+    const status = docStore.getDocumentRow(source)?.ingest_status ?? "ok";
+    if (status !== "ok") continue;
+    out.push(source);
   }
   return Object.freeze(out);
 }
@@ -114,37 +156,66 @@ export async function remirrorDocument(
 }
 
 /**
- * Re-mirror up to `maxDocuments` documents whose mirror is missing. Never
- * throws: a failing document is logged and counted, the rest continue.
+ * Re-mirror up to `maxDocuments` documents whose mirror is missing, within
+ * `chunkBudget` mirror chunks. Never throws: a failing document is logged
+ * and counted, the rest continue.
  */
 export async function remirrorMissingDocuments(deps: RemirrorDeps): Promise<RemirrorResult> {
-  const max = deps.maxDocuments ?? DEFAULT_REMIRROR_PER_CYCLE;
-  const missing = findDocumentsMissingMirror(deps.docStore, deps.memoryStore);
+  const max = Math.max(0, deps.maxDocuments ?? DEFAULT_REMIRROR_PER_CYCLE);
+  const budget = deps.chunkBudget ?? DEFAULT_REMIRROR_CHUNK_BUDGET;
+  const state = deps.state ?? stateFor(deps.agent);
   const checked = deps.docStore.listSources().length;
+  const missing = findDocumentsMissingMirror(deps.docStore, deps.memoryStore, state.unmirrorable);
   let remirrored = 0;
   let failed = 0;
-  for (const source of missing.slice(0, Math.max(0, max))) {
+  let chunksWritten = 0;
+  let attempted = 0;
+  for (const source of missing) {
+    if (attempted >= max) break;
+    if (attempted > 0 && chunksWritten >= budget) break;
+    attempted++;
     try {
       const written = await remirrorDocument(source, deps);
-      if (written > 0) remirrored++;
+      if (written > 0) {
+        remirrored++;
+        chunksWritten += written;
+        state.failures.delete(source);
+      } else {
+        // Nothing to mirror (no text after rebuild): never retry in this process.
+        state.unmirrorable.add(source);
+      }
     } catch (err) {
       failed++;
+      const n = (state.failures.get(source) ?? 0) + 1;
+      state.failures.set(source, n);
+      if (n >= REMIRROR_MAX_FAILURES) state.unmirrorable.add(source);
       deps.logger?.warn(
         {
           tag: "wp3-remirror",
           agent: deps.agent,
           source,
+          failures: n,
           err: err instanceof Error ? err.message : String(err),
         },
-        "document re-mirror failed (will retry next cycle)",
+        n >= REMIRROR_MAX_FAILURES
+          ? "document re-mirror failed; giving up until restart"
+          : "document re-mirror failed (will retry next cycle)",
       );
     }
   }
   if (remirrored > 0 || failed > 0) {
     deps.logger?.info(
-      { tag: "wp3-remirror", agent: deps.agent, checked, missing: missing.length, remirrored, failed },
+      {
+        tag: "wp3-remirror",
+        agent: deps.agent,
+        checked,
+        missing: missing.length,
+        remirrored,
+        failed,
+        chunksWritten,
+      },
       "document re-mirror pass",
     );
   }
-  return Object.freeze({ checked, missing: missing.length, remirrored, failed });
+  return Object.freeze({ checked, missing: missing.length, remirrored, failed, chunksWritten });
 }

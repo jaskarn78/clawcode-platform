@@ -108,33 +108,33 @@ export type DocumentRow = {
   readonly duplicate_of?: string | null;
   /** Phase 999.154 — structured vision analysis (JSON) the chunks were built from. */
   readonly vision_json?: string | null;
-  /** WP3 (2026-10-25) — original upload filename (the inbox path is timestamped). */
+  /** WP3 (2026-10-25): original upload filename (the inbox path is timestamped). */
   readonly filename?: string | null;
-  /** WP3 — Discord display name of the sender, when known. */
+  /** WP3: Discord display name of the sender, when known. */
   readonly user_name?: string | null;
-  /** WP3 — Discord channel name, when the bridge supplied it. */
+  /** WP3: Discord channel name, when the bridge supplied it. */
   readonly channel_name?: string | null;
   /**
-   * WP3 — outcome of the last ingest attempt: "ok" (chunks stored),
+   * WP3: outcome of the last ingest attempt: "ok" (chunks stored),
    * "empty" (nothing extractable; a stub chunk was stored), "failed" (the
    * pipeline threw). NULL on rows written before this column existed
    * (treated as "ok").
    */
   readonly ingest_status?: IngestStatus | null;
-  /** WP3 — how many times the auto-ingest handler has processed this source. */
+  /** WP3: how many times the auto-ingest handler has processed this source. */
   readonly ingest_attempts?: number | null;
 };
 
-/** WP3 — see DocumentRow.ingest_status. */
+/** WP3: see DocumentRow.ingest_status. */
 export type IngestStatus = "ok" | "empty" | "failed";
 
 /**
- * WP3 — a source whose last attempt was "empty" or "failed" is retried by the
+ * WP3: a source whose last attempt was "empty" or "failed" is retried by the
  * inbox rescan until this many attempts have been made.
  */
 export const MAX_INGEST_ATTEMPTS = 3;
 
-/** WP3 — true when the rescan should re-enqueue the file behind this row. */
+/** WP3: true when the rescan should re-enqueue the file behind this row. */
 export function documentNeedsRetry(row: DocumentRow): boolean {
   const status = row.ingest_status ?? "ok";
   if (status === "ok") return false;
@@ -165,11 +165,11 @@ export type DocumentRowInput = {
   readonly imageDhash?: string | null;
   readonly duplicateOf?: string | null;
   readonly visionJson?: string | null;
-  /** WP3 — see DocumentRow.filename / user_name / channel_name. */
+  /** WP3: see DocumentRow.filename / user_name / channel_name. */
   readonly filename?: string | null;
   readonly userName?: string | null;
   readonly channelName?: string | null;
-  /** WP3 — see DocumentRow.ingest_status / ingest_attempts. Defaults: "ok", 0. */
+  /** WP3: see DocumentRow.ingest_status / ingest_attempts. Defaults: "ok", 0. */
   readonly ingestStatus?: IngestStatus | null;
   readonly ingestAttempts?: number | null;
 };
@@ -199,7 +199,7 @@ type SearchRow = {
   // attachments only; NULL for PDF/docx/etc. and for legacy rows that
   // predate the fu2 migration).
   readonly source_image_path: string | null;
-  // WP3 — provenance for the search_documents payload.
+  // WP3: provenance for the search_documents payload.
   readonly filename: string | null;
   readonly user_name: string | null;
   readonly channel_name: string | null;
@@ -225,9 +225,12 @@ type PreparedStatements = {
   readonly listSources: Statement;
   readonly getChunkIdsBySource: Statement;
   readonly getChunksBySource: Statement;
-  // WP3 — delete_document also removes the provenance row (and rows that
+  // WP3: delete_document also removes the provenance row (and rows that
   // were recorded as exact duplicates of it).
   readonly deleteDocumentRows: Statement;
+  readonly listDuplicatesOf: Statement;
+  readonly countImagePathRefs: Statement;
+  readonly setIngestOutcome: Statement;
   // Phase 999.43 Plan 01 Task 2 — documents (provenance) table CRUD.
   readonly upsertDocumentRow: Statement;
   readonly getDocumentRow: Statement;
@@ -245,7 +248,7 @@ export class DocumentStore {
   private readonly db: DatabaseType;
   private readonly stmts: PreparedStatements;
   /**
-   * WP3 — mutation stamp for cache keying. Starts at construction time and
+   * WP3: mutation stamp for cache keying. Starts at construction time and
    * moves forward on every ingest, delete, provenance upsert and priority
    * change, so a search_documents cache key that includes it can never
    * serve a result computed before the corpus changed (across daemon
@@ -266,13 +269,13 @@ export class DocumentStore {
     migrateAddSourceImagePath(db);
     // Phase 999.154 — additive dedupe/vision columns (idempotent).
     migrateAddImageIngestColumns(db);
-    // WP3 — provenance + retry bookkeeping columns (idempotent).
+    // WP3: provenance + retry bookkeeping columns (idempotent).
     migrateAddProvenanceColumns(db);
     this.stmts = this.prepareStatements();
   }
 
   /**
-   * WP3 — current mutation stamp. Include it in any cache key built over
+   * WP3: current mutation stamp. Include it in any cache key built over
    * search results so ingest, delete and priority changes invalidate them.
    */
   getVersion(): number {
@@ -402,7 +405,7 @@ export class DocumentStore {
             (embedding as Float32Array).byteLength,
           );
 
-    // WP3 — with a source filter the candidates are restricted to that
+    // WP3: with a source filter the candidates are restricted to that
     // source BEFORE scoring: a brute-force vec_distance_cosine over the
     // source's own chunks (an indexed lookup on document_chunks.source, then
     // one vector read per chunk). The previous KNN-then-filter query returned
@@ -462,7 +465,7 @@ export class DocumentStore {
         // null for non-image source kinds and for legacy rows whose
         // documents row lacks the column.
         sourceImagePath: row.source_image_path ?? null,
-        // WP3 — provenance for the tool payload.
+        // WP3: provenance for the tool payload.
         filename: row.filename ?? null,
         ingestedAt: row.ingested_at ?? null,
         userName: row.user_name ?? null,
@@ -491,7 +494,34 @@ export class DocumentStore {
     return deleted;
   }
 
-  /** WP3 — every stored chunk of a source in chunk order (no embeddings). */
+  /**
+   * WP3: rows recorded as exact duplicates of `source` (their own inbox
+   * path plus the image path they share with the original).
+   */
+  listDuplicatesOf(
+    source: string,
+  ): readonly { readonly source: string; readonly source_image_path: string | null }[] {
+    return this.stmts.listDuplicatesOf.all(source) as Array<{
+      source: string;
+      source_image_path: string | null;
+    }>;
+  }
+
+  /** WP3: how many documents rows still point at this archived image path. */
+  countImagePathReferences(path: string): number {
+    return (this.stmts.countImagePathRefs.get(path) as { n: number }).n;
+  }
+
+  /**
+   * WP3: record the outcome of an ingest attempt on an existing row without
+   * touching its other provenance fields. No-op when the row is absent.
+   */
+  setIngestOutcome(source: string, status: IngestStatus, attempts: number): void {
+    this.stmts.setIngestOutcome.run(status, attempts, source);
+    this.bumpVersion();
+  }
+
+  /** WP3: every stored chunk of a source in chunk order (no embeddings). */
   getChunksForSource(source: string): readonly StoredChunk[] {
     const rows = this.stmts.getChunksBySource.all(source) as ReadonlyArray<{
       id: string;
@@ -683,7 +713,7 @@ export class DocumentStore {
           AND k = ?
         ORDER BY v.distance
       `),
-      // WP3 — source-scoped search is a brute force over that source's
+      // WP3: source-scoped search is a brute force over that source's
       // chunks (vec_distance_cosine on the int8 vectors), not a global KNN
       // filtered afterwards. Bind order: query bytes, source, limit.
       searchBySource: this.db.prepare(`
@@ -714,6 +744,15 @@ export class DocumentStore {
       ),
       deleteDocumentRows: this.db.prepare(
         "DELETE FROM documents WHERE source = ? OR duplicate_of = ?",
+      ),
+      listDuplicatesOf: this.db.prepare(
+        "SELECT source, source_image_path FROM documents WHERE duplicate_of = ?",
+      ),
+      countImagePathRefs: this.db.prepare(
+        "SELECT COUNT(*) AS n FROM documents WHERE source_image_path = ?",
+      ),
+      setIngestOutcome: this.db.prepare(
+        "UPDATE documents SET ingest_status = ?, ingest_attempts = ? WHERE source = ?",
       ),
       // Phase 999.43 Plan 01 Task 2 — documents table CRUD.
       // ON CONFLICT(source) DO UPDATE — idempotent upsert. agent_name +
@@ -780,9 +819,12 @@ export class DocumentStore {
       listAllDocumentsSources: this.db.prepare(
         "SELECT source FROM documents",
       ),
+      // WP3: a stub ("empty") or "failed" original must not swallow a
+      // re-send of the same bytes, so only successful originals match.
       findDocumentBySha256: this.db.prepare(
         `SELECT * FROM documents
          WHERE content_sha256 = ? AND duplicate_of IS NULL
+           AND (ingest_status IS NULL OR ingest_status = 'ok')
          ORDER BY ingested_at ASC LIMIT 1`,
       ),
       listRecentImageHashes: this.db.prepare(
@@ -909,7 +951,7 @@ export class DocumentStore {
 }
 
 /**
- * WP3 (2026-10-25) — additive provenance + retry columns on `documents`:
+ * WP3 (2026-10-25): additive provenance + retry columns on `documents`:
  * filename, user_name, channel_name (TEXT, NULLable), ingest_status (TEXT,
  * NULL means "ok") and ingest_attempts (INTEGER NOT NULL DEFAULT 0). Same
  * idempotent PRAGMA-introspection pattern as the earlier migrations.
