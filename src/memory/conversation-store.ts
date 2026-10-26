@@ -1195,16 +1195,26 @@ export class ConversationStore {
       // count. Phase 89 restart-greeting falls through to "no prior session
       // to recap" minimalEmbed when this list returns only empty sessions;
       // the filter prevents that false-negative.
+      //
+      // Memory overhaul 2026-10-25 (WP4): summarizeSession deletes a
+      // session's turns right after markSummarized, so the EXISTS predicate
+      // alone hid every successfully summarized session from the brief gap
+      // check, the dream pass, the restart greeting and the brief cache
+      // fingerprint. A session counts when it has a summary OR still has
+      // turns; only sessions with neither are dropped.
       listRecentTerminatedSessions: this.db.prepare(
         `SELECT id, agent_name, started_at, ended_at, turn_count,
                 total_tokens, summary_memory_id, status
          FROM conversation_sessions
          WHERE agent_name = ?
            AND status IN ('ended', 'crashed', 'summarized')
-           AND EXISTS (
-             SELECT 1 FROM conversation_turns ct
-             WHERE ct.session_id = conversation_sessions.id
-             LIMIT 1
+           AND (
+             summary_memory_id IS NOT NULL
+             OR EXISTS (
+               SELECT 1 FROM conversation_turns ct
+               WHERE ct.session_id = conversation_sessions.id
+               LIMIT 1
+             )
            )
          ORDER BY started_at DESC, rowid DESC
          LIMIT ?`,

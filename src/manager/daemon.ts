@@ -5490,15 +5490,19 @@ export async function startDaemon(
   // chokidar watcher on {workspace}/memory/**/*.md for each agent whose
   // resolved config has memoryScannerEnabled=true (the default). The
   // scanner maintains memory_chunks + vec_memory_chunks + memory_chunks_fts
-  // + memory_files tables live — both on boot (via backfill) and on
+  // + memory_files tables live — both on start (via the sha256-gated
+  // backfill that MemoryScanner.start() runs once chokidar is ready) and on
   // subsequent file events.
   //
   // Wire-order: BETWEEN setSkillsCatalog and setAllAgentConfigs so the
   // scanners are ready before reconcileRegistry spins up sessions (which
   // immediately drive warm-path and may invoke memory retrieval). Per-
   // agent MemoryStore instances are initialized inside SessionManager
-  // startAgent so the backfill runs lazily on first turn — boot stays
-  // fast even when there are thousands of indexed memory files.
+  // startAgent, AFTER this loop, so the boot-time start() defers its
+  // backfill (storeReady is false) and SessionManager re-arms the scanner
+  // on every start and resume path once the store exists. The same re-arm
+  // covers in-daemon restarts: stopAgent closes the watcher but keeps the
+  // reference, and the next start re-creates the watcher and backfills.
   for (const agent of resolvedAgents) {
     if (agent.memoryScannerEnabled === false) continue;
     const workspacePath = agent.workspace;
@@ -5516,6 +5520,12 @@ export async function startDaemon(
     const scanner = new MemoryScanner(
       {
         store: makeLazyMemoryStoreProxy(storeProvider),
+        // Memory overhaul 2026-10-25 (WP4): start() backfills once chokidar
+        // is ready. At boot the per-agent store does not exist yet, so gate
+        // the backfill on it; otherwise every file would be embedded into
+        // the no-op proxy and discarded. SessionManager re-arms the scanner
+        // on each start and resume path, which runs the deferred backfill.
+        storeReady: () => storeProvider() !== undefined,
         embed: (text: string) =>
           (manager as unknown as {
             memory: { embedder: { embed: (t: string) => Promise<Float32Array> } };

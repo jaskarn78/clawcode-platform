@@ -35,6 +35,15 @@ export type MemoryScannerDeps = Readonly<{
   store: MemoryStore;
   embed: EmbedFn;
   log: Logger;
+  /**
+   * Memory overhaul 2026-10-25 (WP4): gate for the backfill that start()
+   * runs. The daemon constructs scanners before the per-agent MemoryStore
+   * exists (its `store` is a lazy no-op proxy until then); backfilling at
+   * that point would embed every file and discard the result. When this
+   * returns false the backfill is deferred to the next start() call.
+   * Omitted means "ready".
+   */
+  storeReady?: () => boolean;
 }>;
 
 /**

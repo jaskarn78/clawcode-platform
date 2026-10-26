@@ -14,6 +14,34 @@ import type { ConversationStore } from "../memory/conversation-store.js";
 import type { Logger } from "pino";
 import { detectInstructionPatterns } from "../security/instruction-detector.js";
 
+/**
+ * Memory overhaul 2026-10-25 (WP4): the bridge wraps every Discord message
+ * in a `<channel source="discord" chat_id=... message_id=... user=... ts=...>`
+ * envelope before dispatch. The stored user turn must hold the user's words,
+ * not the envelope: the envelope dominated FTS terms, embeddings, flush
+ * summaries and the short-session summary (which kept only the first 80
+ * characters, all envelope). The fields that matter (user id, message id)
+ * already have their own columns (discordUserId / discordMessageId);
+ * conversation_turns has no metadata column, so ts and chat_id are dropped.
+ *
+ * Anything after the closing tag (attachment manifest, reply context,
+ * vision analysis) is kept because the agent saw it as part of the turn.
+ *
+ * WP2 is adding a shared helper for the retrieval query. Once it lands this
+ * private copy can be replaced by the import.
+ */
+const CHANNEL_ENVELOPE_RE = /^\s*<channel\b[^>]*>\s*([\s\S]*?)\s*<\/channel>/;
+
+function stripChannelEnvelope(text: string): string {
+  const match = CHANNEL_ENVELOPE_RE.exec(text);
+  if (!match) return text;
+  const inner = match[1] ?? "";
+  const trailer = text.slice(match.index + match[0].length).trim();
+  if (trailer.length === 0) return inner;
+  if (inner.length === 0) return trailer;
+  return `${inner}\n${trailer}`;
+}
+
 /** Input for capturing a single Discord message exchange (user + assistant). */
 export type CaptureInput = {
   readonly convStore: ConversationStore;
@@ -65,8 +93,12 @@ export type CaptureInput = {
  */
 export function captureDiscordExchange(input: CaptureInput): void {
   try {
+    // Store the user's words, not the Discord envelope (see
+    // stripChannelEnvelope). Detection runs on the same text that is stored.
+    const userContent = stripChannelEnvelope(input.userContent);
+
     // Run detection BEFORE any storage
-    const detection = detectInstructionPatterns(input.userContent);
+    const detection = detectInstructionPatterns(userContent);
 
     if (detection.detected) {
       input.log.warn(
@@ -87,7 +119,7 @@ export function captureDiscordExchange(input: CaptureInput): void {
     const userTurn = input.convStore.recordTurn({
       sessionId: input.sessionId,
       role: "user",
-      content: input.userContent,
+      content: userContent,
       channelId: input.channelId,
       discordUserId: input.discordUserId,
       discordMessageId: input.discordMessageId,

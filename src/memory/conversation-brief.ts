@@ -12,11 +12,15 @@
  *   `config.sessionCount`, and renders each as a `### Session from …`
  *   markdown block under a stable `## Recent Sessions` heading.
  *
- * SESS-03 — 4-hour gap skip: reads the most recent TERMINATED session via
- *   `listRecentTerminatedSessions(agent, 1)` (excludes status='active').
- *   If the gap between `now` and `endedAt ?? startedAt` is below
- *   `gapThresholdHours`, returns `{ skipped: true, reason: "gap" }` WITHOUT
- *   touching MemoryStore (verified by spy in the paired test suite).
+ * SESS-03 — gap skip (opt-in since the 2026-10-25 memory overhaul, default
+ *   threshold 0): when `gapThresholdHours` is positive, reads the most
+ *   recent TERMINATED session via `listRecentTerminatedSessions(agent, 1)`
+ *   (excludes status='active'). If the gap between `now` and
+ *   `endedAt ?? startedAt` is below the threshold, returns
+ *   `{ skipped: true, reason: "gap" }` WITHOUT touching MemoryStore
+ *   (verified by spy in the paired test suite). With the default of 0 the
+ *   brief is injected on every fresh session, because a fresh session has
+ *   no transcript to make the summary redundant.
  *
  * agents-forget-across-sessions (2026-04-19): originally called
  *   `listRecentSessions` which included the just-created active session
@@ -49,8 +53,14 @@ import type { MemoryEntry } from "./types.js";
 /** Default number of recent summaries rendered in the brief (SESS-02). */
 export const DEFAULT_RESUME_SESSION_COUNT = 3;
 
-/** Default gap threshold in hours — skip if last session ended less than this ago (SESS-03). */
-export const DEFAULT_RESUME_GAP_THRESHOLD_HOURS = 4;
+/**
+ * Default gap threshold in hours (SESS-03). 0 means the brief is injected on
+ * every fresh session. Memory overhaul 2026-10-25 (WP4): a fresh SDK session
+ * has no transcript, so the previous session's summary is the only link to
+ * what the agent was doing, however short the gap was. A positive value is
+ * still honoured for operators who set `resumeGapThresholdHours`.
+ */
+export const DEFAULT_RESUME_GAP_THRESHOLD_HOURS = 0;
 
 /** Default token budget for the rendered brief — dedicated; NOT shared with resume_summary. */
 export const DEFAULT_CONVERSATION_CONTEXT_BUDGET = 2000;
@@ -147,25 +157,34 @@ export function assembleConversationBrief(
   // return that just-started row, collapse the gap to ~0ms, and gap-skip
   // the brief on every daemon boot. Terminated-only is the correct source
   // for "when did the previous session actually end?"
-  const recent = conversationStore.listRecentTerminatedSessions(agentName, 1);
-  if (recent.length > 0) {
-    const last = recent[0]!;
-    // For terminated sessions, endedAt is always populated (ended/crashed
-    // transitions set it; summarized preserves the prior endedAt). The
-    // `?? startedAt` fallback is defensive — a row with status in
-    // (ended,crashed,summarized) but endedAt=null would be a schema
-    // invariant violation upstream.
-    const lastTsIso = last.endedAt ?? last.startedAt;
-    // Clock-skew clamp: `Math.max(0, …)` keeps the gap non-negative even
-    // when an NTP correction moves the system clock backward between
-    // process restarts. Pitfall 7 in 67-RESEARCH.
-    const gapMs = Math.max(0, now - new Date(lastTsIso).getTime());
-    const thresholdMs = config.gapThresholdHours * HOUR_MS;
-    if (gapMs < thresholdMs) {
-      return Object.freeze({
-        skipped: true as const,
-        reason: "gap" as const,
-      });
+  //
+  // Memory overhaul 2026-10-25 (WP4): the gap skip only applies when the
+  // operator set a positive threshold. The default is 0 because a fresh
+  // session never carries the previous transcript, so skipping the brief
+  // on a short gap left the agent with nothing (critic item 4).
+  const thresholdHours =
+    config.gapThresholdHours ?? DEFAULT_RESUME_GAP_THRESHOLD_HOURS;
+  if (thresholdHours > 0) {
+    const recent = conversationStore.listRecentTerminatedSessions(agentName, 1);
+    if (recent.length > 0) {
+      const last = recent[0]!;
+      // For terminated sessions, endedAt is always populated (ended/crashed
+      // transitions set it; summarized preserves the prior endedAt). The
+      // `?? startedAt` fallback is defensive — a row with status in
+      // (ended,crashed,summarized) but endedAt=null would be a schema
+      // invariant violation upstream.
+      const lastTsIso = last.endedAt ?? last.startedAt;
+      // Clock-skew clamp: `Math.max(0, …)` keeps the gap non-negative even
+      // when an NTP correction moves the system clock backward between
+      // process restarts. Pitfall 7 in 67-RESEARCH.
+      const gapMs = Math.max(0, now - new Date(lastTsIso).getTime());
+      const thresholdMs = thresholdHours * HOUR_MS;
+      if (gapMs < thresholdMs) {
+        return Object.freeze({
+          skipped: true as const,
+          reason: "gap" as const,
+        });
+      }
     }
   }
 

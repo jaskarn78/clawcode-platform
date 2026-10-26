@@ -34,6 +34,14 @@ import { TraceCollector } from "../performance/trace-collector.js";
  * Each agent gets its own MemoryStore, SessionLogger, CompactionManager,
  * TierManager, UsageTracker, and CharacterCountFillProvider.
  */
+/**
+ * Memory overhaul 2026-10-25 (WP4) — options for saveContextSummary.
+ * `generatedAt` is an ISO 8601 timestamp written as the first body line.
+ */
+export type SaveContextSummaryOptions = Readonly<{
+  generatedAt?: string;
+}>;
+
 export class AgentMemoryManager {
   readonly memoryStores: Map<string, MemoryStore> = new Map();
   readonly compactionManagers: Map<string, CompactionManager> = new Map();
@@ -275,19 +283,29 @@ export class AgentMemoryManager {
   }
 
   /**
-   * Persist a context summary after compaction.
+   * Persist a context summary after compaction or at session end.
    * Saves to the agent's memory directory for injection on next resume.
    *
    * Phase 75 SHARED-01 — takes memoryPath (not workspace) so shared-workspace
    * agents write context summaries into their private per-agent memory dir.
+   *
+   * Memory overhaul 2026-10-25 (WP4): `opts.generatedAt` (ISO 8601) writes a
+   * `Generated: <ISO>` line as the first line of the summary body, so the
+   * block that boot injects carries a machine-readable timestamp (the file
+   * header's `**Generated:**` line is operator-local and stripped by
+   * loadLatestSummary). Callers that pass no timestamp get the old layout.
    */
   async saveContextSummary(
     agentName: string,
     memoryPath: string,
     summary: string,
+    opts?: SaveContextSummaryOptions,
   ): Promise<void> {
     const memoryDir = join(memoryPath, "memory");
-    await saveSummary(memoryDir, agentName, summary);
+    const body = opts?.generatedAt
+      ? `Generated: ${opts.generatedAt}\n\n${summary}`
+      : summary;
+    await saveSummary(memoryDir, agentName, body);
     this.log.info({ agent: agentName }, "context summary saved");
   }
 
