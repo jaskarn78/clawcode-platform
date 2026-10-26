@@ -156,6 +156,8 @@ describe("ConversationStore", () => {
     // 2026-04-25 evening hotfix added an EXISTS(conversation_turns) filter to
     // listRecentTerminatedSessions so empty restart cycles don't shadow real
     // history; these tests record one turn per session to satisfy that filter.
+    // Memory overhaul 2026-10-25 (WP4): a session with a summary also counts,
+    // because summarizeSession prunes the turns right after markSummarized.
     it("listRecentTerminatedSessions excludes active sessions", () => {
       setup();
       const s1 = convStore.startSession("agent-a");
@@ -190,6 +192,38 @@ describe("ConversationStore", () => {
 
       expect(terminated).toHaveLength(1);
       expect(terminated[0].status).toBe("summarized");
+    });
+
+    it("listRecentTerminatedSessions keeps a summarized session after its turns are pruned (WP4)", () => {
+      setup();
+      const memId = createMemoryEntry(memStore, "pruned-summary");
+      const session = convStore.startSession("agent-a");
+      convStore.recordTurn({ sessionId: session.id, role: "user", content: "x" });
+      convStore.recordTurn({ sessionId: session.id, role: "assistant", content: "y" });
+      convStore.endSession(session.id);
+      convStore.markSummarized(session.id, memId);
+      // Mirrors session-summarizer Step 13b: turns are deleted once the
+      // summary row exists.
+      expect(convStore.deleteTurnsForSession(session.id)).toBe(2);
+      expect(convStore.getTurnsForSession(session.id)).toHaveLength(0);
+
+      const terminated = convStore.listRecentTerminatedSessions("agent-a", 10);
+
+      expect(terminated.map((s) => s.id)).toEqual([session.id]);
+      expect(terminated[0].summaryMemoryId).toBe(memId);
+    });
+
+    it("listRecentTerminatedSessions still drops terminated sessions with no turns and no summary (WP4)", () => {
+      setup();
+      const empty = convStore.startSession("agent-a");
+      convStore.endSession(empty.id); // restart cycle with no conversation
+      const real = convStore.startSession("agent-a");
+      convStore.recordTurn({ sessionId: real.id, role: "user", content: "hi" });
+      convStore.crashSession(real.id);
+
+      const terminated = convStore.listRecentTerminatedSessions("agent-a", 10);
+
+      expect(terminated.map((s) => s.id)).toEqual([real.id]);
     });
 
     it("listRecentTerminatedSessions orders by started_at DESC", () => {

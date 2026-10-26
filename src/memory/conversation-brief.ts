@@ -12,7 +12,7 @@
  *   `config.sessionCount`, and renders each as a `### Session from …`
  *   markdown block under a stable `## Recent Sessions` heading.
  *
- * SESS-03 — gap skip (opt-in since the 2026-10-25 memory overhaul, default
+ * SESS-03, gap skip (opt-in since the 2026-10-25 memory overhaul, default
  *   threshold 0): when `gapThresholdHours` is positive, reads the most
  *   recent TERMINATED session via `listRecentTerminatedSessions(agent, 1)`
  *   (excludes status='active'). If the gap between `now` and
@@ -170,7 +170,7 @@ export function assembleConversationBrief(
       const last = recent[0]!;
       // For terminated sessions, endedAt is always populated (ended/crashed
       // transitions set it; summarized preserves the prior endedAt). The
-      // `?? startedAt` fallback is defensive — a row with status in
+      // `?? startedAt` fallback is defensive: a row with status in
       // (ended,crashed,summarized) but endedAt=null would be a schema
       // invariant violation upstream.
       const lastTsIso = last.endedAt ?? last.startedAt;

@@ -34,14 +34,6 @@ import { TraceCollector } from "../performance/trace-collector.js";
  * Each agent gets its own MemoryStore, SessionLogger, CompactionManager,
  * TierManager, UsageTracker, and CharacterCountFillProvider.
  */
-/**
- * Memory overhaul 2026-10-25 (WP4) — options for saveContextSummary.
- * `generatedAt` is an ISO 8601 timestamp written as the first body line.
- */
-export type SaveContextSummaryOptions = Readonly<{
-  generatedAt?: string;
-}>;
-
 export class AgentMemoryManager {
   readonly memoryStores: Map<string, MemoryStore> = new Map();
   readonly compactionManagers: Map<string, CompactionManager> = new Map();
@@ -299,7 +291,7 @@ export class AgentMemoryManager {
     agentName: string,
     memoryPath: string,
     summary: string,
-    opts?: SaveContextSummaryOptions,
+    opts?: { readonly generatedAt?: string },
   ): Promise<void> {
     const memoryDir = join(memoryPath, "memory");
     const body = opts?.generatedAt
@@ -307,6 +299,63 @@ export class AgentMemoryManager {
       : summary;
     await saveSummary(memoryDir, agentName, body);
     this.log.info({ agent: agentName }, "context summary saved");
+  }
+
+  /**
+   * Memory overhaul 2026-10-25 (WP4): copy a session's final summary into
+   * context-summary.md, so the next boot's "Context Summary (from previous
+   * session)" block holds the real summary of the last session, stamped
+   * with a `Generated: <ISO>` line. Before this, the only writer was the
+   * heartbeat zone snapshot, which wrote a placeholder and never fired for
+   * SDK agents.
+   *
+   * Call it after summarizeSession resolved and BEFORE cleanupMemory (it
+   * reads the agent's open stores). The summary row is the one the session
+   * points at (summary_memory_id) or, failing that, the newest row tagged
+   * both `session-summary` and `session:<id>`. Uses findByTag rather than
+   * getById so reading it does not bump access_count. Raw-turn fallback
+   * rows are not copied: their body is a transcript dump, not a summary,
+   * and the context-summary writer keeps only its first 500 words.
+   *
+   * Never throws. Returns what happened for logging and tests.
+   */
+  async saveSessionSummaryAsContextSummary(
+    agentName: string,
+    memoryPath: string,
+    sessionId: string,
+    now: Date = new Date(),
+  ): Promise<"written" | "no-store" | "no-summary" | "raw-fallback" | "failed"> {
+    const memoryStore = this.memoryStores.get(agentName);
+    const conversationStore = this.conversationStores.get(agentName);
+    if (!memoryStore || !conversationStore) return "no-store";
+    try {
+      const summaryMemoryId =
+        conversationStore.getSession(sessionId)?.summaryMemoryId ?? null;
+      const rows = memoryStore
+        .findByTag(`session:${sessionId}`)
+        .filter((m) => m.tags.includes("session-summary"));
+      const row =
+        rows.find((m) => m.id === summaryMemoryId) ??
+        [...rows].sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+      if (!row || row.content.trim().length === 0) return "no-summary";
+      if (row.tags.includes("raw-fallback")) {
+        this.log.info(
+          { agent: agentName, session: sessionId },
+          "context summary not refreshed: session summary is a raw-turn fallback",
+        );
+        return "raw-fallback";
+      }
+      await this.saveContextSummary(agentName, memoryPath, row.content.trim(), {
+        generatedAt: now.toISOString(),
+      });
+      return "written";
+    } catch (error) {
+      this.log.warn(
+        { agent: agentName, session: sessionId, error: (error as Error).message },
+        "context summary write from session summary failed (non-fatal)",
+      );
+      return "failed";
+    }
   }
 
   /**

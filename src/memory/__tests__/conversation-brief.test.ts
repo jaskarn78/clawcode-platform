@@ -1,7 +1,8 @@
 /**
  * Phase 67 Plan 01 — unit tests for `assembleConversationBrief`.
  *
- * Covers SESS-02 (last-N rendering), SESS-03 (4-hour gap skip), and edge
+ * Covers SESS-02 (last-N rendering), SESS-03 (gap skip, opt-in since the
+ * 2026-10-25 memory overhaul; the default threshold is 0), and edge
  * cases (empty store, active-session fallback, decay bypass, tag
  * precision). Uses real MemoryStore(":memory:") + real ConversationStore
  * (mirrors conversation-store.test.ts harness) so the helper runs against
@@ -12,7 +13,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { MemoryStore } from "../store.js";
 import { ConversationStore } from "../conversation-store.js";
-import { assembleConversationBrief } from "../conversation-brief.js";
+import {
+  assembleConversationBrief,
+  DEFAULT_RESUME_GAP_THRESHOLD_HOURS,
+} from "../conversation-brief.js";
+import { summarizeSession } from "../session-summarizer.js";
 import type { MemoryEntry } from "../types.js";
 
 /** Deterministic "now" — 2026-04-18T12:00:00Z. */
@@ -82,6 +87,13 @@ function seedNonSummaryMemory(
 /**
  * Seed an ended session with controllable `started_at` and `ended_at`.
  * Returns the session id for later inspection.
+ *
+ * Records one turn so the row models a real terminated session:
+ * listRecentTerminatedSessions drops terminated rows that have neither
+ * turns nor a summary (empty restart cycles). Before the 2026-10-25 memory
+ * overhaul this helper seeded a turn-less row, so the two "gap under
+ * threshold" tests below were stale: the row was filtered out and the gap
+ * check never saw it.
  */
 function seedEndedSession(
   memStore: MemoryStore,
@@ -91,6 +103,7 @@ function seedEndedSession(
   endedAt: string,
 ): string {
   const session = convStore.startSession(agentName);
+  convStore.recordTurn({ sessionId: session.id, role: "user", content: "seed" });
   memStore
     .getDatabase()
     .prepare(
@@ -120,6 +133,11 @@ function seedActiveSession(
   return session.id;
 }
 
+/**
+ * Most tests below exercise the opt-in SESS-03 gap check, so they pass an
+ * explicit 4-hour threshold. The production default is 0 (always inject);
+ * see the "default threshold" tests.
+ */
 const defaultConfig = {
   sessionCount: 3,
   gapThresholdHours: 4,
@@ -335,6 +353,95 @@ describe("assembleConversationBrief", () => {
     expect(result.skipped).toBe(false);
     if (result.skipped) return;
     expect(result.brief).toContain("Recent session content");
+  });
+
+  // ── Memory overhaul 2026-10-25 (WP4): brief on every fresh session ─────
+  it("default gap threshold is 0", () => {
+    expect(DEFAULT_RESUME_GAP_THRESHOLD_HOURS).toBe(0);
+  });
+
+  it("with the default threshold the brief is injected even when the last session ended seconds ago", () => {
+    const fortySecondsAgo = new Date(T - 40_000).toISOString();
+    seedEndedSession(memStore, convStore, "agent-a", fortySecondsAgo, fortySecondsAgo);
+    seedSummary(
+      memStore,
+      "s-just-ended",
+      "What we were doing a minute ago",
+      new Date(T - 30_000).toISOString(),
+    );
+    const listSpy = vi.spyOn(convStore, "listRecentTerminatedSessions");
+
+    const result = assembleConversationBrief(
+      { agentName: "agent-a", now: T },
+      {
+        conversationStore: convStore,
+        memoryStore: memStore,
+        config: {
+          sessionCount: 3,
+          gapThresholdHours: DEFAULT_RESUME_GAP_THRESHOLD_HOURS,
+          budgetTokens: 2000,
+        },
+      },
+    );
+
+    expect(result.skipped).toBe(false);
+    if (result.skipped) return;
+    expect(result.brief).toContain("## Recent Sessions");
+    expect(result.brief).toContain("What we were doing a minute ago");
+    // With a 0 threshold there is no gap to measure, so the session list is
+    // not even queried.
+    expect(listSpy).not.toHaveBeenCalled();
+  });
+
+  it("opt-in gap check still sees a session whose turns were pruned by summarizeSession", async () => {
+    // A real summarize-then-prune cycle: 4 turns, Haiku stub, Step 13b prune.
+    const session = convStore.startSession("agent-a");
+    for (let i = 0; i < 4; i++) {
+      convStore.recordTurn({
+        sessionId: session.id,
+        role: i % 2 === 0 ? "user" : "assistant",
+        content: `pruned turn ${i}`,
+      });
+    }
+    convStore.endSession(session.id);
+    const result = await summarizeSession(
+      { agentName: "agent-a", sessionId: session.id },
+      {
+        conversationStore: convStore,
+        memoryStore: memStore,
+        embedder: { embed: async () => emptyEmbedding() } as never,
+        summarize: async () => "## Decisions\n- PRUNED-SESSION-SUMMARY\n",
+        log: { info() {}, warn() {}, debug() {}, error() {} } as never,
+      },
+    );
+    expect("success" in result && result.success).toBe(true);
+    expect(convStore.getTurnsForSession(session.id)).toHaveLength(0);
+    expect(
+      convStore.listRecentTerminatedSessions("agent-a", 5).map((s) => s.id),
+    ).toContain(session.id);
+
+    // The session ended moments ago. With an explicit 4h threshold the gap
+    // check finds it (before WP4 the pruned row was invisible and the check
+    // silently passed); with the default it is injected.
+    const endedAt = convStore.getSession(session.id)!.endedAt!;
+    const now = new Date(endedAt).getTime() + 60_000;
+    const gated = assembleConversationBrief(
+      { agentName: "agent-a", now },
+      { conversationStore: convStore, memoryStore: memStore, config: defaultConfig },
+    );
+    expect(gated.skipped).toBe(true);
+
+    const injected = assembleConversationBrief(
+      { agentName: "agent-a", now },
+      {
+        conversationStore: convStore,
+        memoryStore: memStore,
+        config: { ...defaultConfig, gapThresholdHours: 0 },
+      },
+    );
+    expect(injected.skipped).toBe(false);
+    if (injected.skipped) return;
+    expect(injected.brief).toContain("PRUNED-SESSION-SUMMARY");
   });
 
   it("zero history produces empty string", () => {

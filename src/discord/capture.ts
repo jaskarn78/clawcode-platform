@@ -17,29 +17,48 @@ import { detectInstructionPatterns } from "../security/instruction-detector.js";
 /**
  * Memory overhaul 2026-10-25 (WP4): the bridge wraps every Discord message
  * in a `<channel source="discord" chat_id=... message_id=... user=... ts=...>`
- * envelope before dispatch. The stored user turn must hold the user's words,
- * not the envelope: the envelope dominated FTS terms, embeddings, flush
- * summaries and the short-session summary (which kept only the first 80
- * characters, all envelope). The fields that matter (user id, message id)
- * already have their own columns (discordUserId / discordMessageId);
- * conversation_turns has no metadata column, so ts and chat_id are dropped.
+ * envelope before dispatch (formatDiscordMessage in bridge.ts), and a reply
+ * also gets a leading `<replying-to message_id=... user=... ts=...>` block.
+ * The stored user turn must hold the user's words, not the envelope: the
+ * envelope dominated FTS terms, embeddings, flush summaries and the
+ * short-session summary (which kept only the first 80 characters, all of
+ * them envelope).
  *
- * Anything after the closing tag (attachment manifest, reply context,
- * vision analysis) is kept because the agent saw it as part of the turn.
+ * conversation_turns has no metadata column. The fields that matter already
+ * have their own columns (discord_user_id, discord_message_id, created_at),
+ * so the envelope attributes are dropped. Everything the agent saw besides
+ * the wrapper tags is kept: the message body, the attachment manifest,
+ * vision analysis and the quoted reply text. An upload burst concatenates
+ * several envelopes, so every wrapper is unwrapped, not only the first.
  *
  * WP2 is adding a shared helper for the retrieval query. Once it lands this
  * private copy can be replaced by the import.
  */
-const CHANNEL_ENVELOPE_RE = /^\s*<channel\b[^>]*>\s*([\s\S]*?)\s*<\/channel>/;
+const CHANNEL_BLOCK_RE =
+  /(^|\n)[ \t]*<channel\b[^>\n]*>[ \t]*\n?([\s\S]*?)\n?[ \t]*<\/channel>[ \t]*(?=\n|$)/g;
+const REPLY_BLOCK_RE =
+  /(^|\n)[ \t]*<replying-to\b([^>\n]*)>[ \t]*\n?([\s\S]*?)\n?[ \t]*<\/replying-to>[ \t]*(?=\n|$)/g;
+const USER_ATTR_RE = /\buser="([^"]*)"/;
 
 function stripChannelEnvelope(text: string): string {
-  const match = CHANNEL_ENVELOPE_RE.exec(text);
-  if (!match) return text;
-  const inner = match[1] ?? "";
-  const trailer = text.slice(match.index + match[0].length).trim();
-  if (trailer.length === 0) return inner;
-  if (inner.length === 0) return trailer;
-  return `${inner}\n${trailer}`;
+  if (!text.includes("<channel") && !text.includes("<replying-to")) return text;
+  const unwrapped = text
+    .replace(REPLY_BLOCK_RE, (_m, lead: string, attrs: string, body: string) => {
+      const who = USER_ATTR_RE.exec(attrs)?.[1];
+      const quoted = body
+        .trim()
+        .split("\n")
+        .map((line) => `> ${line}`)
+        .join("\n");
+      const label = who ? `> (replying to ${who})` : "> (replying to)";
+      return `${lead}${label}\n${quoted}`;
+    })
+    .replace(CHANNEL_BLOCK_RE, (_m, lead: string, body: string) => `${lead}${body.trim()}`);
+  const trimmed = unwrapped.trim();
+  // Never store an empty user turn: an envelope around nothing (for example
+  // an attachment-only message whose manifest is also empty) keeps the raw
+  // text so the turn still records that something arrived.
+  return trimmed.length > 0 ? trimmed : text;
 }
 
 /** Input for capturing a single Discord message exchange (user + assistant). */

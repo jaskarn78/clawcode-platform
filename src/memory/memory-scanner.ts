@@ -40,7 +40,8 @@ export type MemoryScannerDeps = Readonly<{
    * runs. The daemon constructs scanners before the per-agent MemoryStore
    * exists (its `store` is a lazy no-op proxy until then); backfilling at
    * that point would embed every file and discard the result. When this
-   * returns false the backfill is deferred to the next start() call.
+   * returns false the backfill is deferred to the next start() call
+   * (SessionManager calls start() again once the store exists).
    * Omitted means "ready".
    */
   storeReady?: () => boolean;
@@ -76,7 +77,22 @@ export type BackfillResult = Readonly<{
 
 export class MemoryScanner {
   private watcher: FSWatcher | null = null;
+  /** Resolves when the current watcher emitted "ready". */
+  private watcherReady: Promise<void> | null = null;
   private readonly indexing: Set<string> = new Set();
+  /**
+   * WP4: paths whose change arrived while they were being indexed. The
+   * in-flight upsert re-runs them when it finishes instead of dropping the
+   * event (the re-run is sha256-gated, so an unchanged file is cheap).
+   */
+  private readonly rerun: Set<string> = new Set();
+  /** WP4: the startup backfill completed for the current watcher. */
+  private startupBackfillDone = false;
+  private startupBackfill: Promise<void> | null = null;
+  /** WP4: set by stop() so a running backfill ends at the next file. */
+  private stopRequested = false;
+  /** WP4: the last backfill() ended early because stop() was called. */
+  private lastBackfillInterrupted = false;
 
   constructor(
     private readonly deps: MemoryScannerDeps,
@@ -100,13 +116,28 @@ export class MemoryScanner {
    * a no-op so daemon re-init (e.g. after config reload) doesn't leak
    * watchers.
    *
+   * Memory overhaul 2026-10-25 (WP4): once chokidar is ready, start() runs
+   * backfill() (sha256-gated, so files already indexed cost a read and a
+   * hash) and resolves when it finishes. The watcher uses ignoreInitial, so
+   * without this, files written while no watcher or no store existed were
+   * never indexed. When `deps.storeReady` reports false the backfill is
+   * deferred, and a later start() call (watcher already running) runs it.
+   * A failed backfill is logged and retried by the next start().
+   *
    * chokidar 5.x dropped glob-pattern support — we watch the memory/
    * directory recursively and filter via `ignored` + shouldIndexMemoryPath
    * in the handlers. The dir-level watch correctly fires for nested paths
    * (e.g. memory/vault/rules.md) without needing explicit sub-watchers.
    */
   async start(): Promise<void> {
-    if (this.watcher) return;
+    this.stopRequested = false;
+    if (!this.watcher) this.openWatcher();
+    await this.watcherReady;
+    await this.runStartupBackfill();
+  }
+
+  /** Create the chokidar watcher and its handlers (no await). */
+  private openWatcher(): void {
     const memoryDir = join(this.workspacePath, "memory");
     const watchRoots = this.roots();
     // Dot-files excluded via `ignored`; non-.md / non-indexable files are
@@ -151,20 +182,64 @@ export class MemoryScanner {
     // Wait for the initial scan to complete before returning. Without this,
     // tests (and callers issuing an immediate write after start()) race
     // against the pre-ready buffering window and can miss the add event.
-    await new Promise<void>((resolve) => {
-      this.watcher!.once("ready", () => resolve());
+    // Stored so a concurrent start() awaits the same ready signal.
+    const watcher = this.watcher;
+    this.watcherReady = new Promise<void>((resolve) => {
+      watcher.once("ready", () => resolve());
+    }).then(() => {
+      this.deps.log.info(
+        { workspace: this.workspacePath, memoryDir, extraRoots: this.extraRoots },
+        "memory-scanner: watching memory/**/*.md",
+      );
     });
-    this.deps.log.info(
-      { workspace: this.workspacePath, memoryDir, extraRoots: this.extraRoots },
-      "memory-scanner: watching memory/**/*.md",
-    );
+  }
+
+  /**
+   * WP4: run the startup backfill once per watcher, when the store is
+   * ready. Concurrent callers share the in-flight run.
+   */
+  private async runStartupBackfill(): Promise<void> {
+    if (this.startupBackfillDone) return;
+    if (this.deps.storeReady && !this.deps.storeReady()) {
+      this.deps.log.debug(
+        { workspace: this.workspacePath },
+        "memory-scanner: store not ready, backfill deferred to the next start()",
+      );
+      return;
+    }
+    if (!this.startupBackfill) {
+      this.startupBackfill = (async () => {
+        try {
+          const result = await this.backfill();
+          if (!this.lastBackfillInterrupted) this.startupBackfillDone = true;
+          this.deps.log.info(
+            { workspace: this.workspacePath, ...result },
+            "memory-scanner: startup backfill complete",
+          );
+        } catch (err) {
+          this.deps.log.warn(
+            { workspace: this.workspacePath, err: (err as Error).message },
+            "memory-scanner: startup backfill failed (retried on next start)",
+          );
+        } finally {
+          this.startupBackfill = null;
+        }
+      })();
+    }
+    await this.startupBackfill;
   }
 
   /** Stop the watcher. Safe to call even if start() was never invoked. */
   async stop(): Promise<void> {
+    // WP4: end a running backfill at the next file, and backfill again on
+    // the next start() (files may change while nothing is watching).
+    this.stopRequested = true;
+    this.startupBackfillDone = false;
     if (this.watcher) {
-      await this.watcher.close();
+      const watcher = this.watcher;
       this.watcher = null;
+      this.watcherReady = null;
+      await watcher.close();
     }
   }
 
@@ -188,7 +263,14 @@ export class MemoryScanner {
     let chunks = 0;
     let indexed = 0;
     let skipped = 0;
+    this.lastBackfillInterrupted = false;
     for (const p of files) {
+      // WP4: stop() during a startup backfill ends it here. Never set for a
+      // standalone backfill() (CLI), which does not start a watcher.
+      if (this.stopRequested) {
+        this.lastBackfillInterrupted = true;
+        break;
+      }
       if (!shouldIndexMemoryPath(p)) continue;
       const outcome = await this.handleUpsert(p);
       if (outcome === "skipped") {
@@ -211,7 +293,11 @@ export class MemoryScanner {
    */
   private async handleUpsert(absPath: string): Promise<number | "skipped"> {
     if (!shouldIndexMemoryPath(absPath)) return 0;
-    if (this.indexing.has(absPath)) return 0;
+    if (this.indexing.has(absPath)) {
+      // WP4: queue a re-run instead of dropping the event.
+      this.rerun.add(absPath);
+      return 0;
+    }
     this.indexing.add(absPath);
     try {
       const content = await readFile(absPath, "utf-8");
@@ -264,6 +350,14 @@ export class MemoryScanner {
       return inserted;
     } finally {
       this.indexing.delete(absPath);
+      if (this.rerun.delete(absPath)) {
+        void this.handleUpsert(absPath).catch((err) =>
+          this.deps.log.warn(
+            { err: (err as Error).message, path: absPath },
+            "memory-scanner: re-index after concurrent change failed",
+          ),
+        );
+      }
     }
   }
 

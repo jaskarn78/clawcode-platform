@@ -5490,23 +5490,28 @@ export async function startDaemon(
   // chokidar watcher on {workspace}/memory/**/*.md for each agent whose
   // resolved config has memoryScannerEnabled=true (the default). The
   // scanner maintains memory_chunks + vec_memory_chunks + memory_chunks_fts
-  // + memory_files tables live — both on start (via the sha256-gated
-  // backfill that MemoryScanner.start() runs once chokidar is ready) and on
+  // + memory_files tables live, on start (sha256-gated backfill) and on
   // subsequent file events.
   //
   // Wire-order: BETWEEN setSkillsCatalog and setAllAgentConfigs so the
   // scanners are ready before reconcileRegistry spins up sessions (which
   // immediately drive warm-path and may invoke memory retrieval). Per-
   // agent MemoryStore instances are initialized inside SessionManager
-  // startAgent, AFTER this loop, so the boot-time start() defers its
-  // backfill (storeReady is false) and SessionManager re-arms the scanner
-  // on every start and resume path once the store exists. The same re-arm
-  // covers in-daemon restarts: stopAgent closes the watcher but keeps the
-  // reference, and the next start re-creates the watcher and backfills.
-  for (const agent of resolvedAgents) {
-    if (agent.memoryScannerEnabled === false) continue;
+  // startAgent, AFTER this loop.
+  //
+  // Memory overhaul 2026-10-25 (WP4): MemoryScanner.start() now runs the
+  // backfill once chokidar is ready. At boot the store does not exist yet,
+  // so `storeReady` defers it, and SessionManager.armMemoryScanner calls
+  // start() again from startAgentCore and the reconcileRegistry resume path
+  // once the store exists, which runs the deferred backfill. stopAgent
+  // stops and drops the scanner, so the factory registered below lets
+  // SessionManager recreate it when the agent starts again (in-daemon
+  // restart). Previously nothing recreated it and the restarted agent's new
+  // daily logs, flush files and cue files were never indexed.
+  const buildMemoryScanner = (agent: ResolvedAgentConfig): MemoryScanner | null => {
+    if (agent.memoryScannerEnabled === false) return null;
     const workspacePath = agent.workspace;
-    if (!workspacePath) continue;
+    if (!workspacePath) return null;
     // Resolve the per-agent MemoryStore lazily — SessionManager.startAgent
     // initializes memory.memoryStores AFTER this loop runs, so a fresh
     // scanner call at boot returns a wrapper that defers the lookup until
@@ -5517,14 +5522,11 @@ export async function startDaemon(
       (manager as unknown as {
         memory: { memoryStores: Map<string, unknown> };
       }).memory.memoryStores.get(agent.name);
-    const scanner = new MemoryScanner(
+    return new MemoryScanner(
       {
         store: makeLazyMemoryStoreProxy(storeProvider),
-        // Memory overhaul 2026-10-25 (WP4): start() backfills once chokidar
-        // is ready. At boot the per-agent store does not exist yet, so gate
-        // the backfill on it; otherwise every file would be embedded into
-        // the no-op proxy and discarded. SessionManager re-arms the scanner
-        // on each start and resume path, which runs the deferred backfill.
+        // WP4: gate the start() backfill on the store existing; otherwise
+        // every file would be embedded into the no-op proxy and discarded.
         storeReady: () => storeProvider() !== undefined,
         embed: (text: string) =>
           (manager as unknown as {
@@ -5538,6 +5540,14 @@ export async function startDaemon(
       // cues, flushes and daily logs written there are indexed.
       scannerExtraRoots(workspacePath, agent),
     );
+  };
+  // Agents that got a scanner at boot. Only these are recreated on restart,
+  // so subagent and thread sessions (never scanned before) stay unscanned.
+  const scannerAgentNames = new Set<string>();
+  for (const agent of resolvedAgents) {
+    const scanner = buildMemoryScanner(agent);
+    if (!scanner) continue;
+    scannerAgentNames.add(agent.name);
     manager.setMemoryScanner(agent.name, scanner);
     // Fire-and-forget: chokidar watches the directory even if it doesn't
     // exist yet (creates on first event). Scanner start failures are
@@ -5549,6 +5559,15 @@ export async function startDaemon(
       );
     });
   }
+  // WP4: recreate a dropped scanner from the agent's current config (it may
+  // have been hot-reloaded), falling back to the boot config.
+  manager.setMemoryScannerFactory((agentName: string) => {
+    if (!scannerAgentNames.has(agentName)) return null;
+    const agentCfg =
+      manager.getAgentConfig(agentName) ??
+      resolvedAgents.find((a) => a.name === agentName);
+    return agentCfg ? buildMemoryScanner(agentCfg) : null;
+  });
 
   // 6c. Wire agent configs into session manager for admin prompt injection
   manager.setAllAgentConfigs(resolvedAgents);

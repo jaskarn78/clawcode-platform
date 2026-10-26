@@ -1875,6 +1875,11 @@ export class SessionManager {
     // between DB flushes doesn't lose the active session's context). Skip
     // heuristic prevents spam on idle windows.
     this.startMemoryFileFlushTimer(name, config);
+
+    // Memory overhaul 2026-10-25 (WP4): the MemoryStore exists now, so make
+    // sure the memory scanner is watching and has run its backfill. This
+    // also recreates a scanner that stopAgent dropped (in-daemon restart).
+    this.armMemoryScanner(name);
     } finally {
       // Phase 106 STALL-02 — clear the warmup-timeout sentinel on every
       // exit path (success, early-return failure, exception). The
@@ -1953,12 +1958,18 @@ export class SessionManager {
   private async awaitMemoryFileFinalFlush(name: string): Promise<void> {
     const timer = this.memoryFileFlushTimers.get(name);
     if (!timer) return;
+    let capHandle: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
-        timer.flushNow(),
-        new Promise<never>((_, rej) =>
-          setTimeout(() => rej(new Error("flush timeout")), 10_000),
-        ),
+        // Memory overhaul 2026-10-25 (WP4): there is no later tick to retry
+        // on, so a failed or slow summary writes the raw turns at once. The
+        // 8s summary budget leaves room for that write inside the 10s cap.
+        // (If a periodic flush is already in flight, flushNow returns that
+        // attempt and these options do not apply.)
+        timer.flushNow({ rawOnFailure: true, summarizeTimeoutMs: 8_000 }),
+        new Promise<never>((_, rej) => {
+          capHandle = setTimeout(() => rej(new Error("flush timeout")), 10_000);
+        }),
       ]);
     } catch (err) {
       this.log.warn(
@@ -1966,9 +1977,63 @@ export class SessionManager {
         "final memory-file flush hit 10s cap or failed (non-fatal)",
       );
     } finally {
+      if (capHandle) clearTimeout(capHandle);
       timer.stop();
       this.memoryFileFlushTimers.delete(name);
     }
+  }
+
+  /**
+   * Memory overhaul 2026-10-25 (WP4): factory the daemon registers so a
+   * memory scanner that stopAgent dropped is recreated when the agent
+   * starts again (in-daemon restart). Returns null for agents that should
+   * not have one (scanner disabled, no workspace, not a configured agent).
+   * Declared here, beside its only users, to keep the WP4 edit in one region.
+   */
+  private memoryScannerFactory:
+    | ((agentName: string) => MemoryScanner | null)
+    | null = null;
+
+  /** WP4: daemon-side DI for {@link armMemoryScanner}. */
+  setMemoryScannerFactory(
+    factory: (agentName: string) => MemoryScanner | null,
+  ): void {
+    this.memoryScannerFactory = factory;
+  }
+
+  /**
+   * Memory overhaul 2026-10-25 (WP4): make sure the agent's memory scanner
+   * is watching and has backfilled. Called once the agent's MemoryStore
+   * exists (end of startAgentCore and the reconcileRegistry resume path).
+   * Recreates a scanner that stopAgent dropped via the daemon's factory,
+   * then calls start(), which is idempotent for the watcher and runs the
+   * sha256-gated backfill the boot-time start deferred (no store yet).
+   * Fire-and-forget: a backfill must never delay agent start.
+   */
+  private armMemoryScanner(name: string): void {
+    let scanner = this.memoryScanners.get(name);
+    if (!scanner && this.memoryScannerFactory) {
+      try {
+        scanner = this.memoryScannerFactory(name) ?? undefined;
+      } catch (err) {
+        this.log.warn(
+          { agent: name, error: (err as Error).message },
+          "memory-scanner factory failed (non-fatal)",
+        );
+        return;
+      }
+      if (scanner) {
+        this.memoryScanners.set(name, scanner);
+        this.log.info({ agent: name }, "memory-scanner recreated for restarted agent");
+      }
+    }
+    if (!scanner) return;
+    void scanner.start().catch((err) => {
+      this.log.warn(
+        { agent: name, error: (err as Error).message },
+        "memory-scanner start/backfill failed (non-fatal)",
+      );
+    });
   }
 
   /**
@@ -2440,6 +2505,22 @@ export class SessionManager {
             error: (err as Error).message,
           },
           "stop-path summarization failed (non-fatal)",
+        );
+      }
+      // Memory overhaul 2026-10-25 (WP4): copy the final summary into
+      // context-summary.md (with a Generated: <ISO> line) so the next boot
+      // has a real resume summary. Must run before cleanupMemory closes the
+      // stores. Never throws.
+      const stopConfig = this.configs.get(name);
+      if (stopConfig) {
+        const outcome = await this.memory.saveSessionSummaryAsContextSummary(
+          name,
+          stopConfig.memoryPath,
+          convSessionId,
+        );
+        this.log.info(
+          { agent: name, session: convSessionId, outcome },
+          "stop-path context summary",
         );
       }
     }
@@ -3136,6 +3217,12 @@ export class SessionManager {
           // periodic flush timer so a daemon reboot doesn't silently extend
           // the at-risk window between persistence checkpoints.
           this.startFlushTimer(entry.name, config);
+          // Memory overhaul 2026-10-25 (WP4): the disk flush timer (MEM-04)
+          // and the memory scanner, exactly as startAgentCore does. Before
+          // this, resumed agents never wrote a flush file and stopAgent had
+          // no final flush to await.
+          this.startMemoryFileFlushTimer(entry.name, config);
+          this.armMemoryScanner(entry.name);
           resumed++;
           this.log.info({ agent: entry.name, sessionId: entry.sessionId }, "session resumed");
         } catch (error) {
