@@ -33,6 +33,7 @@ import {
   DEFAULT_BUDGETS,
   INJECTED_MEMORY_MAX_CHARS,
   INJECTED_USER_MAX_CHARS,
+  renderHotMemoryLine,
 } from "./context-assembler.js";
 // Phase 999.7 — TraceCollector wired through deps for context-audit pipeline
 // restoration. Without it, the per-section section_tokens metadata is never
@@ -82,7 +83,19 @@ import {
 // context-assembler import block above.
 
 // Phase 999.13 DELEG-02 — per-agent specialist delegate map renderer.
-import { renderDelegatesBlock } from "../config/loader.js";
+// Memory overhaul WP6 (2026-10-25): the Phase 94 directive resolver and
+// renderer finally get a production caller: buildSessionConfig renders the
+// enabled directives into `sources.systemPromptDirectives` (the assembler
+// has carried that field since Phase 94 but nothing ever set it).
+import {
+  renderDelegatesBlock,
+  renderSystemPromptDirectiveBlock,
+  resolveSystemPromptDirectives,
+} from "../config/loader.js";
+import {
+  DEFAULT_SYSTEM_PROMPT_DIRECTIVES,
+  type SystemPromptDirective,
+} from "../config/schema.js";
 // Phase 117 Plan 04 T05 — advisor backend + model resolvers (config + SDK alias).
 // `resolveAdvisorBackend` and `resolveAdvisorModel` in `config/loader.ts`
 // implement the per-agent → defaults → baseline fall-through; the SDK
@@ -319,6 +332,15 @@ export type SessionConfigDeps = {
   readonly advisorBudget?: {
     canCall(agent: string): boolean;
   };
+  /**
+   * WP6 (2026-10-25): fleet-wide `defaults.systemPromptDirectives` from
+   * clawcode.yaml. Threaded the same way as `advisorDefaults`. When absent
+   * (tests, bootstrap paths, SessionManager not yet wired), the schema's
+   * DEFAULT_SYSTEM_PROMPT_DIRECTIVES apply, which is what the zod default
+   * puts in `defaults.systemPromptDirectives` anyway. The per-agent override
+   * is read off `config.systemPromptDirectives` when the loader carries it.
+   */
+  readonly systemPromptDirectiveDefaults?: Readonly<Record<string, SystemPromptDirective>>;
   /**
    * Phase 127 Plan 02 — per-agent stream-stall callback factory.
    *
@@ -606,12 +628,16 @@ export async function buildSessionConfig(
 
   const identityFile = identityContent;
 
-  // Inject agent name and memory_lookup guidance (LOAD-01)
+  // Inject agent name and recall guidance (LOAD-01)
   // Phase 115 Plan 03 sub-scope 1 — agent-name line + capability manifest
   // are composed into a single sub-source field so the assembler treats
   // them as one budget-able unit (mid-low importance — bullet-truncated).
+  // WP6 (2026-10-25): the line used to point at `memory_lookup` while the
+  // capability manifest teaches `clawcode_memory_search`; one prompt, two
+  // tool vocabularies. It now names the same tools the manifest does.
   let identityCapabilityManifest =
-    `Your name is ${config.name}. When using memory_lookup, pass '${config.name}' as the agent parameter.\n`;
+    `Your name is ${config.name}. Pass '${config.name}' as the agent parameter to tools that ask for it. ` +
+    `For anything older than what is shown here, call clawcode_memory_search (your saved memory and notes) and search_documents (uploaded files).\n`;
 
   // Phase 100 follow-up — capability manifest (after identity, before
   // MEMORY.md auto-load and MCP block). Sits in the cached stable prefix
@@ -665,6 +691,7 @@ export async function buildSessionConfig(
     INJECTED_MEMORY_MAX_CHARS;
 
   let identityMemoryAutoload = "";
+  let identityUserAutoload = "";
   // Phase 999.187 — MEMORY.md and USER.md come from the ONE Tier 1 directory
   // that `clawcode_memory_edit` / `_archive` write to (`resolveMemoryRoots`).
   // Before this the prompt read `<workspace>/MEMORY.md` while the tools wrote
@@ -769,6 +796,11 @@ export async function buildSessionConfig(
     // protocol has told every agent since Phase 115 that "MEMORY.md and
     // USER.md" are always shown above; USER.md was never loaded. Same
     // head/tail truncation as MEMORY.md under its own (smaller) cap.
+    // WP6 (2026-10-25): carried as its OWN sub-source
+    // (`identityUserAutoload`) instead of being appended to the MEMORY.md
+    // body: the assembler's identity budget now shrinks MEMORY.md to its
+    // floor before it touches the user profile, and the read-site marker
+    // below survives that pass.
     const userMaxChars =
       config.perf?.memoryAssemblyBudgets?.injectedUserMaxChars ??
       INJECTED_USER_MAX_CHARS;
@@ -793,10 +825,7 @@ export async function buildSessionConfig(
           "[diag] tier1-truncation",
         );
       }
-      identityMemoryAutoload =
-        (identityMemoryAutoload ? identityMemoryAutoload + "\n\n" : "") +
-        "## About the user (USER.md)\n\n" +
-        userBody;
+      identityUserAutoload = userBody;
     }
   }
 
@@ -817,6 +846,10 @@ export async function buildSessionConfig(
     identityStr +=
       "\n## Long-term memory (MEMORY.md)\n\n" + identityMemoryAutoload + "\n";
   }
+  if (identityUserAutoload) {
+    identityStr +=
+      "\n## About the user (USER.md)\n\n" + identityUserAutoload + "\n";
+  }
 
   // --- Collect hot memories source ---
   //
@@ -831,8 +864,9 @@ export async function buildSessionConfig(
     const hotMemories = agentTierManager.getHotMemories().slice(0, 3);
     hotMemoriesEntries = hotMemories;
     if (hotMemories.length > 0) {
+      // WP6: each bullet carries its created date (renderHotMemoryLine).
       hotMemoriesStr = hotMemories
-        .map((mem) => `- ${mem.content}`)
+        .map((mem) => renderHotMemoryLine(mem))
         .join("\n");
     }
   }
@@ -1088,7 +1122,12 @@ export async function buildSessionConfig(
     // context-summary.md that saveContextSummary wrote under
     // memoryPath/memory/. For dedicated-workspace agents the loader
     // fallback makes workspace === memoryPath, so this is a no-op.
-    (await loadLatestSummary(join(config.memoryPath, "memory")));
+    // WP6: loadLatestSummary now skips the heartbeat placeholder and any
+    // file older than 7 days; the injected clock keeps that testable. The
+    // one-argument call shape is kept when no clock is injected.
+    (await (deps.now !== undefined
+      ? loadLatestSummary(join(config.memoryPath, "memory"), { now: deps.now })
+      : loadLatestSummary(join(config.memoryPath, "memory"))));
   if (loadedSummary) {
     const resumeBudget =
       config.perf?.resumeSummaryBudget ?? DEFAULT_RESUME_SUMMARY_BUDGET;
@@ -1205,7 +1244,31 @@ export async function buildSessionConfig(
         })
       : undefined;
 
+  // WP6 (2026-10-25) — system-prompt directives. Phase 94 shipped the
+  // resolver + renderer + the assembler field and documented the directives
+  // as RELOADABLE, but no runtime caller ever rendered them: no-em-dashes,
+  // mutate-verify, parallel-tool-calls and the rest were silently absent
+  // from every agent's prompt. Per-key merge of the agent override (read
+  // structurally, like `advisor`, because ResolvedAgentConfig does not
+  // declare the field yet) over the fleet defaults; "" when every directive
+  // is disabled so the stable prefix is byte-identical to the no-directives
+  // baseline (REG-ASSEMBLER-EMPTY-WHEN-DISABLED).
+  const agentDirectiveOverrides = (
+    config as unknown as {
+      systemPromptDirectives?: Record<string, { enabled?: boolean; text?: string }>;
+    }
+  ).systemPromptDirectives;
+  const systemPromptDirectivesStr = renderSystemPromptDirectiveBlock(
+    resolveSystemPromptDirectives(
+      agentDirectiveOverrides,
+      deps.systemPromptDirectiveDefaults ?? DEFAULT_SYSTEM_PROMPT_DIRECTIVES,
+    ),
+  );
+
   const sources: ContextSources = {
+    // WP6: operator directives lead the stable prefix (assembler places
+    // them first). Empty string when all are disabled.
+    systemPromptDirectives: systemPromptDirectivesStr,
     // Legacy compound identity (kept for back-compat with consumers that
     // read `sources.identity` directly). The four carved fields below
     // take precedence at the assembler when any are non-undefined
@@ -1220,6 +1283,8 @@ export async function buildSessionConfig(
     identityFile,
     identityCapabilityManifest,
     identityMemoryAutoload,
+    // WP6: USER.md as its own sub-source (truncated after MEMORY.md).
+    identityUserAutoload,
     // Phase 53 Plan 02: SOUL.md body is currently folded into `identityStr`
     // by the fingerprint+identity concatenation above. We leave `soul: ""`
     // here so section_tokens.soul reports 0 for this agent — accurate given

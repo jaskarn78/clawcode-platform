@@ -24,6 +24,29 @@ export const DEFAULT_RESUME_SUMMARY_BUDGET = 1500;
 export const MIN_RESUME_SUMMARY_BUDGET = 500;
 
 /**
+ * Memory overhaul WP6 (2026-10-25). A resume summary older than this is not
+ * injected at boot: the "from previous session" framing is wrong for a file
+ * written days or weeks ago, and nothing deletes the file after use. Seven
+ * days matches the hot-tier recency window.
+ */
+export const DEFAULT_RESUME_SUMMARY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * WP6. The heartbeat zone-snapshot callback writes a one-line placeholder
+ * ("Auto-snapshot at 85% context fill [red zone]") through saveContextSummary.
+ * A file whose whole body is that line carries no context and is skipped.
+ */
+const PLACEHOLDER_BODY_PREFIX = "Auto-snapshot at";
+
+/** WP6. Options for `loadLatestSummary` (all optional, defaults keep the old call shape). */
+export type LoadLatestSummaryOptions = {
+  /** Epoch ms clock override for the age check (tests). Defaults to Date.now(). */
+  readonly now?: number;
+  /** Age ceiling in ms. Defaults to DEFAULT_RESUME_SUMMARY_MAX_AGE_MS. */
+  readonly maxAgeMs?: number;
+};
+
+/**
  * A persisted context summary from a compaction event.
  */
 export type ContextSummary = {
@@ -151,15 +174,53 @@ export async function saveSummary(
 }
 
 /**
+ * WP6. Parse the `**Generated:**` header value back to epoch ms.
+ *
+ * `saveSummary` writes "YYYY-MM-DD HH:mm:ss ZZZ" (renderAgentVisibleTimestamp);
+ * older files carry an ISO string. V8 parses ISO and the US zone
+ * abbreviations (PDT, EST, UTC...). For an abbreviation it does not know
+ * (CEST, BST...) the wall-clock part is read as UTC: the error is at most a
+ * few hours, far inside the 7-day window. Returns undefined when nothing
+ * date-shaped is found, in which case the caller keeps the summary (no
+ * evidence that it is stale).
+ */
+export function parseGeneratedTimestamp(raw: string): number | undefined {
+  const text = raw.trim();
+  if (text.length === 0) return undefined;
+  const direct = new Date(text).getTime();
+  if (!Number.isNaN(direct)) return direct;
+  const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/.exec(text);
+  if (!m) return undefined;
+  const fallback = new Date(`${m[1]}T${m[2]}Z`).getTime();
+  return Number.isNaN(fallback) ? undefined : fallback;
+}
+
+/**
+ * WP6. True when the body is nothing but the heartbeat zone-snapshot
+ * placeholder line (see PLACEHOLDER_BODY_PREFIX).
+ */
+export function isPlaceholderSummary(body: string): boolean {
+  const trimmed = body.trim();
+  return trimmed.startsWith(PLACEHOLDER_BODY_PREFIX) && !trimmed.includes("\n");
+}
+
+/**
  * Load the latest context summary from the agent's memory directory.
  * Returns the summary text (without the metadata header), or undefined
  * if no summary file exists.
  *
+ * WP6 (2026-10-25): also returns undefined when the body is only the
+ * heartbeat placeholder ("Auto-snapshot at ...") or when the Generated
+ * header is older than `opts.maxAgeMs` (default 7 days). A file with no
+ * parseable Generated header is kept.
+ *
  * @param memoryDir - Path to the agent's memory directory
+ * @param opts - optional clock / age ceiling overrides
  * @returns The summary text, or undefined
  */
 export async function loadLatestSummary(
   memoryDir: string,
+  opts?: LoadLatestSummaryOptions,
 ): Promise<string | undefined> {
   try {
     const content = await readFile(
@@ -172,8 +233,10 @@ export async function loadLatestSummary(
     const lines = content.split("\n");
     // Skip header: find the line after **Generated:** and the following blank line
     let bodyStartIndex = 0;
+    let generatedRaw: string | undefined;
     for (let i = 0; i < lines.length; i++) {
       if (lines[i].startsWith("**Generated:**")) {
+        generatedRaw = lines[i].slice("**Generated:**".length);
         // Skip the blank line after Generated
         bodyStartIndex = i + 2;
         break;
@@ -181,7 +244,17 @@ export async function loadLatestSummary(
     }
 
     const body = lines.slice(bodyStartIndex).join("\n").trim();
-    return body.length > 0 ? body : undefined;
+    if (body.length === 0) return undefined;
+    if (isPlaceholderSummary(body)) return undefined;
+
+    const generatedAt =
+      generatedRaw !== undefined ? parseGeneratedTimestamp(generatedRaw) : undefined;
+    if (generatedAt !== undefined) {
+      const now = opts?.now ?? Date.now();
+      const maxAgeMs = opts?.maxAgeMs ?? DEFAULT_RESUME_SUMMARY_MAX_AGE_MS;
+      if (now - generatedAt > maxAgeMs) return undefined;
+    }
+    return body;
   } catch {
     return undefined;
   }

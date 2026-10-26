@@ -124,6 +124,14 @@ export type ContextSources = {
    */
   readonly identityMemoryAutoload?: string;
   /**
+   * Memory overhaul WP6 (2026-10-25). USER.md auto-load body as its OWN
+   * identity sub-source (it used to be folded into `identityMemoryAutoload`,
+   * so the identity budget head-tail cut it first and dropped its read-site
+   * truncation marker). Bounded upstream by INJECTED_USER_MAX_CHARS. Rendered
+   * AFTER the MEMORY.md block; truncated only once MEMORY.md is at its floor.
+   */
+  readonly identityUserAutoload?: string;
+  /**
    * Phase 115 Plan 03 sub-scope 11 — typed Tier 1 source descriptor for the
    * MEMORY.md auto-load. Optional and additive: when present it carries the
    * same body that `identityMemoryAutoload` carries (`source.content`) plus
@@ -352,6 +360,25 @@ export const INJECTED_USER_MAX_CHARS = 4_000;
  */
 export const STABLE_PREFIX_MAX_TOKENS = 8_000;
 
+/**
+ * Memory overhaul WP6 (2026-10-25). The identity section's budget yields to
+ * the fixed, identity-independent parts of the stable prefix (system-prompt
+ * directives, tools, hot tier, Discord steers) so the per-section budgets
+ * can no longer sum past STABLE_PREFIX_MAX_TOKENS. The directives alone are
+ * about 3,000 tokens; before this the 8K emergency head-tail cut MEMORY.md,
+ * USER.md and the tool table out of the middle of the prompt with a generic
+ * marker. The identity budget never drops below this floor (SOUL fingerprint,
+ * IDENTITY.md head and the agent-name line still fit); if the fixed parts
+ * alone leave less than this, the emergency fallback remains the last resort.
+ */
+export const IDENTITY_BUDGET_FLOOR_TOKENS = 800;
+
+/**
+ * WP6. Slack kept between the measured fixed parts and the outer cap:
+ * covers the "\n\n" joins and the tokenizer's rounding on the final join.
+ */
+const OUTER_CAP_MARGIN_TOKENS = 64;
+
 // ── Phase 115 Plan 04 sub-scope 5 — cache-breakpoint placement constants ───
 
 /**
@@ -421,6 +448,7 @@ export const SECTION_PLACEMENT: Record<keyof ContextSources, SectionPlacement> =
   identityFile: "static",                   // Phase 115-03 carved sub-source
   identityCapabilityManifest: "static",     // Phase 115-03 carved sub-source
   identityMemoryAutoload: "static",         // Phase 115-03 carved sub-source — bounded by INJECTED_MEMORY_MAX_CHARS
+  identityUserAutoload: "static",           // WP6 carved sub-source, bounded by INJECTED_USER_MAX_CHARS
   identityMemoryAutoloadSource: "static",   // Phase 115-03 typed Tier 1 metadata (informational only)
   soul: "static",
   skillsHeader: "static",
@@ -669,6 +697,32 @@ export function computeHotStableToken(hotMemoriesStr: string): string {
 }
 
 /**
+ * WP6 (2026-10-25). The calendar date (YYYY-MM-DD) a memory was created, or
+ * undefined when `createdAt` does not start with one. Reads the date part
+ * verbatim (no Date parsing) so the rendered day never shifts with the host
+ * time zone.
+ */
+export function formatHotMemoryDate(createdAt: string | undefined): string | undefined {
+  if (!createdAt) return undefined;
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(createdAt);
+  return m ? m[1] : undefined;
+}
+
+/**
+ * WP6. One "## Key Memories" bullet. Hot memories used to render as bare
+ * `- <content>`, so the model could not tell a two-year-old fact from
+ * yesterday's. The created date rides at the end of the bullet. Shared by
+ * session-config.ts (pre-render) and `selectHotMemoriesWithinBudget`
+ * (re-render from entries) so both paths agree byte for byte.
+ */
+export function renderHotMemoryLine(
+  mem: Pick<MemoryEntry, "content"> & Partial<Pick<MemoryEntry, "createdAt">>,
+): string {
+  const date = formatHotMemoryDate(mem.createdAt);
+  return date ? `- ${mem.content} (saved ${date})` : `- ${mem.content}`;
+}
+
+/**
  * Phase 52 Plan 02 — sha256 hex of the stable prefix string.
  *
  * Consumed by `SdkSessionAdapter.iterateWithTracing` via the
@@ -752,9 +806,12 @@ function truncateToBudget(text: string, tokenBudget: number): string {
  *   2. IDENTITY.md raw body
  *   3. agent-name line + capability manifest
  *   4. "\n## Long-term memory (MEMORY.md)\n\n" + MEMORY.md body + "\n"
+ *   5. "\n## About the user (USER.md)\n\n" + USER.md body + "\n"   (WP6)
  *
  * Empty sub-sources are omitted (no empty headers leaked). Order is fixed —
- * tests rely on it for stable-prefix hash continuity.
+ * tests rely on it for stable-prefix hash continuity. The USER.md block
+ * renders byte-identically to the pre-WP6 fold (MEMORY.md body + "\n\n" +
+ * USER.md heading) when both files are present.
  */
 function composeCarvedIdentity(sources: ContextSources): string {
   const parts: string[] = [];
@@ -767,6 +824,10 @@ function composeCarvedIdentity(sources: ContextSources): string {
   const memoryAutoload = sources.identityMemoryAutoload ?? "";
   if (memoryAutoload) {
     parts.push("\n## Long-term memory (MEMORY.md)\n\n" + memoryAutoload + "\n");
+  }
+  const userAutoload = sources.identityUserAutoload ?? "";
+  if (userAutoload) {
+    parts.push("\n## About the user (USER.md)\n\n" + userAutoload + "\n");
   }
   // Join with no extra separator — each sub-source already carries its own
   // trailing newlines (matches the pre-115 `identityStr +=` concatenation).
@@ -818,6 +879,59 @@ function headTailTruncate(text: string, targetChars: number): string {
 }
 
 /**
+ * WP6 (2026-10-25). The read-site markers that session-config.ts writes into
+ * MEMORY.md / USER.md bodies when the file is over its char cap:
+ *   `[TRUNCATED <dash> N chars dropped, dream-pass priority requested]`
+ *   `[TRUNCATED <dash> N chars dropped; keep USER.md under 4000 chars]`
+ * Group 1 is the dash token (re-emitted verbatim), group 2 the count, group 3
+ * the agent-actionable suffix.
+ */
+const READ_SITE_MARKER_RE = /\n*\[TRUNCATED (\S+) (\d+) chars dropped([^\]]*)\]\n*/;
+
+/**
+ * WP6. Head-tail truncation that keeps an existing read-site marker.
+ *
+ * `headTailTruncate` drops the middle of the text, which is exactly where the
+ * upstream marker sits (70% in), so a second truncation at the budget step
+ * silently erased the "dream-pass priority requested" / "keep USER.md under N
+ * chars" instruction the agent is meant to act on. When the text carries such
+ * a marker, the head before it and the tail after it are shrunk in the same
+ * 70/20 proportion, the marker stays in place and its dropped-count is
+ * updated to the running total. Without a marker this is `headTailTruncate`.
+ */
+function headTailTruncateKeepingMarker(text: string, targetChars: number): string {
+  if (text.length <= targetChars) return text;
+  const m = READ_SITE_MARKER_RE.exec(text);
+  if (!m) return headTailTruncate(text, targetChars);
+  const dash = m[1];
+  const previouslyDropped = Number(m[2]);
+  const suffix = m[3];
+  const head = text.slice(0, m.index);
+  const tail = text.slice(m.index + m[0].length);
+  // Reserve room for the marker line (its count may grow by a few digits).
+  const reserved = m[0].length + 8;
+  const available = Math.max(0, targetChars - reserved);
+  let headKeep = Math.floor((available * 7) / 9);
+  let tailKeep = available - headKeep;
+  if (head.length < headKeep) {
+    tailKeep += headKeep - head.length;
+    headKeep = head.length;
+  }
+  if (tail.length < tailKeep) {
+    headKeep = Math.min(head.length, headKeep + (tailKeep - tail.length));
+    tailKeep = tail.length;
+  }
+  const dropped =
+    previouslyDropped + (head.length - headKeep) + (tail.length - tailKeep);
+  const keptHead = head.slice(0, headKeep).trimEnd();
+  const keptTail = tailKeep > 0 ? tail.slice(tail.length - tailKeep).trimStart() : "";
+  const marker = `[TRUNCATED ${dash} ${dropped} chars dropped${suffix}]`;
+  return keptTail.length > 0
+    ? `${keptHead}\n\n${marker}\n\n${keptTail}`
+    : `${keptHead}\n\n${marker}`;
+}
+
+/**
  * Phase 115 Plan 03 sub-scope 1 / T02 — drop-lowest-importance for the
  * compound identity aggregate.
  *
@@ -825,12 +939,17 @@ function headTailTruncate(text: string, targetChars: number): string {
  *   1. SOUL fingerprint     (always preserved verbatim — extractor-bounded ≤1200 chars)
  *   2. IDENTITY.md          (head-tail truncated when needed)
  *   3. capability manifest  (bullet-truncated when needed)
- *   4. MEMORY.md autoload   (separately bounded by INJECTED_MEMORY_MAX_CHARS;
+ *   4. USER.md autoload     (WP6: bounded by INJECTED_USER_MAX_CHARS; truncated
+ *                            only after MEMORY.md is at its floor)
+ *   5. MEMORY.md autoload   (separately bounded by INJECTED_MEMORY_MAX_CHARS;
  *                            head-tail truncated FIRST when total still over)
  *
  * Steps when over budget:
  *   A — head-tail-truncate `identityMemoryAutoload` toward 70% of itself
- *       repeatedly until budget is met OR memory is < 100 tokens.
+ *       repeatedly until budget is met OR memory is < 100 tokens. An
+ *       existing read-site marker survives (headTailTruncateKeepingMarker).
+ *   A2: the same for `identityUserAutoload` (WP6), so the user profile is
+ *       the LAST of the two files to shrink.
  *   B — bullet-truncate `identityCapabilityManifest` so the identity total
  *       fits under budget.
  *   C — head-tail-truncate `identityFile`.
@@ -849,6 +968,8 @@ function enforceDropLowestImportance(
     readonly identityFile: string;
     readonly identityCapabilityManifest: string;
     readonly identityMemoryAutoload: string;
+    /** WP6. Optional for back-compat with callers that predate the USER.md sub-source. */
+    readonly identityUserAutoload?: string;
   },
   budgetTokens: number,
   warn?: (e: BudgetWarningEvent) => void,
@@ -865,6 +986,7 @@ function enforceDropLowestImportance(
     identityFile: carved.identityFile,
     identityCapabilityManifest: carved.identityCapabilityManifest,
     identityMemoryAutoload: carved.identityMemoryAutoload,
+    identityUserAutoload: carved.identityUserAutoload ?? "",
   } as ContextSources);
 
   const initialTokens = countTokens(renderInitial);
@@ -875,6 +997,7 @@ function enforceDropLowestImportance(
   // Mutable working copy for the truncation passes. SOUL fingerprint stays
   // verbatim throughout — extractor-bounded ≤1200 chars and operator-curated.
   let memoryAuto = carved.identityMemoryAutoload;
+  let userAuto = carved.identityUserAutoload ?? "";
   let capManifest = carved.identityCapabilityManifest;
   let identityFile = carved.identityFile;
 
@@ -892,6 +1015,7 @@ function enforceDropLowestImportance(
         identityFile,
         identityCapabilityManifest: capManifest,
         identityMemoryAutoload: memoryAuto,
+        identityUserAutoload: userAuto,
       } as ContextSources),
     );
 
@@ -907,7 +1031,22 @@ function enforceDropLowestImportance(
   ) {
     const targetChars = Math.max(400, Math.floor(memoryAuto.length * 0.7));
     if (targetChars >= memoryAuto.length) break; // can't shrink further
-    memoryAuto = headTailTruncate(memoryAuto, targetChars);
+    memoryAuto = headTailTruncateKeepingMarker(memoryAuto, targetChars);
+    total = measure();
+  }
+
+  // Step A2 (WP6): only once MEMORY.md is at its floor, shrink USER.md the
+  // same way. The user profile is curated and small (4,000-char cap), so it
+  // is the last of the two Tier 1 files to give way.
+  let userSafety = 12;
+  while (
+    total > budgetTokens &&
+    countTokens(userAuto) > 100 &&
+    userSafety-- > 0
+  ) {
+    const targetChars = Math.max(400, Math.floor(userAuto.length * 0.7));
+    if (targetChars >= userAuto.length) break;
+    userAuto = headTailTruncateKeepingMarker(userAuto, targetChars);
     total = measure();
   }
 
@@ -948,6 +1087,7 @@ function enforceDropLowestImportance(
     identityFile,
     identityCapabilityManifest: capManifest,
     identityMemoryAutoload: memoryAuto,
+    identityUserAutoload: userAuto,
   } as ContextSources);
 
   const finalTokens = countTokens(rendered);
@@ -1072,7 +1212,7 @@ function selectHotMemoriesWithinBudget(
   const kept: MemoryEntry[] = [];
   let running = 0;
   for (const mem of sorted) {
-    const line = `- ${mem.content}`;
+    const line = renderHotMemoryLine(mem);
     const cost = countTokens(line);
     if (running + cost > budget && kept.length > 0) break;
     kept.push(mem);
@@ -1080,7 +1220,7 @@ function selectHotMemoriesWithinBudget(
   }
 
   if (kept.length < sorted.length && warn) {
-    const fullText = sorted.map((m) => `- ${m.content}`).join("\n");
+    const fullText = sorted.map((m) => renderHotMemoryLine(m)).join("\n");
     warn(
       Object.freeze({
         section: "hot_tier",
@@ -1092,7 +1232,7 @@ function selectHotMemoriesWithinBudget(
   }
 
   return Object.freeze({
-    rendered: kept.map((m) => `- ${m.content}`).join("\n"),
+    rendered: kept.map((m) => renderHotMemoryLine(m)).join("\n"),
   });
 }
 
@@ -1223,22 +1363,29 @@ function assembleContextInternal(
     sources.identitySoulFingerprint !== undefined ||
     sources.identityFile !== undefined ||
     sources.identityCapabilityManifest !== undefined ||
-    sources.identityMemoryAutoload !== undefined;
+    sources.identityMemoryAutoload !== undefined ||
+    sources.identityUserAutoload !== undefined;
 
-  let identityOut: string;
-  if (useCarvedIdentity) {
-    const carvedResult = enforceDropLowestImportance(
-      {
-        identitySoulFingerprint: sources.identitySoulFingerprint ?? "",
-        identityFile: sources.identityFile ?? "",
-        identityCapabilityManifest: sources.identityCapabilityManifest ?? "",
-        identityMemoryAutoload: sources.identityMemoryAutoload ?? "",
-      },
-      phaseBudgets.identity,
-      warn,
-    );
-    identityOut = carvedResult.rendered;
-  } else {
+  // WP6: identity enforcement is deferred until the identity-independent
+  // parts (steps 2 to 4 and the tools / steer blocks) are rendered, so the
+  // carved path can size its budget against what is left under the outer
+  // cap. The legacy compound path keeps its configured budget (it has no
+  // sub-source priorities to spend wisely; the outer-cap fallback covers it).
+  const enforceIdentity = (identityBudgetTokens: number): string => {
+    if (useCarvedIdentity) {
+      const carvedResult = enforceDropLowestImportance(
+        {
+          identitySoulFingerprint: sources.identitySoulFingerprint ?? "",
+          identityFile: sources.identityFile ?? "",
+          identityCapabilityManifest: sources.identityCapabilityManifest ?? "",
+          identityMemoryAutoload: sources.identityMemoryAutoload ?? "",
+          identityUserAutoload: sources.identityUserAutoload ?? "",
+        },
+        identityBudgetTokens,
+        warn,
+      );
+      return carvedResult.rendered;
+    }
     // Legacy path — single compound identity string. Phase 115 D-03 replaces
     // the old `warn-and-keep` no-op with real head-tail truncation. Tests
     // that pin "identity is preserved verbatim regardless of budget" are
@@ -1250,7 +1397,6 @@ function assembleContextInternal(
     const tokens = countTokens(sources.identity);
     if (sources.identity && tokens > phaseBudgets.identity) {
       const targetChars = phaseBudgets.identity * 4;
-      identityOut = headTailTruncate(sources.identity, targetChars);
       if (warn) {
         warn(
           Object.freeze({
@@ -1261,10 +1407,10 @@ function assembleContextInternal(
           }),
         );
       }
-    } else {
-      identityOut = sources.identity;
+      return headTailTruncate(sources.identity, targetChars);
     }
-  }
+    return sources.identity;
+  };
 
   // 2. soul — Phase 115 D-03 + D-04 head-tail truncate when over budget.
   //    With D-02 budget = 0 (folded into identity), any non-empty soul
@@ -1325,6 +1471,65 @@ function assembleContextInternal(
   //    budget BEFORE this string was built, so the assembler only measures.
   const conversationContext = sources.conversationContext ?? "";
 
+  // ── WP6: identity-independent blocks, rendered once ──────────────────────
+  //
+  // Each of these is placed below exactly as before; rendering them here
+  // lets the carved identity budget be sized against the room they leave
+  // under STABLE_PREFIX_MAX_TOKENS (see IDENTITY_BUDGET_FLOOR_TOKENS).
+  const directivesBlock =
+    sources.systemPromptDirectives && sources.systemPromptDirectives.length > 0
+      ? sources.systemPromptDirectives
+      : "";
+  const currentHotToken = computeHotStableToken(hotInput.rendered);
+  const hotBlock = hotInput.rendered ? "## Key Memories\n\n" + hotInput.rendered : "";
+  const priorHotToken = opts?.priorHotStableToken;
+  const hotInMutable =
+    priorHotToken !== undefined && priorHotToken !== currentHotToken;
+  const toolsCombined = [skillsOut, sources.toolDefinitions]
+    .filter((s) => s && s.length > 0)
+    .join("\n\n");
+  const toolsBlock = toolsCombined
+    ? "## Available Tools\n\n" + truncateToBudget(toolsCombined, budgets.toolDefinitions)
+    : "";
+  const fsBlock =
+    sources.filesystemCapabilityBlock && sources.filesystemCapabilityBlock.length > 0
+      ? "<tool_status></tool_status>\n" +
+        sources.filesystemCapabilityBlock +
+        "\n<dream_log_recent></dream_log_recent>"
+      : "";
+  const delegatesBlock =
+    sources.delegatesBlock && sources.delegatesBlock.length > 0 ? sources.delegatesBlock : "";
+  const graphBlock = sources.graphContext
+    ? "## Related Context\n\n" + truncateToBudget(sources.graphContext, budgets.graphContext)
+    : "";
+
+  // 1. identity (Phase 115 sub-scope 1 / D-03), sized by WP6 against the cap.
+  let identityBudget = phaseBudgets.identity;
+  if (useCarvedIdentity) {
+    const fixedOverheadTokens = countTokens(
+      [
+        directivesBlock,
+        soulOut,
+        hotInMutable ? "" : hotBlock,
+        toolsBlock,
+        fsBlock,
+        delegatesBlock,
+        sources.discordBindings,
+        graphBlock,
+        CACHE_BREAKPOINT_MARKER,
+      ]
+        .filter((part) => part.length > 0)
+        .join("\n\n"),
+    );
+    const roomUnderCap =
+      STABLE_PREFIX_MAX_TOKENS - fixedOverheadTokens - OUTER_CAP_MARGIN_TOKENS;
+    identityBudget = Math.min(
+      phaseBudgets.identity,
+      Math.max(IDENTITY_BUDGET_FLOOR_TOKENS, roomUnderCap),
+    );
+  }
+  const identityOut = enforceIdentity(identityBudget);
+
   // ── Placement ────────────────────────────────────────────────────────────
   //
   // Phase 115 Plan 04 sub-scope 5 — cache-breakpoint placement.
@@ -1371,8 +1576,8 @@ function assembleContextInternal(
   // identical to the no-directives baseline (REG-ASSEMBLER-EMPTY-WHEN-
   // DISABLED — required for prompt-cache hash stability when all
   // directives are disabled by operator override).
-  if (sources.systemPromptDirectives && sources.systemPromptDirectives.length > 0) {
-    staticParts.push(sources.systemPromptDirectives);
+  if (directivesBlock) {
+    staticParts.push(directivesBlock);
   }
 
   // Identity stays in stablePrefix (no section header — fingerprint has its own formatting)
@@ -1394,12 +1599,7 @@ function assembleContextInternal(
   // composition can change when access_count flips). When hot-tier
   // composition just changed (token mismatch), Phase 52 punts it to the
   // mutable suffix for THIS turn only — that path is unchanged.
-  const currentHotToken = computeHotStableToken(hotInput.rendered);
-  if (hotInput.rendered) {
-    const hotBlock = "## Key Memories\n\n" + hotInput.rendered;
-    const priorToken = opts?.priorHotStableToken;
-    const hotInMutable =
-      priorToken !== undefined && priorToken !== currentHotToken;
+  if (hotBlock) {
     if (hotInMutable) {
       mutableParts.push(hotBlock);
     } else {
@@ -1409,14 +1609,8 @@ function assembleContextInternal(
 
   // Combined "Available Tools" header: skillsHeader (Phase 53) + toolDefinitions (Phase 52).
   // Session-config can populate either or both — the header renders once.
-  const toolsCombined = [skillsOut, sources.toolDefinitions]
-    .filter((s) => s && s.length > 0)
-    .join("\n\n");
-  if (toolsCombined) {
-    staticParts.push(
-      "## Available Tools\n\n" +
-        truncateToBudget(toolsCombined, budgets.toolDefinitions),
-    );
+  if (toolsBlock) {
+    staticParts.push(toolsBlock);
   }
 
   // ── Phase 96 Plan 02 D-02 — <filesystem_capability> block insertion ─────
@@ -1446,12 +1640,8 @@ function assembleContextInternal(
   // from RESEARCH.md: any movement of the fs block changes the fleet-wide
   // stable-prefix hash and triggers fleet-wide Anthropic cache miss on
   // deploy. Static-grep on this very file pins the byte order.
-  if (sources.filesystemCapabilityBlock && sources.filesystemCapabilityBlock.length > 0) {
-    staticParts.push(
-      "<tool_status></tool_status>\n" +
-        sources.filesystemCapabilityBlock +
-        "\n<dream_log_recent></dream_log_recent>",
-    );
+  if (fsBlock) {
+    staticParts.push(fsBlock);
   }
 
   // Phase 999.13 DELEG-02 — per-agent delegates directive lands at the END of
@@ -1463,8 +1653,8 @@ function assembleContextInternal(
   // Required for prompt-cache hash stability: agents without delegates see
   // NO fleet-wide cache invalidation on Phase 999.13 deploy (Pitfall 2 in
   // 999.13-RESEARCH.md).
-  if (sources.delegatesBlock && sources.delegatesBlock.length > 0) {
-    staticParts.push(sources.delegatesBlock);
+  if (delegatesBlock) {
+    staticParts.push(delegatesBlock);
   }
 
   // Context-bloat fix #3a — Discord bindings in the STABLE PREFIX.
@@ -1483,11 +1673,8 @@ function assembleContextInternal(
   // Graph context (Phase 41/52) — DYNAMIC per Phase 115 sub-scope 5
   // (intended to carry per-turn graph slices when wired upstream; today
   // most call sites pass empty string and the source is short-circuited).
-  if (sources.graphContext) {
-    dynamicParts.push(
-      "## Related Context\n\n" +
-        truncateToBudget(sources.graphContext, budgets.graphContext),
-    );
+  if (graphBlock) {
+    dynamicParts.push(graphBlock);
   }
 
   // Context-bloat fix #3a — Discord bindings NO LONGER pushed to
@@ -1570,43 +1757,28 @@ function assembleContextInternal(
     // partitioning. We just route the SAME computed strings into the legacy
     // interleaved array.
     const legacyParts: string[] = [];
-    if (sources.systemPromptDirectives && sources.systemPromptDirectives.length > 0) {
-      legacyParts.push(sources.systemPromptDirectives);
+    if (directivesBlock) {
+      legacyParts.push(directivesBlock);
     }
     if (identityOut) legacyParts.push(identityOut);
     if (soulOut) legacyParts.push(soulOut);
     // Hot-tier in legacy lands AFTER soul / BEFORE tools (pre-115-04 order).
     // Only when it stayed in stable (not punted to mutable by Phase 52
-    // stable_token mismatch). Re-derive that decision from the same logic.
-    if (hotInput.rendered) {
-      const priorToken = opts?.priorHotStableToken;
-      const hotInMutable =
-        priorToken !== undefined && priorToken !== currentHotToken;
-      if (!hotInMutable) {
-        legacyParts.push("## Key Memories\n\n" + hotInput.rendered);
-      }
+    // stable_token mismatch). Same decision as the static-first path.
+    if (hotBlock && !hotInMutable) {
+      legacyParts.push(hotBlock);
     }
-    if (toolsCombined) {
-      legacyParts.push(
-        "## Available Tools\n\n" +
-          truncateToBudget(toolsCombined, budgets.toolDefinitions),
-      );
+    if (toolsBlock) {
+      legacyParts.push(toolsBlock);
     }
-    if (sources.filesystemCapabilityBlock && sources.filesystemCapabilityBlock.length > 0) {
-      legacyParts.push(
-        "<tool_status></tool_status>\n" +
-          sources.filesystemCapabilityBlock +
-          "\n<dream_log_recent></dream_log_recent>",
-      );
+    if (fsBlock) {
+      legacyParts.push(fsBlock);
     }
-    if (sources.delegatesBlock && sources.delegatesBlock.length > 0) {
-      legacyParts.push(sources.delegatesBlock);
+    if (delegatesBlock) {
+      legacyParts.push(delegatesBlock);
     }
-    if (sources.graphContext) {
-      legacyParts.push(
-        "## Related Context\n\n" +
-          truncateToBudget(sources.graphContext, budgets.graphContext),
-      );
+    if (graphBlock) {
+      legacyParts.push(graphBlock);
     }
     stableParts = legacyParts;
   } else {
