@@ -1202,6 +1202,9 @@ describe("SessionManager periodic mid-session flush (Gap 3)", () => {
     expect(convStore.getTurnsForSession(convSessionId)).toHaveLength(4);
   }, 15_000);
 
+  // WP1 (memory overhaul 2026-10-25): the flush is incremental, so flush:2
+  // needs 4 more turns after flush:1. The pre-WP1 version of this test
+  // waited for two rows over the same 4 turns.
   it("increments flush sequence tag across consecutive intervals (flush:1 then flush:2)", async () => {
     const agentName = "flush-seq";
     const config = makeFlushConfig(agentName, 15);
@@ -1209,41 +1212,107 @@ describe("SessionManager periodic mid-session flush (Gap 3)", () => {
 
     const convStore = manager.getConversationStore(agentName)!;
     const convSessionId = manager.getActiveConversationSessionId(agentName)!;
+    const recordTurns = (from: number): void => {
+      for (let i = from; i < from + 4; i++) {
+        convStore.recordTurn({
+          sessionId: convSessionId,
+          role: i % 2 === 0 ? "user" : "assistant",
+          content: `turn ${i} content`,
+        });
+      }
+    };
 
+    const memStore = manager.getMemoryStore(agentName)!;
+    const insertSpy = vi.spyOn(memStore, "insert");
+    const midSessionTags = (): Array<readonly string[]> =>
+      insertSpy.mock.calls
+        .map((call) => (call[0] as { tags?: readonly string[] }).tags ?? [])
+        .filter((tags) => tags.includes("mid-session"));
+
+    recordTurns(0);
+    await waitFor(() => midSessionTags().length >= 1, 5000);
+    recordTurns(4);
+    await waitFor(() => midSessionTags().length >= 2, 5000);
+
+    const allTags = midSessionTags();
+    expect(allTags[0]).toContain("flush:1");
+    expect(allTags[1]).toContain("flush:2");
+  }, 15_000);
+
+  it("WP1: ticks without 4 new turns write nothing and do not consume a flush number", async () => {
+    const agentName = "flush-idle";
+    const config = makeFlushConfig(agentName, 15);
+    await manager.startAgent(agentName, config);
+
+    const convStore = manager.getConversationStore(agentName)!;
+    const convSessionId = manager.getActiveConversationSessionId(agentName)!;
+    const recordTurns = (from: number, count: number): void => {
+      for (let i = from; i < from + count; i++) {
+        convStore.recordTurn({
+          sessionId: convSessionId,
+          role: i % 2 === 0 ? "user" : "assistant",
+          content: `idle turn ${i} content`,
+        });
+      }
+    };
+    const memStore = manager.getMemoryStore(agentName)!;
+    const insertSpy = vi.spyOn(memStore, "insert");
+    const midSessionTags = (): Array<readonly string[]> =>
+      insertSpy.mock.calls
+        .map((call) => (call[0] as { tags?: readonly string[] }).tags ?? [])
+        .filter((tags) => tags.includes("mid-session"));
+
+    recordTurns(0, 4);
+    await waitFor(() => midSessionTags().length >= 1, 5000);
+    const summarizeCalls = mockSummarize.mock.calls.length;
+
+    // ~5 ticks with only 3 new turns: no Haiku call, no row.
+    recordTurns(4, 3);
+    await new Promise((r) => setTimeout(r, 500));
+    expect(midSessionTags()).toHaveLength(1);
+    expect(mockSummarize.mock.calls.length).toBe(summarizeCalls);
+
+    // The fourth new turn releases the next flush, numbered 2 (not 6).
+    recordTurns(7, 1);
+    await waitFor(() => midSessionTags().length >= 2, 5000);
+    expect(midSessionTags()[1]).toContain("flush:2");
+  }, 15_000);
+
+  it("WP1: only one flush runs at a time per agent", async () => {
+    // Only the first call blocks; later ones (the stop-path session summary
+    // in afterEach) resolve at once.
+    let release: (() => void) | undefined;
+    mockSummarize.mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          release = () => resolve("## Decisions\n- slow\n");
+        }),
+    );
+    const agentName = "flush-inflight";
+    const config = makeFlushConfig(agentName, 15);
+    await manager.startAgent(agentName, config);
+
+    const convStore = manager.getConversationStore(agentName)!;
+    const convSessionId = manager.getActiveConversationSessionId(agentName)!;
     for (let i = 0; i < 4; i++) {
       convStore.recordTurn({
         sessionId: convSessionId,
         role: i % 2 === 0 ? "user" : "assistant",
-        content: `turn ${i} content`,
+        content: `in-flight turn ${i} content`,
       });
     }
 
+    await waitFor(() => mockSummarize.mock.calls.length >= 1, 5000);
+    // Several more ticks land while the first flush is still summarizing.
+    await new Promise((r) => setTimeout(r, 400));
+    expect(mockSummarize).toHaveBeenCalledTimes(1);
+
     const memStore = manager.getMemoryStore(agentName)!;
-    const insertSpy = vi.spyOn(memStore, "insert");
-
-    // Wait until at least two mid-session inserts have landed.
-    await waitFor(
-      () => {
-        const count = insertSpy.mock.calls.filter((call) =>
-          (call[0] as { tags?: readonly string[] }).tags?.includes(
-            "mid-session",
-          ),
-        ).length;
-        return count >= 2;
-      },
-      5000,
-    );
-
-    const midSessionCalls = insertSpy.mock.calls.filter((call) =>
-      (call[0] as { tags?: readonly string[] }).tags?.includes("mid-session"),
-    );
-    const allTags = midSessionCalls.map(
-      (c) => (c[0] as { tags: readonly string[] }).tags,
-    );
-    const hasFlush1 = allTags.some((tags) => tags.includes("flush:1"));
-    const hasFlush2 = allTags.some((tags) => tags.includes("flush:2"));
-    expect(hasFlush1).toBe(true);
-    expect(hasFlush2).toBe(true);
+    release?.();
+    await waitFor(() => memStore.findByTag("mid-session").length >= 1, 5000);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(memStore.findByTag("mid-session")).toHaveLength(1);
+    expect(mockSummarize).toHaveBeenCalledTimes(1);
   }, 15_000);
 
   it("does not start a flush timer when flushIntervalMinutes is 0 and override is not set", async () => {

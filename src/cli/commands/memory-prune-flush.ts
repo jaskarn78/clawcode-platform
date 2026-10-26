@@ -1,5 +1,5 @@
 /**
- * Memory overhaul 2026-10-25 (WP1) — `clawcode memory prune-flush <agent>`.
+ * Memory overhaul 2026-10-25 (WP1): `clawcode memory prune-flush <agent>`.
  *
  * One-shot operator cleanup for the mid-session flush flood. On the
  * production host 95 percent of memory rows were mid-session flush rows
@@ -11,28 +11,35 @@
  *
  * Dry run by default: prints what would be deleted and exits. With
  * `--apply` it deletes every mid-session row whose session already has a
- * final summary (`conversation_sessions.summary_memory_id`), through
- * `MemoryStore.delete` so vectors, links and the session FK go with the
- * row, then runs `TierManager.runMaintenance()` so the hot tier is rebuilt
- * without the flush rows. Rows of active or not-yet-summarized sessions
- * are always kept; `--keep-days N` additionally keeps rows younger than N
- * days.
+ * final summary, through `MemoryStore.delete` so vectors, links and FTS
+ * rows go with it, then runs `TierManager.runMaintenance()` so the hot
+ * tier is rebuilt without the flush rows. A session counts as summarized
+ * when `conversation_sessions.summary_memory_id` is set, or when it has
+ * ended and a `session-summary` row tagged `session:<id>` still exists
+ * (summary-dedupe detaches the pointer when it removes a duplicate).
+ * Rows of active or not-yet-summarized sessions, and rows with no session
+ * tag, are always kept; `--keep-days N` additionally keeps rows younger
+ * than N days.
  *
  * This is never automatic: no heartbeat, no daemon path, no schedule calls
- * it. Opens the store the way `clawcode memory backfill` does (loadConfig,
- * getAgentMemoryDbPath, new MemoryStore), so it works with the daemon
- * stopped.
+ * it. It opens the agent's memories.db directly, the way
+ * `clawcode memory backfill` does (loadConfig, getAgentMemoryDbPath, new
+ * MemoryStore), so it works with the daemon stopped; SQLite WAL and the
+ * store's busy timeout let it run beside a live daemon too. It refuses to
+ * create a database that does not exist.
  *
  * Exit codes:
- *   0 — success (dry run printed, or apply finished with no failed deletes)
- *   1 — agent not in clawcode.yaml, workspace unset, store failed to open,
- *       or at least one delete failed
+ *   0: success (dry run printed, or apply finished with no failed deletes)
+ *   1: agent not in clawcode.yaml, no workspace, no database, store failed
+ *      to open, or at least one delete failed
  */
 import type { Command } from "commander";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import pino from "pino";
 import type { Logger } from "pino";
 import { loadConfig } from "../../config/loader.js";
+import { expandHome } from "../../config/defaults.js";
 import { getAgentMemoryDbPath } from "../../shared/agent-paths.js";
 import { MemoryStore } from "../../memory/store.js";
 import { ConversationStore } from "../../memory/conversation-store.js";
@@ -46,24 +53,32 @@ import { MID_SESSION_TAG } from "../../memory/session-summarizer.js";
 import type { MemoryEntry } from "../../memory/types.js";
 import { cliError, cliLog } from "../output.js";
 
+type MemoryConfigLike = {
+  readonly tiers?: Partial<TierConfig>;
+  readonly decay?: {
+    readonly halfLifeDays?: number;
+    readonly semanticWeight?: number;
+    readonly decayWeight?: number;
+  };
+};
+
 /**
  * Minimal shape of what the action needs from loadConfig (mirrors
- * memory-backfill.ts). The tier and decay knobs are optional: the raw
- * agent block may omit them, in which case the daemon defaults apply.
+ * memory-backfill.ts). Paths and the memory block are resolved the way
+ * the config loader resolves them for the daemon: workspace falls back to
+ * `<defaults.basePath>/<name>`, memoryPath to the workspace, and an agent
+ * memory block replaces the defaults block as a whole.
  */
 type ConfigLike = {
+  readonly defaults?: {
+    readonly basePath?: string;
+    readonly memory?: MemoryConfigLike;
+  };
   readonly agents: ReadonlyArray<{
     readonly name: string;
     readonly workspace?: string;
     readonly memoryPath?: string;
-    readonly memory?: {
-      readonly tiers?: Partial<TierConfig>;
-      readonly decay?: {
-        readonly halfLifeDays?: number;
-        readonly semanticWeight?: number;
-        readonly decayWeight?: number;
-      };
-    };
+    readonly memory?: MemoryConfigLike;
   }>;
 };
 
@@ -88,25 +103,35 @@ type OpenStoresArgs = Readonly<{
 type OpenStoresFn = (args: OpenStoresArgs) => PruneFlushStores;
 
 function defaultOpenStores(args: OpenStoresArgs): PruneFlushStores {
+  // new MemoryStore would create an empty database at a wrong path and
+  // report "0 rows", which reads like success. Refuse instead.
+  if (!existsSync(args.dbPath)) {
+    throw new Error(`no memory database at ${args.dbPath}`);
+  }
   const store = new MemoryStore(args.dbPath);
-  const conversationStore = new ConversationStore(store.getDatabase());
-  // runMaintenance never embeds; the service is only constructed to satisfy
-  // the TierManager deps and loads no model unless asked to.
-  const tierManager = new TierManager({
-    store,
-    embedder: new EmbeddingService(),
-    memoryDir: join(args.memoryPath, "memory"),
-    tierConfig: args.tierConfig,
-    scoringConfig: args.scoringConfig,
-    log: args.log,
-    agentName: args.agentName,
-  });
-  return {
-    memoryStore: store,
-    conversationStore,
-    tierManager,
-    close: () => store.close(),
-  };
+  try {
+    const conversationStore = new ConversationStore(store.getDatabase());
+    // runMaintenance never embeds; the service is only constructed to
+    // satisfy the TierManager deps and loads no model unless asked to.
+    const tierManager = new TierManager({
+      store,
+      embedder: new EmbeddingService(),
+      memoryDir: join(args.memoryPath, "memory"),
+      tierConfig: args.tierConfig,
+      scoringConfig: args.scoringConfig,
+      log: args.log,
+      agentName: args.agentName,
+    });
+    return {
+      memoryStore: store,
+      conversationStore,
+      tierManager,
+      close: () => store.close(),
+    };
+  } catch (err) {
+    store.close();
+    throw err;
+  }
 }
 
 /** What a run would delete and what it keeps, with the reasons. */
@@ -128,6 +153,14 @@ export type PruneFlushPlan = Readonly<{
 }>;
 
 const SESSION_TAG_PREFIX = "session:";
+const SESSION_SUMMARY_TAG = "session-summary";
+
+/** The `<id>` of the first `session:<id>` tag, or null. */
+function sessionIdOf(tags: readonly string[]): string | null {
+  const tag = tags.find((t) => t.startsWith(SESSION_TAG_PREFIX));
+  const id = tag ? tag.slice(SESSION_TAG_PREFIX.length) : "";
+  return id.length > 0 ? id : null;
+}
 
 /**
  * Pure planning step: classify every mid-session row. Exported for tests.
@@ -141,8 +174,17 @@ export function planPruneFlush(
   const cutoffMs =
     opts.keepDays > 0 ? now.getTime() - opts.keepDays * 24 * 60 * 60 * 1000 : null;
 
+  // Sessions that still have a session-summary row, whatever the pointer
+  // on conversation_sessions says.
+  const sessionsWithSummaryRow = new Set<string>();
+  for (const row of stores.memoryStore.findByTag(SESSION_SUMMARY_TAG)) {
+    const id = sessionIdOf(row.tags);
+    if (id !== null) sessionsWithSummaryRow.add(id);
+  }
+
   const rows = stores.memoryStore.findByTag(MID_SESSION_TAG);
-  const summarizedBySession = new Map<string, boolean | null>();
+  /** true = summarized, false = not yet, null = session row missing. */
+  const stateBySession = new Map<string, boolean | null>();
   const allSessions = new Set<string>();
   const prunableSessions = new Set<string>();
   const unsummarizedSessions = new Set<string>();
@@ -152,21 +194,21 @@ export function planPruneFlush(
   let keptNoSession = 0;
 
   for (const row of rows) {
-    const tag = row.tags.find((t) => t.startsWith(SESSION_TAG_PREFIX));
-    const sessionId = tag ? tag.slice(SESSION_TAG_PREFIX.length) : "";
-    if (sessionId.length === 0) {
+    const sessionId = sessionIdOf(row.tags);
+    if (sessionId === null) {
       keptNoSession++;
       continue;
     }
     allSessions.add(sessionId);
 
-    let summarized = summarizedBySession.get(sessionId);
+    let summarized = stateBySession.get(sessionId);
     if (summarized === undefined) {
       const session = stores.conversationStore.getSession(sessionId);
       summarized = session
-        ? session.summaryMemoryId !== null || session.status === "summarized"
+        ? session.summaryMemoryId !== null ||
+          (session.status !== "active" && sessionsWithSummaryRow.has(sessionId))
         : null;
-      summarizedBySession.set(sessionId, summarized);
+      stateBySession.set(sessionId, summarized);
     }
 
     if (summarized === null) {
@@ -224,12 +266,14 @@ export function formatPruneFlushPlan(
 
 /** Render the apply outcome. Pure, exported for tests. */
 export function formatPruneFlushApplied(
-  deleted: number,
-  failed: number,
+  outcome: Readonly<{ deleted: number; missing: number; failed: number }>,
   maintenance: MaintenanceResult,
 ): string {
+  const extras: string[] = [];
+  if (outcome.missing > 0) extras.push(`${outcome.missing} already gone`);
+  if (outcome.failed > 0) extras.push(`${outcome.failed} failed`);
   const lines = [
-    `Deleted ${deleted} mid-session flush row(s)${failed > 0 ? `, ${failed} failed` : ""}.`,
+    `Deleted ${outcome.deleted} mid-session flush row(s)${extras.length > 0 ? ` (${extras.join(", ")})` : ""}.`,
     `Tier maintenance: promoted ${maintenance.promoted}, demoted ${maintenance.demoted}, cooled ${maintenance.archived}, rewarmed ${maintenance.rewarmed}, errors ${maintenance.errors}.`,
   ];
   if (maintenance.errors > 0 && maintenance.firstError) {
@@ -245,13 +289,13 @@ export type RunMemoryPruneFlushArgs = Readonly<{
   /** Keep rows younger than this many days even when their session is summarized. Default 0. */
   keepDays?: number;
   configPath?: string;
-  /** DI — override loadConfig for hermetic tests. */
+  /** DI: override loadConfig for hermetic tests. */
   loadConfigDep?: (path: string) => Promise<ConfigLike>;
-  /** DI — override store construction for hermetic tests. */
+  /** DI: override store construction for hermetic tests. */
   openStores?: OpenStoresFn;
-  /** DI — override logger (defaults to pino at warn level so maintenance stays quiet). */
+  /** DI: override logger (defaults to pino at warn level so maintenance stays quiet). */
   log?: Logger;
-  /** DI — clock for the keep-days cutoff. */
+  /** DI: clock for the keep-days cutoff. */
   now?: Date;
 }>;
 
@@ -291,19 +335,26 @@ export async function runMemoryPruneFlushAction(
     cliError(`Agent '${args.agentName}' not in clawcode.yaml`);
     return 1;
   }
-  const workspace = agent.workspace;
+  const basePath = config.defaults?.basePath;
+  const workspace =
+    agent.workspace ??
+    (basePath ? join(expandHome(basePath), agent.name) : undefined);
   if (!workspace) {
     cliError(`Agent '${args.agentName}' has no workspace configured`);
     return 1;
   }
 
-  const memoryPath = agent.memoryPath ?? workspace;
+  const memoryPath = agent.memoryPath ? expandHome(agent.memoryPath) : workspace;
   const dbPath = getAgentMemoryDbPath(memoryPath);
-  const tierConfig: TierConfig = { ...DEFAULT_TIER_CONFIG, ...(agent.memory?.tiers ?? {}) };
+  const memoryConfig = agent.memory ?? config.defaults?.memory;
+  const tierConfig: TierConfig = {
+    ...DEFAULT_TIER_CONFIG,
+    ...(memoryConfig?.tiers ?? {}),
+  };
   const scoringConfig: ScoringConfig = {
-    semanticWeight: agent.memory?.decay?.semanticWeight ?? 0.7,
-    decayWeight: agent.memory?.decay?.decayWeight ?? 0.3,
-    halfLifeDays: agent.memory?.decay?.halfLifeDays ?? 30,
+    semanticWeight: memoryConfig?.decay?.semanticWeight ?? 0.7,
+    decayWeight: memoryConfig?.decay?.decayWeight ?? 0.3,
+    halfLifeDays: memoryConfig?.decay?.halfLifeDays ?? 30,
   };
 
   let stores: PruneFlushStores;
@@ -329,11 +380,14 @@ export async function runMemoryPruneFlushAction(
     if (!apply) return 0;
 
     let deleted = 0;
+    let missing = 0;
     let failed = 0;
     for (const row of plan.prunable) {
       try {
+        // false means the row is already gone (for example the daemon's
+        // summarizer removed it between the plan and now): not a failure.
         if (stores.memoryStore.delete(row.id)) deleted++;
-        else failed++;
+        else missing++;
       } catch (err) {
         failed++;
         log.warn(
@@ -344,7 +398,7 @@ export async function runMemoryPruneFlushAction(
     }
 
     const maintenance = stores.tierManager.runMaintenance();
-    cliLog(formatPruneFlushApplied(deleted, failed, maintenance));
+    cliLog(formatPruneFlushApplied({ deleted, missing, failed }, maintenance));
     return failed > 0 ? 1 : 0;
   } catch (err) {
     cliError(
@@ -379,10 +433,15 @@ export function registerMemoryPruneFlushCommand(parent: Command): void {
         opts: { apply?: boolean; keepDays?: string; config?: string },
       ) => {
         const keepDays = Number.parseInt(opts.keepDays ?? "0", 10);
+        if (Number.isNaN(keepDays) || keepDays < 0) {
+          cliError(`--keep-days must be a non-negative integer, got '${opts.keepDays}'`);
+          process.exit(1);
+          return;
+        }
         const code = await runMemoryPruneFlushAction({
           agentName,
           apply: opts.apply === true,
-          keepDays: Number.isNaN(keepDays) ? 0 : keepDays,
+          keepDays,
           configPath: opts.config,
         });
         process.exit(code);

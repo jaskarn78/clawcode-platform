@@ -1,5 +1,5 @@
 /**
- * Memory overhaul 2026-10-25 (WP1) — flush flood fixes in the session
+ * Memory overhaul 2026-10-25 (WP1): flush flood fixes in the session
  * summarizer.
  *
  * Live facts the fixes were designed against: on the production host 95
@@ -43,6 +43,8 @@ import {
   FLUSH_THROUGH_TAG_PREFIX,
   MAX_PROMPT_CHARS,
   MIN_CHARS_PER_TURN,
+  CHECKPOINT_BUDGET_CHARS,
+  fitNewestToBudget,
 } from "../session-summarizer.js";
 import type { ConversationTurn } from "../conversation-types.js";
 
@@ -377,6 +379,59 @@ describe("WP1: the final summary deletes the session's mid-session rows", () => 
     expect(listMidSessionRows(memStore, a.id)).toHaveLength(0);
   });
 
+  it("folds the early checkpoints into the summary prompt of a long session, then deletes them", async () => {
+    const a = convStore.startSession("agent-a");
+    for (let i = 0; i < 400; i++) {
+      convStore.recordTurn({
+        sessionId: a.id,
+        role: i % 2 === 0 ? "user" : "assistant",
+        content: `turn ${i} ` + "w".repeat(1_000),
+      });
+    }
+    const early = memStore.insert(
+      {
+        content: "EARLY-CHECKPOINT: chose Postgres over MySQL",
+        source: "conversation",
+        importance: 0.4,
+        tags: ["mid-session", `session:${a.id}`, "flush:1", `${FLUSH_THROUGH_TAG_PREFIX}149`],
+        skipDedup: true,
+      },
+      new Float32Array(384).fill(0.3),
+    );
+    convStore.endSession(a.id);
+    const summarize = vi.fn().mockResolvedValue("## Decisions\n- Postgres\n");
+
+    const result = await summarizeSession(
+      { agentName: "agent-a", sessionId: a.id },
+      { ...deps, summarize: summarize as unknown as SummarizeFn },
+    );
+
+    expect(result).toMatchObject({ success: true, fallback: "llm", turnCount: 400 });
+    const prompt = summarize.mock.calls[0][0] as string;
+    expect(prompt).toContain("# Earlier Checkpoints");
+    expect(prompt).toContain("EARLY-CHECKPOINT: chose Postgres over MySQL");
+    expect(prompt).toContain("the 300 earliest turn(s) are not shown");
+    expect(memStore.getById(early.id)).toBeNull();
+  });
+
+  it("a flush whose session ends while it is summarizing writes no row", async () => {
+    const a = convStore.startSession("agent-a");
+    addTurns(a.id, 5);
+    const summarize = vi.fn().mockImplementation(async () => {
+      convStore.endSession(a.id);
+      return "## Decisions\n- late\n";
+    });
+
+    const result = await flushSessionMidway(
+      { agentName: "agent-a", sessionId: a.id, flushSequence: 1 },
+      { ...deps, summarize: summarize as unknown as SummarizeFn },
+    );
+
+    expect(summarize).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ skipped: true, reason: "session-not-active" });
+    expect(listMidSessionRows(memStore, a.id)).toHaveLength(0);
+  });
+
   it("deleteMidSessionRows counts rows and tolerates a failing delete", () => {
     const a = convStore.startSession("agent-a");
     const rows = [1, 2].map((n) =>
@@ -433,26 +488,155 @@ describe("WP1: prompt truncation keeps the head and the tail", () => {
     expect(prompt).toContain("start and the end of each cut turn are kept");
   });
 
-  it("drops whole oldest turns instead of starving every turn below the floor", () => {
+  it("keeps every turn whole when the content fits, however many turns there are", () => {
+    const turns = Array.from({ length: 250 }, (_, i) =>
+      makeTurn({
+        turnIndex: i,
+        role: i % 2 === 0 ? "user" : "assistant",
+        content: `SHORT-${i}-END ` + "s".repeat(80),
+      }),
+    );
+    const prompt = buildSessionSummarizationPrompt(turns);
+    for (const i of [0, 1, 124, 249]) {
+      expect(prompt).toContain(`SHORT-${i}-END ` + "s".repeat(80));
+    }
+    expect(prompt).not.toContain("are not shown");
+    expect(prompt).not.toContain("[...truncated due to length]");
+  });
+
+  it("short turns stay whole while long turns share the rest of the budget", () => {
+    const turns = [
+      makeTurn({ turnIndex: 0, role: "user", content: "SHORT-QUESTION?" }),
+      makeTurn({
+        turnIndex: 1,
+        role: "assistant",
+        content: "LONG-A-OPEN " + "a".repeat(40_000) + " LONG-A-CLOSE",
+      }),
+      makeTurn({ turnIndex: 2, role: "user", content: "SHORT-FOLLOWUP?" }),
+      makeTurn({
+        turnIndex: 3,
+        role: "assistant",
+        content: "LONG-B-OPEN " + "b".repeat(40_000) + " LONG-B-CLOSE",
+      }),
+    ];
+    const prompt = buildSessionSummarizationPrompt(turns);
+    expect(prompt).toContain("SHORT-QUESTION?");
+    expect(prompt).toContain("SHORT-FOLLOWUP?");
+    for (const tag of ["LONG-A-OPEN", "LONG-A-CLOSE", "LONG-B-OPEN", "LONG-B-CLOSE"]) {
+      expect(prompt).toContain(tag);
+    }
+    // Both long turns got close to half of the budget each, not 1/4.
+    const aChars = (prompt.match(/a{1000,}/g) ?? []).reduce((n, m) => n + m.length, 0);
+    expect(aChars).toBeGreaterThan(MAX_PROMPT_CHARS / 2 - 200);
+    expect(prompt.length).toBeLessThan(MAX_PROMPT_CHARS + 2_000);
+  });
+
+  it("drops whole oldest turns only when each kept turn would get less than the floor", () => {
     const total = 1_000;
     const turns = Array.from({ length: total }, (_, i) =>
       makeTurn({
         turnIndex: i,
         role: i % 2 === 0 ? "user" : "assistant",
-        content: `TURN-${i}-BODY ` + "y".repeat(200),
+        content: `TURN-${i}-OPEN ` + "y".repeat(1_000) + ` TURN-${i}-CLOSE`,
       }),
     );
     const prompt = buildSessionSummarizationPrompt(turns);
-    const maxTurns = Math.floor(MAX_PROMPT_CHARS / MIN_CHARS_PER_TURN);
-    expect(prompt).toContain(`TURN-${total - 1}-BODY`);
-    expect(prompt).toContain(`TURN-${total - maxTurns}-BODY`);
-    expect(prompt).not.toContain(`TURN-${total - maxTurns - 1}-BODY`);
-    expect(prompt).not.toContain("TURN-0-BODY");
-    expect(prompt).toContain(`the ${total - maxTurns} earliest turn(s) were omitted`);
-    // Each kept turn still has its full body: no per-turn starvation.
-    expect(prompt).toContain(`TURN-${total - 1}-BODY ` + "y".repeat(200));
+    // 1000-char turns cost MIN_CHARS_PER_TURN each at the floor, so exactly
+    // MAX_PROMPT_CHARS / MIN_CHARS_PER_TURN of the newest turns are kept.
+    const keptCount = Math.floor(MAX_PROMPT_CHARS / MIN_CHARS_PER_TURN);
+    const firstKept = total - keptCount;
+    expect(prompt).toContain(`TURN-${total - 1}-OPEN`);
+    expect(prompt).toContain(`TURN-${total - 1}-CLOSE`);
+    expect(prompt).toContain(`TURN-${firstKept}-OPEN`);
+    expect(prompt).toContain(`TURN-${firstKept}-CLOSE`);
+    expect(prompt).not.toContain(`TURN-${firstKept - 1}-OPEN`);
+    expect(prompt).not.toContain("TURN-0-OPEN");
+    expect(prompt).toContain(`the ${firstKept} earliest turn(s) are not shown`);
+    expect(prompt).toContain("start and the end of each cut turn are kept");
+  });
+});
+
+describe("WP1: fitNewestToBudget", () => {
+  it("keeps everything uncut when it fits", () => {
+    expect(fitNewestToBudget([10, 20, 30], 60, 5)).toEqual({ start: 0, cap: null });
+    expect(fitNewestToBudget([], 10, 5)).toEqual({ start: 0, cap: null });
   });
 
+  it("water-fills a cap: short items stay whole, long ones share the rest", () => {
+    // 10 + 2 * 45 = 100
+    expect(fitNewestToBudget([10, 200, 200], 100, 5)).toEqual({ start: 0, cap: 45 });
+  });
+
+  it("drops the oldest items once the floor no longer fits, and always keeps the newest", () => {
+    // floor cost 30 each: the newest three fit in 100, a fourth would not.
+    expect(fitNewestToBudget([500, 500, 500, 500, 500], 100, 30)).toEqual({ start: 2, cap: 33 });
+    expect(fitNewestToBudget([5_000], 100, 30)).toEqual({ start: 0, cap: 100 });
+  });
+
+  it("drops old items without cutting when the kept window fits", () => {
+    expect(fitNewestToBudget([50, 50, 50, 20, 20], 60, 50)).toEqual({ start: 3, cap: null });
+  });
+});
+
+describe("WP1: the final summary folds in checkpoints for turns it cannot show", () => {
+  function longTurns(count: number): ConversationTurn[] {
+    return Array.from({ length: count }, (_, i) =>
+      makeTurn({
+        turnIndex: i,
+        role: i % 2 === 0 ? "user" : "assistant",
+        content: `TURN-${i}-OPEN ` + "z".repeat(1_000),
+      }),
+    );
+  }
+
+  it("includes only the checkpoints that cover dropped turns", () => {
+    const turns = longTurns(400); // keeps the newest 100: turns 300..399
+    const prompt = buildSessionSummarizationPrompt(turns, {
+      checkpoints: [
+        { throughTurnIndex: 149, content: "CHECKPOINT-A early decisions" },
+        { throughTurnIndex: 298, content: "CHECKPOINT-B middle decisions" },
+        { throughTurnIndex: 299, content: "CHECKPOINT-C straddles one dropped turn" },
+        { throughTurnIndex: 350, content: "CHECKPOINT-D covers shown turns only" },
+      ],
+    });
+    expect(prompt).toContain("# Earlier Checkpoints");
+    expect(prompt).toContain("CHECKPOINT-A early decisions");
+    expect(prompt).toContain("CHECKPOINT-B middle decisions");
+    expect(prompt).toContain("CHECKPOINT-C straddles one dropped turn");
+    expect(prompt).not.toContain("CHECKPOINT-D");
+    expect(prompt).toContain("fold them into your summary");
+    expect(prompt.indexOf("# Earlier Checkpoints")).toBeLessThan(
+      prompt.indexOf("# Conversation Turns"),
+    );
+  });
+
+  it("leaves checkpoints out when every turn is shown", () => {
+    const turns = longTurns(10);
+    const prompt = buildSessionSummarizationPrompt(turns, {
+      checkpoints: [{ throughTurnIndex: 4, content: "CHECKPOINT-X" }],
+    });
+    expect(prompt).not.toContain("# Earlier Checkpoints");
+    expect(prompt).not.toContain("CHECKPOINT-X");
+  });
+
+  it("fits many checkpoints to the checkpoint budget, newest first", () => {
+    const turns = longTurns(400);
+    const checkpoints = Array.from({ length: 30 }, (_, i) => ({
+      throughTurnIndex: i * 10 + 9,
+      content: `CP-${i}-OPEN ` + "c".repeat(3_000) + ` CP-${i}-CLOSE`,
+    }));
+    const prompt = buildSessionSummarizationPrompt(turns, { checkpoints });
+    const start = prompt.indexOf("# Earlier Checkpoints");
+    const end = prompt.indexOf("# Conversation Turns");
+    const block = prompt.slice(start, end);
+    expect(block.length).toBeLessThan(CHECKPOINT_BUDGET_CHARS + 2_000);
+    expect(block).toContain("CP-29-OPEN");
+    expect(block).toContain("CP-29-CLOSE");
+    expect(block).not.toContain("CP-0-OPEN");
+  });
+});
+
+describe("WP1: prompt segment wording", () => {
   it("segment prompts describe an ongoing session, session prompts a completed one", () => {
     const turns = [makeTurn({ turnIndex: 0, role: "user", content: "hi" })];
     expect(buildSessionSummarizationPrompt(turns)).toContain("a completed conversation session");

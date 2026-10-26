@@ -24,24 +24,40 @@ import type {
 import type { MemoryStore } from "./store.js";
 import type { MemoryEntry } from "./types.js";
 
-/** Maximum combined character length before proportional truncation. */
+/**
+ * Character budget for the conversation turns in a summarization prompt.
+ * WP1 (memory overhaul 2026-10-25): turns that do not fit are cut to their
+ * head and tail, and the oldest whole turns are dropped once every kept
+ * turn would get less than MIN_CHARS_PER_TURN (see fitNewestToBudget).
+ */
 export const MAX_PROMPT_CHARS = 30_000;
 
 /**
- * WP1 (memory overhaul 2026-10-25) — floor for the per-turn budget. A
- * ConversationStore session spans the agent's whole uptime, so a purely
- * proportional cut gave a 1000-turn session 30 characters per turn and
- * the final summary carried nothing usable. Below this floor whole oldest
- * turns are dropped instead (the most recent MAX_PROMPT_CHARS /
- * MIN_CHARS_PER_TURN turns are kept).
+ * WP1 (memory overhaul 2026-10-25): floor for the per-turn budget. A
+ * ConversationStore session spans the agent's whole uptime, so the old
+ * purely proportional cut gave a 1000-turn session 30 characters per turn
+ * (less than the Discord envelope) and the final summary carried nothing
+ * usable. When even this many characters per turn would not fit, the
+ * oldest whole turns are dropped instead.
  */
 export const MIN_CHARS_PER_TURN = 300;
+
+/**
+ * WP1: budget for the mid-session checkpoint summaries the final session
+ * summary folds in when older turns had to be dropped from its prompt, so
+ * the summary that supersedes (and deletes) those checkpoints still covers
+ * the early part of a long session.
+ */
+export const CHECKPOINT_BUDGET_CHARS = 12_000;
+
+/** WP1: per-checkpoint floor inside CHECKPOINT_BUDGET_CHARS. */
+export const MIN_CHARS_PER_CHECKPOINT = 1_500;
 
 /** Marker inserted where a turn was cut. Tests and operators grep for it. */
 const TRUNCATION_MARKER = "\n\n[...truncated due to length]\n\n";
 
 /**
- * WP1 — cut a turn to `maxChars` keeping its head and its tail (60/40)
+ * WP1: cut a turn to `maxChars` keeping its head and its tail (60/40)
  * around a marker, so a long answer keeps both its opening and its
  * conclusion. Content at or under the budget is returned unchanged.
  */
@@ -53,6 +69,44 @@ export function truncateHeadTail(content: string, maxChars: number): string {
   const head = content.slice(0, headChars);
   const tail = tailChars > 0 ? content.slice(content.length - tailChars) : "";
   return head + TRUNCATION_MARKER + tail;
+}
+
+/**
+ * WP1: fit the newest items of an ordered list into `budget` characters.
+ *
+ * Returns `start`, the index of the oldest item kept (everything before it
+ * is dropped), and `cap`, the length to cut longer kept items to (null when
+ * the kept items fit as they are). Old items are dropped only when the kept
+ * window could not give each item at least `minEach` characters; inside the
+ * window the cap is water-filled, so items shorter than the cap keep every
+ * character and the long ones share the rest equally. The newest item is
+ * always kept. Content that fits the budget is never dropped or cut.
+ */
+export function fitNewestToBudget(
+  lengths: readonly number[],
+  budget: number,
+  minEach: number,
+): { readonly start: number; readonly cap: number | null } {
+  const total = lengths.reduce((sum, n) => sum + n, 0);
+  if (total <= budget) return { start: 0, cap: null };
+
+  let start = lengths.length;
+  let floorCost = 0;
+  while (start > 0) {
+    const cost = Math.min(lengths[start - 1], minEach);
+    if (start < lengths.length && floorCost + cost > budget) break;
+    floorCost += cost;
+    start--;
+  }
+
+  const kept = lengths.slice(start).sort((a, b) => a - b);
+  let remaining = budget;
+  for (let i = 0; i < kept.length; i++) {
+    const share = Math.floor(remaining / (kept.length - i));
+    if (kept[i] > share) return { start, cap: Math.max(0, share) };
+    remaining -= kept[i];
+  }
+  return { start, cap: null };
 }
 
 /**
@@ -83,45 +137,96 @@ export const DEFAULT_MIN_TURNS = 3;
 export const DEFAULT_IMPORTANCE = 0.78;
 
 /**
+ * WP1: a mid-session checkpoint (flush row) offered to the final session
+ * summary: its content and the highest turnIndex it covers.
+ */
+export type SummaryCheckpoint = Readonly<{
+  throughTurnIndex: number;
+  content: string;
+}>;
+
+/**
+ * WP1: the checkpoints that cover turns older than `firstKeptTurnIndex`,
+ * oldest first, fitted to CHECKPOINT_BUDGET_CHARS (newest checkpoints win
+ * when they do not all fit). A checkpoint covers the turns after the
+ * previous checkpoint's cursor up to its own, so it is relevant when that
+ * range starts before the first turn the prompt still shows.
+ */
+function renderCheckpointSections(
+  checkpoints: readonly SummaryCheckpoint[],
+  firstKeptTurnIndex: number,
+): readonly string[] {
+  const sorted = checkpoints
+    .filter((c) => c.throughTurnIndex >= 0 && c.content.trim().length > 0)
+    .sort((a, b) => a.throughTurnIndex - b.throughTurnIndex);
+  const relevant = sorted.filter(
+    (_, i) => i === 0 || sorted[i - 1].throughTurnIndex + 1 < firstKeptTurnIndex,
+  );
+  if (relevant.length === 0) return [];
+  const fit = fitNewestToBudget(
+    relevant.map((c) => c.content.length),
+    CHECKPOINT_BUDGET_CHARS,
+    MIN_CHARS_PER_CHECKPOINT,
+  );
+  return relevant.slice(fit.start).map((c) => {
+    const content =
+      fit.cap !== null && c.content.length > fit.cap
+        ? truncateHeadTail(c.content, fit.cap)
+        : c.content;
+    return `### checkpoint through turn ${c.throughTurnIndex}\n\n${content}`;
+  });
+}
+
+/**
  * Build the structured prompt for Haiku.
  *
  * Format: a 4-category instruction block (User Preferences, Decisions,
  * Open Threads, Commitments) followed by role-annotated turn headers.
- * Truncates proportionally if total content exceeds MAX_PROMPT_CHARS
- * (mirrors consolidation.ts:199-244 pattern — Pitfall 6 in 66-RESEARCH).
  *
- * WP1 — each cut turn keeps its head and its tail (truncateHeadTail) so
- * conclusions survive, and when the per-turn budget would fall under
- * MIN_CHARS_PER_TURN the oldest whole turns are dropped instead. With
- * `opts.segment` the instruction block describes a segment of an ongoing
- * session (the mid-session flush) rather than a completed one.
+ * WP1 (memory overhaul 2026-10-25): when the turns exceed
+ * MAX_PROMPT_CHARS they are fitted with fitNewestToBudget: long turns are
+ * cut to their head and tail (truncateHeadTail) so conclusions survive,
+ * short turns stay whole, and the oldest whole turns are dropped only when
+ * each kept turn would otherwise get less than MIN_CHARS_PER_TURN. When
+ * turns were dropped and `opts.checkpoints` is given (the final summary
+ * passes the session's mid-session flush rows), the checkpoints covering
+ * the dropped turns are included so the summary still spans the whole
+ * session. With `opts.segment` the instruction block describes a segment
+ * of an ongoing session (the mid-session flush) instead of a completed one.
  *
  * An empty `turns` array still returns a valid prompt — the instruction
  * block is always present so callers cannot produce a malformed request.
  */
 export function buildSessionSummarizationPrompt(
   turns: readonly ConversationTurn[],
-  opts?: { readonly segment?: boolean },
+  opts?: {
+    readonly segment?: boolean;
+    readonly checkpoints?: readonly SummaryCheckpoint[];
+  },
 ): string {
-  const maxTurns = Math.max(1, Math.floor(MAX_PROMPT_CHARS / MIN_CHARS_PER_TURN));
-  const omitted = Math.max(0, turns.length - maxTurns);
-  const kept = omitted > 0 ? turns.slice(omitted) : turns;
+  const fit = fitNewestToBudget(
+    turns.map((t) => t.content.length),
+    MAX_PROMPT_CHARS,
+    MIN_CHARS_PER_TURN,
+  );
+  const omitted = fit.start;
+  const kept = turns.slice(omitted);
 
-  const totalChars = kept.reduce((sum, t) => sum + t.content.length, 0);
-  const needsTruncation = totalChars > MAX_PROMPT_CHARS;
-  const maxPerTurn =
-    kept.length > 0
-      ? Math.floor(MAX_PROMPT_CHARS / kept.length)
-      : MAX_PROMPT_CHARS;
-
+  let truncatedTurns = 0;
   const sections: string[] = [];
   for (const turn of kept) {
     let content = turn.content;
-    if (needsTruncation && content.length > maxPerTurn) {
-      content = truncateHeadTail(content, maxPerTurn);
+    if (fit.cap !== null && content.length > fit.cap) {
+      content = truncateHeadTail(content, fit.cap);
+      truncatedTurns++;
     }
     sections.push(`### ${turn.role} (turn ${turn.turnIndex})\n\n${content}`);
   }
+
+  const checkpointSections =
+    omitted > 0 && kept.length > 0 && opts?.checkpoints
+      ? renderCheckpointSections(opts.checkpoints, kept[0].turnIndex)
+      : [];
 
   const subject = opts?.segment
     ? "a segment of an ongoing conversation session (the turns recorded since the previous checkpoint)"
@@ -129,10 +234,13 @@ export function buildSessionSummarizationPrompt(
   const notes: string[] = [];
   if (omitted > 0) {
     notes.push(
-      `Note: the ${omitted} earliest turn(s) were omitted; only the most recent ${kept.length} turns are shown.`,
+      `Note: the ${omitted} earliest turn(s) are not shown; only the most recent ${kept.length} turn(s) are.` +
+        (checkpointSections.length > 0
+          ? " Checkpoint summaries written earlier in this session cover the turns that are not shown: fold them into your summary."
+          : ""),
     );
   }
-  if (needsTruncation) {
+  if (truncatedTurns > 0) {
     notes.push(
       "Note: some turn content was truncated due to length (the start and the end of each cut turn are kept). Summarize what is available.",
     );
@@ -160,11 +268,14 @@ ${notes.length > 0 ? "\n" + notes.join("\n") : ""}
 
 ---
 
-# Conversation Turns
-
 `;
 
-  return instructions + sections.join("\n\n");
+  const checkpointBlock =
+    checkpointSections.length > 0
+      ? `# Earlier Checkpoints\n\n${checkpointSections.join("\n\n")}\n\n`
+      : "";
+
+  return `${instructions}${checkpointBlock}# Conversation Turns\n\n${sections.join("\n\n")}`;
 }
 
 /**
@@ -308,7 +419,25 @@ export async function summarizeSession(
     summaryContent = buildShortSessionSummary(turns);
     fallback = "short-session";
   } else {
-    const prompt = buildSessionSummarizationPrompt(turns);
+    // WP1 (memory overhaul 2026-10-25): this summary supersedes the
+    // session's mid-session flush rows (they are deleted below), so when a
+    // long session's oldest turns do not fit the prompt the checkpoints
+    // that cover them are folded in. Lookup failure only loses that extra
+    // context.
+    let checkpoints: readonly SummaryCheckpoint[] = [];
+    try {
+      checkpoints = listSessionCheckpoints(deps.memoryStore, sessionId, turns);
+    } catch (err) {
+      deps.log.warn(
+        {
+          agent: agentName,
+          session: sessionId,
+          error: (err as Error).message,
+        },
+        "summarize: could not load mid-session checkpoints (non-fatal)",
+      );
+    }
+    const prompt = buildSessionSummarizationPrompt(turns, { checkpoints });
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -492,7 +621,7 @@ export async function summarizeSession(
     }
   }
 
-  // WP1 (memory overhaul 2026-10-25) — the final summary supersedes every
+  // WP1 (memory overhaul 2026-10-25): the final summary supersedes every
   // mid-session flush row of this session: delete them so they stop
   // crowding search, dedup and the auto-linker. Runs whenever the summary
   // row exists (even when markSummarized raced with another summarizer:
@@ -563,7 +692,7 @@ export async function summarizeSession(
 export const DEFAULT_FLUSH_IMPORTANCE = 0.4;
 
 /**
- * WP1 — minimum turns recorded since the previous flush before a new row
+ * WP1: minimum turns recorded since the previous flush before a new row
  * is written. Below this the tick is a cheap skip (no Haiku call, no row).
  */
 export const DEFAULT_FLUSH_MIN_NEW_TURNS = 4;
@@ -571,7 +700,7 @@ export const DEFAULT_FLUSH_MIN_NEW_TURNS = 4;
 /** Tag carried by every mid-session flush row. */
 export const MID_SESSION_TAG = "mid-session";
 
-/** WP1 — cursor tag on flush rows: `flush-through:<turnIndex>`. */
+/** WP1: cursor tag on flush rows: `flush-through:<turnIndex>`. */
 export const FLUSH_THROUGH_TAG_PREFIX = "flush-through:";
 
 /** `session:<id>` tag shared by flush rows and the final session summary. */
@@ -579,7 +708,7 @@ export function sessionTag(sessionId: string): string {
   return `session:${sessionId}`;
 }
 
-/** WP1 — every mid-session flush row written for `sessionId`. */
+/** WP1: every mid-session flush row written for `sessionId`. */
 export function listMidSessionRows(
   memoryStore: Pick<MemoryStore, "findByTag">,
   sessionId: string,
@@ -589,8 +718,38 @@ export function listMidSessionRows(
     .filter((row) => row.tags.includes(MID_SESSION_TAG));
 }
 
+function turnIndexById(
+  turns: readonly ConversationTurn[],
+): ReadonlyMap<string, number> {
+  const indexById = new Map<string, number>();
+  for (const turn of turns) indexById.set(turn.id, turn.turnIndex);
+  return indexById;
+}
+
 /**
- * WP1 — the highest turnIndex already covered by a mid-session flush row
+ * WP1: the highest turnIndex one flush row covers, or -1 when it says
+ * nothing about it. Reads the `flush-through:N` tag and falls back to the
+ * row's sourceTurnIds (rows written before the tag existed).
+ */
+function flushCursorOf(
+  row: MemoryEntry,
+  indexById: ReadonlyMap<string, number>,
+): number {
+  let cursor = -1;
+  for (const tag of row.tags) {
+    if (!tag.startsWith(FLUSH_THROUGH_TAG_PREFIX)) continue;
+    const n = Number(tag.slice(FLUSH_THROUGH_TAG_PREFIX.length));
+    if (Number.isInteger(n) && n > cursor) cursor = n;
+  }
+  for (const turnId of row.sourceTurnIds ?? []) {
+    const turnIndex = indexById.get(turnId);
+    if (turnIndex !== undefined && turnIndex > cursor) cursor = turnIndex;
+  }
+  return cursor;
+}
+
+/**
+ * WP1: the highest turnIndex already covered by a mid-session flush row
  * of `sessionId`, or -1 when nothing has been flushed yet. Reads the
  * `flush-through:N` tag and falls back to the row's sourceTurnIds (rows
  * written before the tag existed), so a daemon restart or a legacy row
@@ -601,26 +760,36 @@ export function findLastFlushedTurnIndex(
   sessionId: string,
   turns: readonly ConversationTurn[],
 ): number {
-  const indexById = new Map<string, number>();
-  for (const turn of turns) indexById.set(turn.id, turn.turnIndex);
-
+  const indexById = turnIndexById(turns);
   let cursor = -1;
   for (const row of listMidSessionRows(memoryStore, sessionId)) {
-    for (const tag of row.tags) {
-      if (!tag.startsWith(FLUSH_THROUGH_TAG_PREFIX)) continue;
-      const n = Number(tag.slice(FLUSH_THROUGH_TAG_PREFIX.length));
-      if (Number.isInteger(n) && n > cursor) cursor = n;
-    }
-    for (const turnId of row.sourceTurnIds ?? []) {
-      const turnIndex = indexById.get(turnId);
-      if (turnIndex !== undefined && turnIndex > cursor) cursor = turnIndex;
-    }
+    const rowCursor = flushCursorOf(row, indexById);
+    if (rowCursor > cursor) cursor = rowCursor;
   }
   return cursor;
 }
 
 /**
- * WP1 — delete every mid-session flush row of `sessionId` through the
+ * WP1: the session's mid-session flush rows as checkpoints for the final
+ * summary prompt (rows whose coverage cannot be determined are left out).
+ */
+export function listSessionCheckpoints(
+  memoryStore: Pick<MemoryStore, "findByTag">,
+  sessionId: string,
+  turns: readonly ConversationTurn[],
+): readonly SummaryCheckpoint[] {
+  const indexById = turnIndexById(turns);
+  const checkpoints: SummaryCheckpoint[] = [];
+  for (const row of listMidSessionRows(memoryStore, sessionId)) {
+    const throughTurnIndex = flushCursorOf(row, indexById);
+    if (throughTurnIndex < 0) continue;
+    checkpoints.push(Object.freeze({ throughTurnIndex, content: row.content }));
+  }
+  return Object.freeze(checkpoints);
+}
+
+/**
+ * WP1: delete every mid-session flush row of `sessionId` through the
  * store's delete path (vectors, links and the session FK go with it).
  * Per-row failures are counted and skipped; only the lookup can throw.
  */
@@ -653,7 +822,7 @@ export function deleteMidSessionRows(
  *     `flush:${N}`, `flush-through:${turnIndex}`] with `skipDedup: true`
  *     so multiple flushes coexist.
  *
- * WP1 (memory overhaul 2026-10-25) — the flush is incremental: only the
+ * WP1 (memory overhaul 2026-10-25): the flush is incremental: only the
  * turns recorded since the previous flush (cursor from
  * `input.afterTurnIndex`, else recovered from the session's existing flush
  * rows) are summarized, and a tick with fewer than `flushMinNewTurns`
@@ -711,7 +880,7 @@ export async function flushSessionMidway(
     });
   }
 
-  // Step 3b (WP1) — only the turns after the previous flush's cursor.
+  // Step 3b (WP1): only the turns after the previous flush's cursor.
   const afterTurnIndex =
     input.afterTurnIndex ??
     findLastFlushedTurnIndex(deps.memoryStore, sessionId, turns);
@@ -740,7 +909,7 @@ export async function flushSessionMidway(
     afterTurnIndex,
   );
 
-  // Step 4-7 — content source (mirrors summarizeSession) over the new turns
+  // Step 4-7: content source (mirrors summarizeSession) over the new turns
   const shortSession = newTurns.length < minTurns;
   let summaryContent: string;
   let fallback: SummarizeSuccessFallback;
@@ -802,6 +971,24 @@ export async function flushSessionMidway(
       skipped: true as const,
       reason: "zero-turns" as const,
       turnCount: turns.length,
+    });
+  }
+
+  // Step 8b (WP1): the session may have ended while this flush was
+  // summarizing (a Haiku call takes up to timeoutMs). The final summary
+  // owns an ended session and deletes its flush rows, so a row written
+  // now would outlive it as an orphan checkpoint. Re-check right before
+  // the insert (no await in between).
+  const current = deps.conversationStore.getSession(sessionId);
+  if (!current || current.status !== "active") {
+    deps.log.debug(
+      { agent: agentName, session: sessionId, flushSequence },
+      "flush discarded: session ended while it was being summarized",
+    );
+    return Object.freeze({
+      skipped: true as const,
+      reason: "session-not-active" as const,
+      turnCount: newTurns.length,
     });
   }
 

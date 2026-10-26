@@ -988,8 +988,11 @@ describe("SessionSummarizer", () => {
       expect(convStore.getTurnsForSession(sessionId)).toHaveLength(4);
     });
 
+    // WP1 (memory overhaul 2026-10-25): the flush is incremental and needs
+    // 4 new turns, so the second flush only fires after 4 more turns. The
+    // pre-WP1 version of this test flushed the same 3 turns twice.
     it("encodes flushSequence into the flush:N tag across multiple flushes", async () => {
-      const { sessionId } = seedActiveSession(3);
+      const { sessionId } = seedActiveSession(4);
 
       const deps: SummarizeSessionDeps = {
         conversationStore: convStore,
@@ -1003,6 +1006,13 @@ describe("SessionSummarizer", () => {
         { agentName: "agent-a", sessionId, flushSequence: 1 },
         deps,
       );
+      for (let i = 4; i < 8; i++) {
+        convStore.recordTurn({
+          sessionId,
+          role: i % 2 === 0 ? "user" : "assistant",
+          content: `Flush-turn ${i} content with some substance.`,
+        });
+      }
       const r2 = await flushSessionMidway(
         { agentName: "agent-a", sessionId, flushSequence: 2 },
         deps,
@@ -1019,7 +1029,36 @@ describe("SessionSummarizer", () => {
       }
     });
 
+    // WP1 (memory overhaul 2026-10-25): by default a flush needs 4 new
+    // turns, so a 2-turn session is now skipped (see the next test). The
+    // short-session path is still reachable with a lower flushMinNewTurns.
     it("uses short-session fallback for sessions below minTurns (no Haiku call)", async () => {
+      const { sessionId } = seedActiveSession(2);
+
+      const mockSummarize: SummarizeFn = vi.fn();
+      const deps: SummarizeSessionDeps = {
+        conversationStore: convStore,
+        memoryStore: memStore,
+        embedder: createMockEmbedder(),
+        summarize: mockSummarize,
+        log: silentLog(),
+        config: { flushMinNewTurns: 1 },
+      };
+
+      const result = await flushSessionMidway(
+        { agentName: "agent-a", sessionId, flushSequence: 1 },
+        deps,
+      );
+
+      expect(result).toMatchObject({
+        success: true,
+        fallback: "short-session",
+        turnCount: 2,
+      });
+      expect(mockSummarize).not.toHaveBeenCalled();
+    });
+
+    it("WP1: skips a session with fewer than 4 turns by default (no Haiku call, no row)", async () => {
       const { sessionId } = seedActiveSession(2);
 
       const mockSummarize: SummarizeFn = vi.fn();
@@ -1037,11 +1076,12 @@ describe("SessionSummarizer", () => {
       );
 
       expect(result).toMatchObject({
-        success: true,
-        fallback: "short-session",
-        turnCount: 2,
+        skipped: true,
+        reason: "insufficient-new-turns",
+        newTurnCount: 2,
       });
       expect(mockSummarize).not.toHaveBeenCalled();
+      expect(memStore.findByTag("mid-session")).toHaveLength(0);
     });
 
     it("skips when the session has zero turns", async () => {

@@ -40,7 +40,7 @@ import { registerSearchMcpCommand } from "./commands/search-mcp.js";
 import { registerImageMcpCommand } from "./commands/image-mcp.js";
 import { registerMcpBrokerShimCommand } from "./commands/mcp-broker-shim.js";
 import { registerMemoryCommand } from "./commands/memory.js";
-// Memory overhaul 2026-10-25 (WP1) — `clawcode memory prune-flush <agent>`.
+// Memory overhaul 2026-10-25 (WP1): `clawcode memory prune-flush <agent>`.
 import { registerMemoryPruneFlushCommand } from "./commands/memory-prune-flush.js";
 import { registerUsageCommand } from "./commands/usage.js";
 import { registerDeliveryQueueCommand } from "./commands/delivery-queue.js";
@@ -212,7 +212,7 @@ registerSearchMcpCommand(program);
 registerImageMcpCommand(program);
 registerMcpBrokerShimCommand(program);
 registerMemoryCommand(program);
-// WP1 — prune-flush hangs off the memory group registered just above.
+// WP1: prune-flush hangs off the memory group registered just above.
 // Operator-only, dry run by default, never automatic.
 {
   const memoryGroup = program.commands.find((c) => c.name() === "memory");

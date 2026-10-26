@@ -1,5 +1,5 @@
 /**
- * Memory overhaul 2026-10-25 (WP1) — `clawcode memory prune-flush <agent>`
+ * Memory overhaul 2026-10-25 (WP1): `clawcode memory prune-flush <agent>`
  * CLI tests.
  *
  * DI'd against a stub loadConfig and an `openStores` factory that hands
@@ -10,6 +10,9 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { Command } from "commander";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import pino from "pino";
 import { MemoryStore } from "../../../memory/store.js";
 import { ConversationStore } from "../../../memory/conversation-store.js";
@@ -285,6 +288,198 @@ describe("memory prune-flush CLI (WP1)", () => {
     expect(args.memoryPath).toBe("/tmp/ws-agent-x/memory/agent-x");
     expect(args.tierConfig).toEqual({ ...DEFAULT_TIER_CONFIG, hotBudget: 7 });
     expect(args.scoringConfig).toEqual({ semanticWeight: 0.7, decayWeight: 0.3, halfLifeDays: 90 });
+  });
+
+  it("a session whose summary pointer was detached still counts as summarized while a summary row exists", async () => {
+    // summary-dedupe removed the summary the pointer named; a duplicate
+    // summary row for the same session survives.
+    const s = convStore.startSession("agent-x").id;
+    const rows = [1, 2].map((n) => insertFlush(s, n));
+    convStore.endSession(s);
+    const first = memStore.insert(
+      { content: `summary A of ${s}`, source: "conversation", tags: ["session-summary", `session:${s}`], skipDedup: true },
+      randomEmbedding(),
+    );
+    convStore.markSummarized(s, first.id);
+    memStore.insert(
+      { content: `summary B of ${s}`, source: "conversation", tags: ["session-summary", `session:${s}`], skipDedup: true },
+      randomEmbedding(),
+    );
+    memStore.delete(first.id);
+    expect(convStore.getSession(s)!.summaryMemoryId).toBeNull();
+
+    const plan = planPruneFlush(stores, { keepDays: 0 });
+
+    expect(plan.prunable.map((r) => r.id)).toEqual(expect.arrayContaining(rows));
+  });
+
+  it("a summarized session with no summary row left keeps its flush rows", async () => {
+    const s = convStore.startSession("agent-x").id;
+    const rows = [1, 2].map((n) => insertFlush(s, n));
+    convStore.endSession(s);
+    const only = memStore.insert(
+      { content: `summary of ${s}`, source: "conversation", tags: ["session-summary", `session:${s}`], skipDedup: true },
+      randomEmbedding(),
+    );
+    convStore.markSummarized(s, only.id);
+    memStore.delete(only.id);
+
+    const plan = planPruneFlush(stores, { keepDays: 0 });
+
+    for (const id of rows) expect(plan.prunable.map((r) => r.id)).not.toContain(id);
+    expect(plan.keptUnsummarized).toBe(4);
+  });
+
+  it("a row that vanished between plan and delete counts as already gone, not as a failure", async () => {
+    const realDelete = memStore.delete.bind(memStore);
+    const gone = rowsBySession[summarizedSession][0];
+    const flaky: PruneFlushStores = {
+      ...stores,
+      memoryStore: {
+        findByTag: (tag: string) => memStore.findByTag(tag),
+        delete: (id: string) => (id === gone ? false : realDelete(id)),
+      },
+    };
+
+    const code = await runMemoryPruneFlushAction({
+      agentName: "agent-x",
+      apply: true,
+      configPath: "/tmp/fake-clawcode.yaml",
+      loadConfigDep: vi.fn().mockResolvedValue(CONFIG),
+      openStores: () => flaky,
+      log: silent,
+    });
+
+    expect(code).toBe(0);
+    expect(stdoutCapture.join("")).toContain("Deleted 3 mid-session flush row(s) (1 already gone).");
+  });
+
+  it("a failing delete is reported and exits 1", async () => {
+    const realDelete = memStore.delete.bind(memStore);
+    const bad = rowsBySession[summarizedSession][1];
+    const failing: PruneFlushStores = {
+      ...stores,
+      memoryStore: {
+        findByTag: (tag: string) => memStore.findByTag(tag),
+        delete: (id: string) => {
+          if (id === bad) throw new Error("database is locked");
+          return realDelete(id);
+        },
+      },
+    };
+
+    const code = await runMemoryPruneFlushAction({
+      agentName: "agent-x",
+      apply: true,
+      configPath: "/tmp/fake-clawcode.yaml",
+      loadConfigDep: vi.fn().mockResolvedValue(CONFIG),
+      openStores: () => failing,
+      log: silent,
+    });
+
+    expect(code).toBe(1);
+    expect(memStore.getById(bad)).not.toBeNull();
+    expect(stdoutCapture.join("")).toContain("Deleted 3 mid-session flush row(s) (1 failed).");
+    expect(closed).toBe(true);
+  });
+
+  it("resolves the workspace from defaults.basePath and uses the defaults memory block like the config loader", async () => {
+    const openStores = vi.fn().mockReturnValue(stores);
+    const code = await runMemoryPruneFlushAction({
+      agentName: "agent-x",
+      configPath: "/tmp/fake-clawcode.yaml",
+      loadConfigDep: vi.fn().mockResolvedValue({
+        defaults: {
+          basePath: "/srv/agents",
+          memory: { tiers: { hotBudget: 9 }, decay: { semanticWeight: 0.6 } },
+        },
+        agents: [{ name: "agent-x" }],
+      }),
+      openStores,
+      log: silent,
+    });
+
+    expect(code).toBe(0);
+    const args = openStores.mock.calls[0][0];
+    expect(args.memoryPath).toBe("/srv/agents/agent-x");
+    expect(args.dbPath).toBe("/srv/agents/agent-x/memory/memories.db");
+    expect(args.tierConfig).toEqual({ ...DEFAULT_TIER_CONFIG, hotBudget: 9 });
+    expect(args.scoringConfig).toEqual({ semanticWeight: 0.6, decayWeight: 0.3, halfLifeDays: 30 });
+  });
+
+  it("refuses to create a database that does not exist (default store opener)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "prune-flush-nodb-"));
+    try {
+      const code = await runMemoryPruneFlushAction({
+        agentName: "agent-x",
+        configPath: "/tmp/fake-clawcode.yaml",
+        loadConfigDep: vi.fn().mockResolvedValue({ agents: [{ name: "agent-x", workspace: dir }] }),
+        log: silent,
+      });
+
+      expect(code).toBe(1);
+      expect(stderrCapture.join("")).toContain("no memory database at");
+      expect(existsSync(join(dir, "memory", "memories.db"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("end to end on an on-disk database through the default store opener", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "prune-flush-disk-"));
+    try {
+      mkdirSync(join(dir, "memory"), { recursive: true });
+      const dbPath = join(dir, "memory", "memories.db");
+      const disk = new MemoryStore(dbPath);
+      const conv = new ConversationStore(disk.getDatabase());
+      const done = conv.startSession("agent-x").id;
+      const live = conv.startSession("agent-x").id;
+      const flushIds = [1, 2, 3].map(
+        (n) =>
+          disk.insert(
+            { content: `flush ${n}`, source: "conversation", importance: 0.4, tags: ["mid-session", `session:${done}`, `flush:${n}`], skipDedup: true },
+            randomEmbedding(),
+          ).id,
+      );
+      const liveId = disk.insert(
+        { content: "live flush", source: "conversation", importance: 0.4, tags: ["mid-session", `session:${live}`, "flush:1"], skipDedup: true },
+        randomEmbedding(),
+      ).id;
+      conv.endSession(done);
+      const summary = disk.insert(
+        { content: "summary", source: "conversation", tags: ["session-summary", `session:${done}`], skipDedup: true },
+        randomEmbedding(),
+      );
+      conv.markSummarized(done, summary.id);
+      disk.updateTier(flushIds[0], "hot");
+      disk.close();
+
+      const code = await runMemoryPruneFlushAction({
+        agentName: "agent-x",
+        apply: true,
+        configPath: "/tmp/fake-clawcode.yaml",
+        loadConfigDep: vi.fn().mockResolvedValue({ agents: [{ name: "agent-x", workspace: dir }] }),
+        log: silent,
+      });
+
+      expect(code).toBe(0);
+      expect(stdoutCapture.join("")).toContain("Deleted 3 mid-session flush row(s).");
+      const check = new MemoryStore(dbPath);
+      try {
+        for (const id of flushIds) expect(check.getById(id)).toBeNull();
+        expect(check.getById(liveId)).not.toBeNull();
+        expect(check.getById(summary.id)).not.toBeNull();
+        const vecs = check
+          .getDatabase()
+          .prepare(`SELECT COUNT(*) AS n FROM vec_memories WHERE memory_id IN (${flushIds.map(() => "?").join(",")})`)
+          .get(...flushIds) as { n: number };
+        expect(vecs.n).toBe(0);
+      } finally {
+        check.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("agent not in config exits 1 without opening a store", async () => {

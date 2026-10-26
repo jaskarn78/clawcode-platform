@@ -34,7 +34,7 @@ export type SummarizerConfig = {
   /** Importance assigned to the resulting MemoryEntry. Default 0.78. */
   readonly importance?: number;
   /**
-   * WP1 (memory overhaul 2026-10-25) — minimum number of turns recorded
+   * WP1 (memory overhaul 2026-10-25): minimum number of turns recorded
    * since the previous mid-session flush before a new flush row is
    * written. Default 4. Only read by flushSessionMidway.
    */
@@ -117,7 +117,7 @@ export type FlushSessionInput = {
    */
   readonly flushSequence: number;
   /**
-   * WP1 — explicit flush cursor: only turns with turnIndex greater than
+   * WP1: explicit flush cursor. Only turns with turnIndex greater than
    * this are summarized. When omitted the cursor is recovered from the
    * session's existing mid-session rows (their `flush-through:N` tag, or
    * their sourceTurnIds for rows written before the tag existed), so the
@@ -158,6 +158,6 @@ export type FlushSessionResult =
         | "zero-turns"
         | "insufficient-new-turns";
       readonly turnCount?: number;
-      /** WP1 — turns recorded since the previous flush (insufficient-new-turns). */
+      /** WP1: turns recorded since the previous flush (insufficient-new-turns). */
       readonly newTurnCount?: number;
     };

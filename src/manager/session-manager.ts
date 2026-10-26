@@ -3984,7 +3984,7 @@ export class SessionManager {
       return;
     }
     this.flushSequenceByAgent.set(name, 0);
-    // WP1 (memory overhaul 2026-10-25) — one flush in flight per timer. A
+    // WP1 (memory overhaul 2026-10-25): one flush in flight per timer. A
     // tick that lands while the previous flush is still summarizing would
     // read the same cursor and write a duplicate row.
     let inFlight = false;
@@ -3994,8 +3994,8 @@ export class SessionManager {
       const convSessionId = this.activeConversationSessionIds.get(name);
       if (!convSessionId) return; // no active session — skip this tick
       if (this.draining) return; // shutdown in progress — new flushes pointless
-      if (inFlight) return; // previous flush still running — skip this tick
-      // WP1 — the sequence advances only when a row is written. The flush
+      if (inFlight) return; // previous flush still running, skip this tick
+      // WP1: the sequence advances only when a row is written. The flush
       // is incremental now: a tick with fewer than flushMinNewTurns new
       // turns is skipped inside flushSessionMidway and must not consume a
       // flush:N label, so the labels stay dense.
@@ -4057,7 +4057,7 @@ export class SessionManager {
    * Mirrors summarizeSessionIfPossible's shape so tests can exercise the
    * production wiring end-to-end.
    *
-   * WP1 — resolves with the flush result (undefined when the stores are
+   * WP1: resolves with the flush result (undefined when the stores are
    * missing or the pipeline threw) so the timer can advance the flush
    * sequence only when a row was actually written. The cursor itself is
    * recovered by flushSessionMidway from the session's existing flush

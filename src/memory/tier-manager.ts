@@ -489,7 +489,7 @@ export class TierManager {
     // backlink_count DESC so hubs surface first when the cap IS reached.
     // Phase 999.119 — the backlink count now rides on the candidate row
     // (one JOIN) instead of one COUNT(*) per candidate.
-    // WP1 — the store query already excludes session-derived rows, so
+    // WP1: the store query already excludes session-derived rows, so
     // neither the access path nor the centrality path can promote them.
     const warmMemories = this.store.listWarmCandidatesForPromotion(5000);
     const qualifyingWarm = warmMemories.filter((mem) =>
@@ -535,7 +535,7 @@ export class TierManager {
    * Get current hot-tier memories sorted by importance descending.
    * Returns a frozen array of frozen MemoryEntry objects.
    *
-   * WP1 — session-derived rows (SESSION_DERIVED_TAGS) are never returned,
+   * WP1: session-derived rows (SESSION_DERIVED_TAGS) are never returned,
    * even when a row still carries tier='hot' from before the promotion
    * scan excluded them; the next refreshHotTier demotes those.
    */

@@ -1392,7 +1392,7 @@ export class MemoryStore {
    * Used by `TierManager.refreshHotTier`. Not used elsewhere; if a future
    * caller needs hot/cold variants, generalize the orderBy at that point.
    *
-   * Memory overhaul 2026-10-25 (WP1) — session-derived rows (mid-session
+   * Memory overhaul 2026-10-25 (WP1): session-derived rows (mid-session
    * flushes, session summaries, raw fallbacks) are excluded here, which
    * covers both the access-count path and the centrality path. On the
    * production host 19 of 20 hot rows were flush rows that had reached hot

@@ -25,7 +25,7 @@
  * reads from (`getEmbeddingReadVersion`). Distances come back on the v1
  * scale, so the 0.6 threshold means the same thing under bge-small.
  *
- * Memory overhaul 2026-10-25 (WP1) — session-derived rows (mid-session
+ * Memory overhaul 2026-10-25 (WP1): session-derived rows (mid-session
  * flushes, session summaries, raw fallbacks; see SESSION_DERIVED_TAGS in
  * tiers.ts) are never linked: not as the memory being scanned and not as
  * a neighbour. Every flush row of a session is near-identical to its
@@ -94,10 +94,18 @@ const DEFAULT_CONFIG: AutoLinkConfig = {
 /** KNN width: five neighbours plus the self match. */
 const KNN_K = 6;
 
+/**
+ * WP1 (memory overhaul 2026-10-25): extra KNN rows fetched so that
+ * session-derived neighbours, which are skipped without using one of the
+ * KNN_K slots, do not crowd out the real neighbours. sqlite-vec scans the
+ * whole table either way, so the wider fetch costs next to nothing.
+ */
+const KNN_SESSION_DERIVED_OVERFETCH = 24;
+
 type LinkStatements = Readonly<{
   checkEdge: Statement;
   insertLink: Statement;
-  /** WP1 — one row when the memory carries any SESSION_DERIVED_TAGS tag. */
+  /** WP1: one row when the memory carries any SESSION_DERIVED_TAGS tag. */
   isSessionDerived: Statement;
 }>;
 
@@ -133,7 +141,7 @@ function prepareLinkStatements(db: DatabaseType): LinkStatements {
   });
 }
 
-/** WP1 — true when the memory is tagged with any of SESSION_DERIVED_TAGS. */
+/** WP1: true when the memory is tagged with any of SESSION_DERIVED_TAGS. */
 function isSessionDerived(stmts: LinkStatements, memoryId: string): boolean {
   return stmts.isSessionDerived.get(memoryId, ...SESSION_DERIVED_TAGS) !== undefined;
 }
@@ -173,19 +181,31 @@ function linkNeighbors(
 ): NeighborCounts {
   // searchMemoriesVec JOINs memories: ghosts never surface, and the tier
   // rides on the row. Distances are already on the v1 scale.
-  const neighbors = store.searchMemoriesVec(query, KNN_K);
+  const neighbors = store.searchMemoriesVec(
+    query,
+    KNN_K + KNN_SESSION_DERIVED_OVERFETCH,
+  );
 
   let neighborsExamined = 0;
   let linksCreated = 0;
   let skippedExisting = 0;
+  // The first KNN_K rows that are not session-derived (the self match
+  // included) are the ones considered, exactly as before WP1 when no
+  // session-derived rows are near.
+  let slotsUsed = 0;
 
   for (const neighbor of neighbors) {
+    if (slotsUsed >= KNN_K) break;
+    // WP1: never link into a flush row, summary row or raw fallback, and
+    // do not let one take a slot.
+    if (neighbor.memory_id !== memoryId && isSessionDerived(stmts, neighbor.memory_id)) {
+      continue;
+    }
+    slotsUsed++;
     if (neighbor.memory_id === memoryId) continue;
     neighborsExamined++;
 
     if (neighbor.tier === "cold") continue;
-    // WP1 — never link into a flush row, summary row or raw fallback.
-    if (isSessionDerived(stmts, neighbor.memory_id)) continue;
 
     const similarity = 1 - neighbor.distance;
     if (similarity < similarityThreshold) continue;
@@ -229,7 +249,7 @@ export function autoLinkMemory(
   const db = store.getDatabase();
   const stmts = prepareLinkStatements(db);
 
-  // WP1 — a session-derived row never seeds links. Stamp it so the
+  // WP1: a session-derived row never seeds links. Stamp it so the
   // heartbeat cursor does not pick it up again.
   if (isSessionDerived(stmts, memoryId)) {
     store.markAutoLinked(memoryId);
@@ -289,7 +309,7 @@ export function discoverAutoLinks(
   let firstError: string | null = null;
 
   const scanOne = db.transaction((memoryId: string): void => {
-    // WP1 — session-derived candidates are stamped and skipped: they
+    // WP1: session-derived candidates are stamped and skipped: they
     // must not seed auto:similar edges (see the module doc).
     const query = isSessionDerived(stmts, memoryId)
       ? null
