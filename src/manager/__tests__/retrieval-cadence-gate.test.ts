@@ -55,6 +55,28 @@ describe("RetrievalCadenceGate", () => {
     expect((await g.shouldRefresh("b", "topic B")).reason).toBe("first");
   });
 
+  it("WP2: compares the user's words, not the shared Discord envelope", async () => {
+    const seen: string[] = [];
+    const g = new RetrievalCadenceGate(async (q) => {
+      seen.push(q);
+      return embedByTopic(q);
+    });
+    const wrap = (text: string, id: string) =>
+      `<channel source="discord" chat_id="000000000000000001" message_id="${id}" user="jas" ts="2026-10-25 09:14 PDT">\n${text}\n</channel>`;
+    expect((await g.shouldRefresh("a", wrap("topic A please", "1"))).reason).toBe("first");
+    expect((await g.shouldRefresh("a", wrap("now about topic B", "2"))).reason).toBe("topic-shift");
+    expect(seen).toEqual(["topic A please", "now about topic B"]);
+  });
+
+  it("WP2: an envelope with no words never reaches the embedder", async () => {
+    const embed = vi.fn(embedByTopic);
+    const g = new RetrievalCadenceGate(embed);
+    await g.shouldRefresh("a", "topic A");
+    const verdict = await g.shouldRefresh("a", '<channel source="discord" user="jas" ts="t">\n</channel>');
+    expect(verdict.reason).toBe("hold");
+    expect(embed).toHaveBeenCalledTimes(1);
+  });
+
   it("exports the threshold", () => {
     expect(TOPIC_SHIFT_MIN_COSINE).toBe(0.75);
   });

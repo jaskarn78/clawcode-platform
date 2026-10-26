@@ -3,10 +3,12 @@
  *
  * Splits workspace memory/*.md content on H2 boundaries (## headings).
  * Memory overhaul WP2 (2026-10-25): a section longer than about 220 words
- * is split into parts headed "<heading> (part n/N)" so every part fits the
- * embedding window (MiniLM embeds 200 words, bge-small 350) and a fact in
- * the last paragraph of a long section is still reachable by vector search.
- * Files with only H1/body become a single chunk (or parts of one). Empty /
+ * is split into parts headed "<heading> (part n/N)" so a part fits
+ * bge-small's 350-word window whole and MiniLM's 200-word window nearly
+ * whole, and a fact in the last paragraph of a long section is still
+ * reachable by vector search.
+ * Files with only H1/body become a single chunk (or several parts, all
+ * with a null heading so the renderer falls back to the file path). Empty /
  * whitespace-only content → zero chunks.
  *
  * Pure functions — no I/O, no mutation of inputs. DI-friendly for the
@@ -32,11 +34,21 @@ const HARD_CAP_RATIO = 1.25;
 
 /**
  * WP2: a section (or headless file) longer than this many words is split
- * into parts. 220 words sits under both embedders' truncation caps with
- * room for the heading line the scanner prepends, so no indexed text is
- * silently cut before embedding.
+ * into parts. bge-small (v2) embeds up to 350 words, so a part plus the
+ * heading line the scanner prepends is embedded whole; MiniLM (v1) stops at
+ * 200 words because its window is 256 tokens, so on v1 only the last few
+ * words of a full part fall outside the vector (FTS still indexes them).
  */
 export const DEFAULT_MAX_WORDS_PER_PART = 220;
+
+/**
+ * WP2: version of the chunking rules. The scanner skips a file whose
+ * sha256 is unchanged, so files indexed by the pre-WP2 chunker keep their
+ * long, partly-unembedded chunks until they change. A scanner that folds
+ * this value into its skip check re-chunks them once (memory-scanner.ts is
+ * owned by another package; exported for it).
+ */
+export const MEMORY_CHUNKER_VERSION = 2;
 
 export type MemoryChunk = Readonly<{
   heading: string | null;
@@ -57,7 +69,8 @@ export function stripPartSuffix(heading: string | null): string | null {
  * H2 is discarded (typically just the H1 title). Oversized sections are
  * split into parts of at most `maxWordsPerPart` words on paragraph, then
  * line, then sentence boundaries; every part keeps the section heading
- * with a "(part n/N)" suffix.
+ * with a "(part n/N)" suffix. Parts of a file with no H2 keep a null
+ * heading (as the pre-WP2 paragraph split did).
  *
  * Phase 90 D-20 — H2 is the canonical boundary for memory/*.md. H3/H4 are
  * treated as body content within their parent H2.
@@ -82,11 +95,7 @@ export function chunkMarkdownByH2(
     const total = parts.length;
     parts.forEach((part, i) => {
       const partHeading =
-        total === 1
-          ? heading
-          : heading === null
-            ? `(part ${i + 1}/${total})`
-            : `${heading} (part ${i + 1}/${total})`;
+        total === 1 || heading === null ? heading : `${heading} (part ${i + 1}/${total})`;
       chunks.push({
         heading: partHeading,
         body: part,
@@ -204,7 +213,7 @@ function pack(units: readonly string[], maxWords: number, joiner: string): reado
 }
 
 /**
- * Phase 90 D-19 — path-derived retrieval-ranking weight. Multiplies the RRF
+ * Phase 90 D-19, path-derived retrieval-ranking weight. Multiplies the RRF
  * fused score at hydration time (memory-retrieval.ts: fused * (1 + weight),
  * memory overhaul WP2). Vault content (standing rules) ranks a little
  * higher; archive content (old session logs) a little lower. Dated files at

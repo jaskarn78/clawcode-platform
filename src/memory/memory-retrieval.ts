@@ -19,9 +19,11 @@
  *     20, and excluded memory tags are dropped BEFORE fusion (with one
  *     larger refetch when the filter consumed most of a full fetch), so
  *     flush rows no longer fill the candidate window;
- *   - the D-24 14-day window is a SOFT recency multiplier by default
- *     (0.5 ** (ageDays / windowDays), floor 0.35) on dated chunks;
- *     standing paths (vault, procedures, digests, cue files, documents) are
+ *   - the D-24 14-day window is a SOFT recency factor by default
+ *     (max(0.35, 0.5 ** (ageDays / windowDays))) on dated chunks, applied on
+ *     the RRF rank scale: a dated chunk counts as if it sat at rank / factor
+ *     in each ranker (see recencyDemotedRrf). Nothing is dropped; standing
+ *     paths (vault, procedures, digests, cue files, documents) are
  *     untouched. `timeWindowMode: "hard"` restores the old drop filter;
  *   - a query-embedding failure logs once and continues with the keyword
  *     rankers only instead of throwing away keyword recall;
@@ -67,8 +69,8 @@ export type MemoryRetrievalResult = Readonly<{
   heading: string | null;
   body: string;
   /**
-   * Ranking score (higher = better): the RRF fused score times
-   * (1 + scoreWeight), times the soft recency factor for dated chunks.
+   * Ranking score (higher = better): the RRF fused score (with dated chunks'
+   * ranks demoted by the soft recency factor) times (1 + scoreWeight).
    */
   fusedScore: number;
   /** Path-derived nudge clamped to [-0.2, 0.2] (vault +0.2, procedures +0.1, archive -0.2, else 0). */
@@ -130,9 +132,10 @@ const MEMORY_REFETCH_MULTIPLIER = 10;
 export const MAX_PATH_SCORE_WEIGHT = 0.2;
 
 /**
- * WP2: lowest soft recency multiplier for a dated chunk. An old daily log
- * is still reachable when it is the only relevant note, but at a third of
- * the weight of a fresh one.
+ * WP2: lowest soft recency factor for a dated chunk. Applied on the rank
+ * scale, the floor means an old note ranks as if it sat at most 1 / 0.35
+ * (about 2.9) times lower in each ranked list, so an old note that is the
+ * best match is still returned.
  */
 export const SOFT_WINDOW_FLOOR = 0.35;
 
@@ -153,6 +156,33 @@ export function softRecencyFactor(ageDays: number, windowDays: number): number {
   if (!(windowDays > 0)) return 1;
   const age = Number.isFinite(ageDays) ? Math.max(0, ageDays) : Number.POSITIVE_INFINITY;
   return Math.max(SOFT_WINDOW_FLOOR, Math.pow(0.5, age / windowDays));
+}
+
+/**
+ * WP2: RRF score of a candidate whose recency factor is `factor`, given its
+ * 0-based positions in each ranker that returned it. Each position is
+ * demoted to (position + 1) / factor before the usual 1 / (k + rank), so
+ * `factor = 1` gives exactly the rrfFuse score.
+ *
+ * Why on the rank scale and not on the fused score: RRF scores span only
+ * about 1/120 to 2/61 (a factor of 4), so multiplying the fused score by
+ * the 0.35 floor put a dated note found first by BOTH rankers (2/61 x 0.35
+ * = 0.011) below every fresh candidate in the top 27 of EITHER ranker
+ * (1/87 = 0.011). Any agent with a few saved memories or recent logs has
+ * that many, so the soft window behaved exactly like the hard 14-day drop
+ * it replaced. Demoting the rank keeps recency a bounded tie-breaker: a
+ * best match that is old loses about 3 percent (rank 1 counts as 2.9), a
+ * weak old match at rank 20 loses about a third (it counts as rank 57).
+ */
+export function recencyDemotedRrf(
+  positions: readonly number[],
+  factor: number,
+  k: number = RRF_K,
+): number {
+  const f = factor > 0 && Number.isFinite(factor) ? Math.min(1, factor) : SOFT_WINDOW_FLOOR;
+  let score = 0;
+  for (const p of positions) score += 1 / (k + (p + 1) / f);
+  return score;
 }
 
 /** `sourceKind` with a path-based fallback for results built elsewhere. */
@@ -360,8 +390,8 @@ export type RetrieveArgs = Readonly<{
   timeWindowDays?: number;
   /**
    * WP2: how `timeWindowDays` applies to dated (non-standing) chunks.
-   *   "soft" (default): multiply the fused score by
-   *     max(0.35, 0.5 ** (ageDays / windowDays)); nothing is dropped.
+   *   "soft" (default): factor = max(0.35, 0.5 ** (ageDays / windowDays)),
+   *     applied on the rank scale (recencyDemotedRrf); nothing is dropped.
    *   "hard": the pre-WP2 behavior, applyTimeWindowFilter drops chunks
    *     older than the window.
    */
@@ -529,8 +559,8 @@ function logVectorFallback(
  *   4. Memories side: hydrate once per id, drop excluded tags BEFORE
  *      fusion (one larger refetch when the filter ate a full fetch), rank
  *      by similarity x importance x recency, RRF-fuse with memories_fts.
- *   5. Chunks side: RRF-fuse vec + FTS, hydrate, apply
- *      fused * (1 + clampedWeight) and the soft recency factor.
+ *   5. Chunks side: RRF-fuse vec + FTS, hydrate, demote dated chunks'
+ *      ranks by the soft recency factor, apply fused * (1 + clampedWeight).
  *   6. Hard window (opt-in) or nothing to drop (soft default).
  *   7. Sort by fusedScore desc; document priority weighting; reranker.
  *   8. Document-chunk cap.
@@ -600,8 +630,22 @@ export async function retrieveMemoryChunks(
     Promise.resolve(runMemoriesFts(fetchK)),
   ]);
 
-  // Chunks side: RRF-fuse vec + FTS as before.
+  // Chunks side: RRF-fuse vec + FTS as before. The per-ranker positions are
+  // kept so a dated chunk's ranks can be demoted by its recency factor.
   const fusedChunks = rrfFuse(vecTop, ftsTop, RRF_K);
+  const chunkPositions = new Map<string, number[]>();
+  const notePositions = (rows: readonly { chunk_id: string }[]): void => {
+    const seen = new Set<string>();
+    rows.forEach((r, i) => {
+      if (seen.has(r.chunk_id)) return;
+      seen.add(r.chunk_id);
+      const list = chunkPositions.get(r.chunk_id);
+      if (list) list.push(i);
+      else chunkPositions.set(r.chunk_id, [i]);
+    });
+  };
+  notePositions(vecTop);
+  notePositions(ftsTop);
 
   // WP2 (c): memories-side tag exclusion BEFORE fusion. Hydrate each
   // candidate id once (the row read already returns tags, so the filter
@@ -709,16 +753,19 @@ export async function retrieveMemoryChunks(
 
   // Hydrate chunk-side. WP2 (b): the path weight multiplies the fused score
   // (clamped to +-0.2, so the multiplier stays within [0.8, 1.2]) instead of
-  // being added to it. WP2 (c): dated chunks decay softly with age; standing
-  // paths (vault, procedures, digests, cue files, documents) keep full weight.
+  // being added to it. WP2 (c): dated chunks decay softly with age on the
+  // rank scale (recencyDemotedRrf); standing paths (vault, procedures,
+  // digests, cue files, documents) keep their plain RRF score.
   for (const f of fusedChunks) {
     const meta = args.store.getMemoryChunk(f.chunk_id);
     if (!meta) continue;
     const weight = clampScoreWeight(meta.score_weight);
-    let score = f.score * (1 + weight);
+    let rrf = f.score;
     if (timeWindowMode === "soft" && windowDays > 0 && !isStandingMemoryPath(meta.path)) {
-      score *= softRecencyFactor((now - meta.file_mtime_ms) / 86_400_000, windowDays);
+      const factor = softRecencyFactor((now - meta.file_mtime_ms) / 86_400_000, windowDays);
+      if (factor < 1) rrf = recencyDemotedRrf(chunkPositions.get(f.chunk_id) ?? [], factor);
     }
+    const score = rrf * (1 + weight);
     hydrated.push({
       chunkId: f.chunk_id,
       path: meta.path,
@@ -782,8 +829,8 @@ export async function retrieveMemoryChunks(
     args.log?.debug?.(payload, "phase115-tag-filter dropped memories");
   }
 
-  // WP2 (c): the hard window is opt-in; the soft multiplier already ran
-  // at hydration time and drops nothing.
+  // WP2 (c): the hard window is opt-in; the soft factor already ran at
+  // hydration time and drops nothing.
   const windowed: Hydrated[] =
     timeWindowMode === "hard" ? [...applyTimeWindowFilter(hydrated, windowDays, now)] : hydrated;
   windowed.sort((a: Hydrated, b: Hydrated) => b.fusedScore - a.fusedScore);

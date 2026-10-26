@@ -890,8 +890,9 @@ export class SessionManager {
     // the resolver is unset OR returns undefined (config block absent).
     // Memory overhaul WP2 (2026-10-25): the document-chunk cap default is 4
     // (was 2). Two slots were too few once the cross-ingest mirror held
-    // thousands of chunks per agent; four still leaves most of a 5-slot
-    // block to conversational memory. The zod default in config/schema.ts
+    // thousands of chunks per agent. The cap is an upper bound, not a
+    // quota, so saved memories and notes still take every slot a document
+    // chunk does not outrank them for. The zod default in config/schema.ts
     // (`documentIngest.retrieval.maxChunksPerRetrieval`) still says 2 and
     // wins whenever the resolver is wired, so the schema default has to
     // move in its own package for production to see 4.
@@ -950,8 +951,9 @@ export class SessionManager {
         // space the agent's migration currently reads from.
         embed: (text: string) => store.embedQuery(embedder, text),
         topK,
-        // WP2: 14 days is now the half-life of the soft recency multiplier
-        // (timeWindowMode defaults to "soft"); nothing is dropped for age.
+        // WP2: 14 days is now the half-life of the soft recency factor
+        // (timeWindowMode defaults to "soft", applied on the rank scale);
+        // nothing is dropped for age.
         timeWindowDays: 14,
         tokenBudget,
         log: self.log,

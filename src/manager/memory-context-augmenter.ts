@@ -114,7 +114,7 @@ export class RetrievalCadenceGate {
       reason = "first";
     } else if (st.turnCounter - st.lastRetrievalTurn >= this.cadenceTurns) {
       reason = "cadence";
-    } else if (this.embed && st.lastQuery) {
+    } else if (this.embed && st.lastQuery && query.length > 0) {
       try {
         embedding = await this.embed(query);
         if (cosine(embedding, st.lastQuery) < this.minCosine) reason = "topic-shift";
@@ -125,7 +125,7 @@ export class RetrievalCadenceGate {
 
     if (reason === "hold") return { refresh: false, reason };
     st.lastRetrievalTurn = st.turnCounter;
-    if (this.embed) {
+    if (this.embed && query.length > 0) {
       try {
         st.lastQuery = embedding ?? (await this.embed(query));
       } catch {

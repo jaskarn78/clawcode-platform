@@ -30,8 +30,9 @@ import { EmbeddingError } from "./errors.js";
  * covers a whole WP2 chunk part (220 words plus heading) with margin.
  * MiniLM stays at 200 words in embedder.ts because its limit is 256
  * tokens. The two caps therefore differ: a v1/v2 dual-write pair embeds
- * the same text only while it is under 200 words, which every WP2 chunk
- * part is; longer legacy chunks are embedded more completely by v2.
+ * the same text only while it is under 200 words. A WP2 chunk part (at most
+ * 220 words plus its heading) can run slightly past that, and longer
+ * legacy chunks much further; v2 then embeds more of the text than v1.
  */
 
 /**

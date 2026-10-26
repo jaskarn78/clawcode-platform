@@ -66,10 +66,23 @@ describe("clawcode_memory_search reaches older context", () => {
   });
   afterEach(() => store.close());
 
-  it("the lazy tool returns a 150-day-old daily-log chunk; the pre-turn path (14d) does not", async () => {
+  // WP2 (2026-10-25): the pre-turn window is a soft multiplier by default,
+  // so the only relevant note is returned even when it is old. This test
+  // used to assert the pre-turn path returned nothing; the hard mode keeps
+  // that behavior and is asserted below.
+  it("the lazy tool and the soft pre-turn path both return a 150-day-old daily-log chunk; the hard window does not", async () => {
     const lazy = await clawcodeMemorySearch({ query: "sqlite-vec faiss" }, { store, embedder: { embed }, agentName: "a" });
     expect(lazy.hits.map((h) => h.heading)).toContain("May decision");
-    const preTurn = await retrieveMemoryChunks({ query: "sqlite-vec faiss", store, embed, timeWindowDays: 14, now });
-    expect(preTurn).toHaveLength(0);
+    const soft = await retrieveMemoryChunks({ query: "sqlite-vec faiss", store, embed, timeWindowDays: 14, now });
+    expect(soft.map((r) => r.heading)).toEqual(["May decision"]);
+    const hard = await retrieveMemoryChunks({
+      query: "sqlite-vec faiss",
+      store,
+      embed,
+      timeWindowDays: 14,
+      timeWindowMode: "hard",
+      now,
+    });
+    expect(hard).toHaveLength(0);
   });
 });

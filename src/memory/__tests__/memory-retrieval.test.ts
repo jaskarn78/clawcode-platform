@@ -188,11 +188,11 @@ describe("memory-retrieval RRF (Phase 90 MEM-03)", () => {
       const old = results.find((r) => r.heading === "Old")!;
       const fresh = results.find((r) => r.heading === "Fresh")!;
       // 30 days at a 14-day half-life is below the 0.35 floor; one day is
-      // ~0.95. The two rows tie on distance, so their RRF ranks differ by
-      // one step (61/62): the ratio sits just under 0.35 / 0.95.
-      const ratio = old.fusedScore / fresh.fusedScore;
-      expect(ratio).toBeGreaterThan(0.3);
-      expect(ratio).toBeLessThan(0.4);
+      // ~0.95. The factor demotes each ranker position (rank / factor), so
+      // a tie on distance becomes a small lead for the fresh row rather
+      // than a 3x gap: recency breaks the tie, it does not hide the row.
+      expect(old.fusedScore).toBeLessThan(fresh.fusedScore);
+      expect(old.fusedScore / fresh.fusedScore).toBeGreaterThan(0.85);
     });
 
     it("MEM-03-R5: topK truncates results", async () => {

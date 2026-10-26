@@ -91,11 +91,15 @@ describe("memory-chunks (Phase 90 MEM-02)", () => {
       expect(chunks[chunks.length - 1]!.body).toContain("Kestrel account");
     });
 
-    it("WP2-CH8: a headless file longer than the cap gets '(part n/N)' headings; a short one stays null", () => {
+    it("WP2-CH8: a headless file longer than the cap is split into parts that keep a null heading", () => {
       const long = Array.from({ length: 30 }, (_, i) => `Line ${i} ` + "word ".repeat(20)).join("\n");
       const parts = chunkMarkdownByH2(`# Only a title\n\n${long}`);
       expect(parts.length).toBeGreaterThan(1);
-      expect(parts[0]!.heading).toBe(`(part 1/${parts.length})`);
+      // null, so the renderer falls back to the file path (as before WP2)
+      for (const p of parts) {
+        expect(p.heading).toBeNull();
+        expect(p.body.split(/\s+/).length).toBeLessThanOrEqual(DEFAULT_MAX_WORDS_PER_PART);
+      }
       expect(chunkMarkdownByH2("# T\n\nshort body")[0]!.heading).toBeNull();
     });
 

@@ -108,16 +108,9 @@ function fmtDate(iso: string, now: number): string | null {
   });
 }
 
-/**
- * "(Jun 12 to Aug 30)", "(Jun 12)", or "" when nothing carries a date.
- * WP2: spans memories (created_at) AND notes / documents (file date).
- */
-export function recallDateRange(record: RecallRecord, now: number = Date.now()): string {
-  const times = [
-    ...record.memories.map((m) => m.createdAt),
-    ...record.notes.map((n) => n.date),
-    ...record.documents.map((d) => d.date),
-  ]
+/** " (Jun 12 to Aug 30)", " (Jun 12)", or "" when none of `isos` parses. */
+function dateRange(isos: readonly (string | undefined)[], now: number): string {
+  const times = isos
     .map((iso) => (iso ? new Date(iso).getTime() : NaN))
     .filter((t) => !Number.isNaN(t));
   if (times.length === 0) return "";
@@ -127,18 +120,32 @@ export function recallDateRange(record: RecallRecord, now: number = Date.now()):
   return lo === hi ? ` (${lo})` : ` (${lo} to ${hi})`;
 }
 
+/** "(Jun 12 to Aug 30)", "(Jun 12)", or "" when no memory carries a date. */
+export function recallDateRange(record: RecallRecord, now: number = Date.now()): string {
+  return dateRange(record.memories.map((m) => m.createdAt), now);
+}
+
 const plural = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`;
 
-/** The one-line footer. Empty string when nothing was recalled. */
+/**
+ * The one-line footer. Empty string when nothing was recalled. Each count
+ * is followed by its own date range; WP2 (2026-10-25) added the ranges for
+ * notes and documents (file dates), which earlier results never carried.
+ */
 export function recallFooterLine(record: RecallRecord, now: number = Date.now()): string {
   const parts: string[] = [];
-  if (record.memories.length > 0) parts.push(plural(record.memories.length, "memory", "memories"));
-  if (record.notes.length > 0) parts.push(plural(record.notes.length, "note", "notes"));
-  if (record.documents.length > 0) parts.push(plural(record.documents.length, "document", "documents"));
+  if (record.memories.length > 0) {
+    parts.push(`${plural(record.memories.length, "memory", "memories")}${recallDateRange(record, now)}`);
+  }
+  if (record.notes.length > 0) {
+    parts.push(`${plural(record.notes.length, "note", "notes")}${dateRange(record.notes.map((n) => n.date), now)}`);
+  }
+  if (record.documents.length > 0) {
+    parts.push(
+      `${plural(record.documents.length, "document", "documents")}${dateRange(record.documents.map((d) => d.date), now)}`,
+    );
+  }
   if (parts.length === 0) return "";
-  // WP2: the date range covers everything recalled, so it closes the line.
-  const last = parts.length - 1;
-  parts[last] = `${parts[last]}${recallDateRange(record, now)}`;
   return `*— recalled ${parts.join(", ")}*`;
 }
 

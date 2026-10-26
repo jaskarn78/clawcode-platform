@@ -4,6 +4,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { hasChannelEnvelope, stripChannelEnvelope } from "../channel-envelope.js";
+import { formatDiscordMessage } from "../../discord/bridge.js";
 
 const ENVELOPE =
   '<channel source="discord" chat_id="000000000000000001" message_id="1433000000000000000" user="jas" ts="2026-10-25 09:14 PDT">\n' +
@@ -56,6 +57,49 @@ describe("stripChannelEnvelope", () => {
     expect(stripChannelEnvelope("<b>bold</b> and <channel-ish>x</channel-ish>")).toBe(
       "<b>bold</b> and <channel-ish>x</channel-ish>",
     );
+  });
+});
+
+describe("stripChannelEnvelope against the real formatDiscordMessage output", () => {
+  const base = {
+    channelId: "000000000000000001",
+    id: "1433000000000000000",
+    author: { username: "jas" },
+    createdAt: new Date("2026-10-25T16:14:00Z"),
+    attachments: new Map(),
+  };
+
+  it("returns exactly the user's words for a plain message", () => {
+    const formatted = formatDiscordMessage(
+      { ...base, content: "is it safe to run the migration on staging?" } as never,
+      undefined,
+      undefined,
+      "America/Los_Angeles",
+    );
+    expect(formatted).toContain("<channel source=\"discord\"");
+    expect(stripChannelEnvelope(formatted)).toBe("is it safe to run the migration on staging?");
+  });
+
+  it("keeps the reply context and attachment lines, drops only the wrapper", () => {
+    const formatted = formatDiscordMessage(
+      {
+        ...base,
+        content: "what is the total on this one?",
+        reference: { messageId: "1432999999999999999" },
+      } as never,
+      undefined,
+      {
+        author: { username: "bot" },
+        content: "Here is the invoice summary.",
+        createdAt: new Date("2026-10-25T16:10:00Z"),
+      } as never,
+      "America/Los_Angeles",
+    );
+    const stripped = stripChannelEnvelope(formatted);
+    expect(stripped).not.toContain("<channel");
+    expect(stripped).not.toContain("</channel>");
+    expect(stripped).toContain("what is the total on this one?");
+    expect(stripped.startsWith("<replying-to")).toBe(true);
   });
 });
 
