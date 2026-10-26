@@ -29,7 +29,12 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { stringify as yamlStringify, parse as yamlParse } from "yaml";
 import { extractWikilinks } from "./graph.js";
-import { shouldPromoteToHot, shouldDemoteToWarm, shouldArchiveToCold } from "./tiers.js";
+import {
+  shouldPromoteToHot,
+  shouldDemoteToWarm,
+  shouldArchiveToCold,
+  hasSessionDerivedTag,
+} from "./tiers.js";
 import type { TierConfig } from "./tiers.js";
 import { scoreAndRank, type ScoringConfig } from "./relevance.js";
 import type { MemoryStore } from "./store.js";
@@ -455,9 +460,19 @@ export class TierManager {
       this.log.info(this.ctx({ rewarmed }), "re-warmed recently accessed cold memories");
     }
 
-    // Step 1: Demote stale hot memories back to warm
+    // Step 1: Demote stale hot memories back to warm. Memory overhaul
+    // 2026-10-25 (WP1): session-derived rows (SESSION_DERIVED_TAGS) are
+    // demoted on sight as well, so rows promoted before the promotion
+    // scan excluded them free their slots on the next cycle instead of
+    // waiting out hotDemotionDays.
     const hotMemories = this.store.listByTier("hot", 1000);
     for (const mem of hotMemories) {
+      if (hasSessionDerivedTag(mem.tags)) {
+        this.store.updateTier(mem.id, "warm");
+        demoted++;
+        this.log.info(this.ctx({ id: mem.id }), "demoted hot -> warm (session-derived)");
+        continue;
+      }
       if (shouldDemoteToWarm(mem.accessedAt, now, this.tierConfig)) {
         this.store.updateTier(mem.id, "warm");
         demoted++;
@@ -474,6 +489,8 @@ export class TierManager {
     // backlink_count DESC so hubs surface first when the cap IS reached.
     // Phase 999.119 — the backlink count now rides on the candidate row
     // (one JOIN) instead of one COUNT(*) per candidate.
+    // WP1 — the store query already excludes session-derived rows, so
+    // neither the access path nor the centrality path can promote them.
     const warmMemories = this.store.listWarmCandidatesForPromotion(5000);
     const qualifyingWarm = warmMemories.filter((mem) =>
       shouldPromoteToHot(
@@ -517,9 +534,15 @@ export class TierManager {
   /**
    * Get current hot-tier memories sorted by importance descending.
    * Returns a frozen array of frozen MemoryEntry objects.
+   *
+   * WP1 — session-derived rows (SESSION_DERIVED_TAGS) are never returned,
+   * even when a row still carries tier='hot' from before the promotion
+   * scan excluded them; the next refreshHotTier demotes those.
    */
   getHotMemories(): readonly MemoryEntry[] {
-    const hot = this.store.listByTier("hot", 1000);
+    const hot = this.store
+      .listByTier("hot", 1000)
+      .filter((mem) => !hasSessionDerivedTag(mem.tags));
     const sorted = [...hot].sort((a, b) => b.importance - a.importance);
     return Object.freeze(sorted);
   }

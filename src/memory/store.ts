@@ -1391,6 +1391,14 @@ export class MemoryStore {
    *
    * Used by `TierManager.refreshHotTier`. Not used elsewhere; if a future
    * caller needs hot/cold variants, generalize the orderBy at that point.
+   *
+   * Memory overhaul 2026-10-25 (WP1) — session-derived rows (mid-session
+   * flushes, session summaries, raw fallbacks) are excluded here, which
+   * covers both the access-count path and the centrality path. On the
+   * production host 19 of 20 hot rows were flush rows that had reached hot
+   * through auto:similar backlinks. The tag list mirrors
+   * `SESSION_DERIVED_TAGS` in tiers.ts (pinned by a store test) and is
+   * matched through json_each like `findByTag`.
    */
   listWarmCandidatesForPromotion(limit: number): readonly TierScanCandidate[] {
     try {
@@ -1407,6 +1415,10 @@ export class MemoryStore {
              GROUP BY target_id
            ) lc ON lc.target_id = m.id
            WHERE m.tier = 'warm'
+             AND NOT EXISTS (
+               SELECT 1 FROM json_each(m.tags) AS sd
+               WHERE sd.value IN ('mid-session', 'session-summary', 'raw-fallback')
+             )
            ORDER BY COALESCE(lc.backlink_count, 0) DESC, m.accessed_at DESC
            LIMIT ?`,
         )

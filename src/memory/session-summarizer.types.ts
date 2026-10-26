@@ -33,6 +33,12 @@ export type SummarizerConfig = {
   readonly minTurns?: number;
   /** Importance assigned to the resulting MemoryEntry. Default 0.78. */
   readonly importance?: number;
+  /**
+   * WP1 (memory overhaul 2026-10-25) — minimum number of turns recorded
+   * since the previous mid-session flush before a new flush row is
+   * written. Default 4. Only read by flushSessionMidway.
+   */
+  readonly flushMinNewTurns?: number;
 };
 
 /** All dependencies required by the summarizer. Injected for testability. */
@@ -110,6 +116,15 @@ export type FlushSessionInput = {
    * trace the evolution of a long-running session post-mortem.
    */
   readonly flushSequence: number;
+  /**
+   * WP1 — explicit flush cursor: only turns with turnIndex greater than
+   * this are summarized. When omitted the cursor is recovered from the
+   * session's existing mid-session rows (their `flush-through:N` tag, or
+   * their sourceTurnIds for rows written before the tag existed), so the
+   * flush stays incremental across daemon restarts without any in-memory
+   * state.
+   */
+  readonly afterTurnIndex?: number;
 };
 
 /**
@@ -118,9 +133,13 @@ export type FlushSessionInput = {
  * `success: true` — a MemoryEntry tagged "mid-session" was written. The
  * underlying conversation session remains status="active" and its raw
  * turns remain intact — this is a checkpoint, not a termination.
+ * `turnCount` is the number of turns this flush summarized (the turns
+ * recorded since the previous flush), and `lastTurnIndex` is the cursor
+ * the row carries.
  *
  * `skipped: true` — the session was not in a flushable state (wrong status,
- * not found, zero turns).
+ * not found, zero turns) or fewer than `flushMinNewTurns` turns were
+ * recorded since the previous flush ("insufficient-new-turns").
  */
 export type FlushSessionResult =
   | {
@@ -129,12 +148,16 @@ export type FlushSessionResult =
       readonly fallback: SummarizeSuccessFallback;
       readonly turnCount: number;
       readonly flushSequence: number;
+      readonly lastTurnIndex: number;
     }
   | {
       readonly skipped: true;
       readonly reason:
         | "session-not-found"
         | "session-not-active"
-        | "zero-turns";
+        | "zero-turns"
+        | "insufficient-new-turns";
       readonly turnCount?: number;
+      /** WP1 — turns recorded since the previous flush (insufficient-new-turns). */
+      readonly newTurnCount?: number;
     };

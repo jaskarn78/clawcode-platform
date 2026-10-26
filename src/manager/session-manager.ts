@@ -3984,17 +3984,39 @@ export class SessionManager {
       return;
     }
     this.flushSequenceByAgent.set(name, 0);
+    // WP1 (memory overhaul 2026-10-25) — one flush in flight per timer. A
+    // tick that lands while the previous flush is still summarizing would
+    // read the same cursor and write a duplicate row.
+    let inFlight = false;
     const timer = setInterval(() => {
       // Non-blocking: fire-and-forget through trackSummary so drain() at
       // daemon shutdown waits for an in-flight flush.
       const convSessionId = this.activeConversationSessionIds.get(name);
       if (!convSessionId) return; // no active session — skip this tick
       if (this.draining) return; // shutdown in progress — new flushes pointless
+      if (inFlight) return; // previous flush still running — skip this tick
+      // WP1 — the sequence advances only when a row is written. The flush
+      // is incremental now: a tick with fewer than flushMinNewTurns new
+      // turns is skipped inside flushSessionMidway and must not consume a
+      // flush:N label, so the labels stay dense.
       const nextSeq = (this.flushSequenceByAgent.get(name) ?? 0) + 1;
-      this.flushSequenceByAgent.set(name, nextSeq);
-      void this.trackSummary(
-        this.flushSessionIfPossible(name, convSessionId, nextSeq),
-      ).catch((err) => {
+      inFlight = true;
+      const run = this.flushSessionIfPossible(name, convSessionId, nextSeq)
+        .then((result) => {
+          const stillThisTimer = this.flushTimers.get(name) === timer;
+          if (
+            result !== undefined &&
+            "success" in result &&
+            result.success &&
+            stillThisTimer
+          ) {
+            this.flushSequenceByAgent.set(name, nextSeq);
+          }
+        })
+        .finally(() => {
+          inFlight = false;
+        });
+      void this.trackSummary(run).catch((err) => {
         this.log.warn(
           {
             agent: name,
@@ -4034,12 +4056,18 @@ export class SessionManager {
    * Gap 3 (memory-persistence-gaps) — invoke the mid-session flush pipeline.
    * Mirrors summarizeSessionIfPossible's shape so tests can exercise the
    * production wiring end-to-end.
+   *
+   * WP1 — resolves with the flush result (undefined when the stores are
+   * missing or the pipeline threw) so the timer can advance the flush
+   * sequence only when a row was actually written. The cursor itself is
+   * recovered by flushSessionMidway from the session's existing flush
+   * rows, so nothing has to be tracked here across restarts.
    */
   private async flushSessionIfPossible(
     agentName: string,
     sessionId: string,
     flushSequence: number,
-  ): Promise<void> {
+  ): Promise<Awaited<ReturnType<typeof flushSessionMidway>> | undefined> {
     const memoryStore = this.memory.memoryStores.get(agentName);
     const conversationStore = this.memory.conversationStores.get(agentName);
     if (!memoryStore || !conversationStore) {
@@ -4047,10 +4075,10 @@ export class SessionManager {
         { agent: agentName, session: sessionId, flushSequence },
         "flush: missing memoryStore or conversationStore (non-fatal)",
       );
-      return;
+      return undefined;
     }
     try {
-      await flushSessionMidway(
+      return await flushSessionMidway(
         { agentName, sessionId, flushSequence },
         {
           conversationStore,
@@ -4071,6 +4099,7 @@ export class SessionManager {
         },
         "flush threw unexpectedly (non-fatal)",
       );
+      return undefined;
     }
   }
 

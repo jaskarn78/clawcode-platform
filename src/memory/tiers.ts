@@ -32,6 +32,32 @@ export type TierConfig = {
   readonly centralityPromoteThreshold: number;
 };
 
+/**
+ * Tags that mark session-derived checkpoint rows: mid-session flushes,
+ * final session summaries and their raw-turn fallbacks. These rows are
+ * pointers to conversation history, not standing facts. They never enter
+ * the hot tier, never seed or receive auto:similar links, and the default
+ * retrieval excludeTags already keeps them out of the pre-turn block. On
+ * the production host 19 of 20 hot rows were flush rows promoted through
+ * centrality, which is what this list exists to stop.
+ *
+ * Shared by tier-manager.ts, similarity.ts and the promotion SQL in
+ * store.ts (which mirrors the list inline, pinned by a store test).
+ */
+export const SESSION_DERIVED_TAGS: readonly string[] = Object.freeze([
+  "mid-session",
+  "session-summary",
+  "raw-fallback",
+]);
+
+/** True when any tag marks the row as session-derived (see SESSION_DERIVED_TAGS). */
+export function hasSessionDerivedTag(tags: readonly string[]): boolean {
+  for (const tag of tags) {
+    if (SESSION_DERIVED_TAGS.includes(tag)) return true;
+  }
+  return false;
+}
+
 /** Default tier configuration matching D-05/D-06/D-07/D-09 design decisions. */
 export const DEFAULT_TIER_CONFIG: Readonly<TierConfig> = Object.freeze({
   hotAccessThreshold: 3,

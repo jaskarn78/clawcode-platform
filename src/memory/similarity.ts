@@ -24,11 +24,21 @@
  * Phase 999.119 v2 switch — the scan runs in whichever space the agent
  * reads from (`getEmbeddingReadVersion`). Distances come back on the v1
  * scale, so the 0.6 threshold means the same thing under bge-small.
+ *
+ * Memory overhaul 2026-10-25 (WP1) — session-derived rows (mid-session
+ * flushes, session summaries, raw fallbacks; see SESSION_DERIVED_TAGS in
+ * tiers.ts) are never linked: not as the memory being scanned and not as
+ * a neighbour. Every flush row of a session is near-identical to its
+ * siblings, so they used to link to each other and to the summary in
+ * bulk, and that backlink mass was what promoted them to hot through the
+ * centrality path. Skipped rows are still stamped as scanned so the
+ * heartbeat cursor advances past them.
  */
 
 import type { Database as DatabaseType, Statement } from "better-sqlite3";
 import type { MemoryStore } from "./store.js";
 import type { EmbeddingReadVersion, QueryVector } from "./embedding-version.js";
+import { SESSION_DERIVED_TAGS } from "./tiers.js";
 
 /**
  * Compute cosine similarity between two L2-normalized vectors.
@@ -87,6 +97,8 @@ const KNN_K = 6;
 type LinkStatements = Readonly<{
   checkEdge: Statement;
   insertLink: Statement;
+  /** WP1 — one row when the memory carries any SESSION_DERIVED_TAGS tag. */
+  isSessionDerived: Statement;
 }>;
 
 type NeighborCounts = Readonly<{
@@ -105,6 +117,7 @@ const ZERO_RESULT: AutoLinkResult = Object.freeze({
 });
 
 function prepareLinkStatements(db: DatabaseType): LinkStatements {
+  const tagPlaceholders = SESSION_DERIVED_TAGS.map(() => "?").join(", ");
   return Object.freeze({
     checkEdge: db.prepare(
       `SELECT 1 FROM memory_links
@@ -113,7 +126,16 @@ function prepareLinkStatements(db: DatabaseType): LinkStatements {
     insertLink: db.prepare(
       "INSERT OR IGNORE INTO memory_links (source_id, target_id, link_text, created_at) VALUES (?, ?, ?, ?)",
     ),
+    isSessionDerived: db.prepare(
+      `SELECT 1 FROM memories m, json_each(m.tags) AS t
+       WHERE m.id = ? AND t.value IN (${tagPlaceholders}) LIMIT 1`,
+    ),
   });
+}
+
+/** WP1 — true when the memory is tagged with any of SESSION_DERIVED_TAGS. */
+function isSessionDerived(stmts: LinkStatements, memoryId: string): boolean {
+  return stmts.isSessionDerived.get(memoryId, ...SESSION_DERIVED_TAGS) !== undefined;
 }
 
 /**
@@ -162,6 +184,8 @@ function linkNeighbors(
     neighborsExamined++;
 
     if (neighbor.tier === "cold") continue;
+    // WP1 — never link into a flush row, summary row or raw fallback.
+    if (isSessionDerived(stmts, neighbor.memory_id)) continue;
 
     const similarity = 1 - neighbor.distance;
     if (similarity < similarityThreshold) continue;
@@ -202,11 +226,18 @@ export function autoLinkMemory(
   config?: Partial<AutoLinkConfig>,
 ): AutoLinkResult {
   const merged: AutoLinkConfig = { ...DEFAULT_CONFIG, ...config };
-  const query = storedQueryVector(store, memoryId, store.getEmbeddingReadVersion());
-  if (!query) return ZERO_RESULT;
-
   const db = store.getDatabase();
   const stmts = prepareLinkStatements(db);
+
+  // WP1 — a session-derived row never seeds links. Stamp it so the
+  // heartbeat cursor does not pick it up again.
+  if (isSessionDerived(stmts, memoryId)) {
+    store.markAutoLinked(memoryId);
+    return ZERO_RESULT;
+  }
+
+  const query = storedQueryVector(store, memoryId, store.getEmbeddingReadVersion());
+  if (!query) return ZERO_RESULT;
 
   const counts = db.transaction((): NeighborCounts => {
     const c = linkNeighbors(store, stmts, memoryId, query, merged.similarityThreshold);
@@ -232,8 +263,9 @@ export function autoLinkMemory(
  *    (never scanned first, then those scanned more than `rescanAfterDays` ago)
  * 2. For each candidate, find top-5 KNN neighbors via sqlite-vec
  * 3. For each similar pair above threshold, create bidirectional edges
- * 4. Skip already-linked pairs, cold neighbours and memories without
- *    embeddings; stamp the candidate as scanned
+ * 4. Skip already-linked pairs, cold neighbours, session-derived rows
+ *    (either side) and memories without embeddings; stamp the candidate
+ *    as scanned
  *
  * Each candidate is its own transaction: a failure is counted and the
  * pass continues with the next candidate.
@@ -257,7 +289,11 @@ export function discoverAutoLinks(
   let firstError: string | null = null;
 
   const scanOne = db.transaction((memoryId: string): void => {
-    const query = storedQueryVector(store, memoryId, version);
+    // WP1 — session-derived candidates are stamped and skipped: they
+    // must not seed auto:similar edges (see the module doc).
+    const query = isSessionDerived(stmts, memoryId)
+      ? null
+      : storedQueryVector(store, memoryId, version);
     if (query) {
       const c = linkNeighbors(store, stmts, memoryId, query, merged.similarityThreshold);
       linksCreated += c.linksCreated;

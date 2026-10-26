@@ -21,9 +21,39 @@ import type {
   SummarizeSessionResult,
   SummarizeSuccessFallback,
 } from "./session-summarizer.types.js";
+import type { MemoryStore } from "./store.js";
+import type { MemoryEntry } from "./types.js";
 
 /** Maximum combined character length before proportional truncation. */
 export const MAX_PROMPT_CHARS = 30_000;
+
+/**
+ * WP1 (memory overhaul 2026-10-25) — floor for the per-turn budget. A
+ * ConversationStore session spans the agent's whole uptime, so a purely
+ * proportional cut gave a 1000-turn session 30 characters per turn and
+ * the final summary carried nothing usable. Below this floor whole oldest
+ * turns are dropped instead (the most recent MAX_PROMPT_CHARS /
+ * MIN_CHARS_PER_TURN turns are kept).
+ */
+export const MIN_CHARS_PER_TURN = 300;
+
+/** Marker inserted where a turn was cut. Tests and operators grep for it. */
+const TRUNCATION_MARKER = "\n\n[...truncated due to length]\n\n";
+
+/**
+ * WP1 — cut a turn to `maxChars` keeping its head and its tail (60/40)
+ * around a marker, so a long answer keeps both its opening and its
+ * conclusion. Content at or under the budget is returned unchanged.
+ */
+export function truncateHeadTail(content: string, maxChars: number): string {
+  if (content.length <= maxChars) return content;
+  const budget = Math.max(0, Math.floor(maxChars));
+  const headChars = Math.ceil(budget * 0.6);
+  const tailChars = budget - headChars;
+  const head = content.slice(0, headChars);
+  const tail = tailChars > 0 ? content.slice(content.length - tailChars) : "";
+  return head + TRUNCATION_MARKER + tail;
+}
 
 /**
  * Default timeout for the summarize() LLM call.
@@ -60,30 +90,55 @@ export const DEFAULT_IMPORTANCE = 0.78;
  * Truncates proportionally if total content exceeds MAX_PROMPT_CHARS
  * (mirrors consolidation.ts:199-244 pattern — Pitfall 6 in 66-RESEARCH).
  *
+ * WP1 — each cut turn keeps its head and its tail (truncateHeadTail) so
+ * conclusions survive, and when the per-turn budget would fall under
+ * MIN_CHARS_PER_TURN the oldest whole turns are dropped instead. With
+ * `opts.segment` the instruction block describes a segment of an ongoing
+ * session (the mid-session flush) rather than a completed one.
+ *
  * An empty `turns` array still returns a valid prompt — the instruction
  * block is always present so callers cannot produce a malformed request.
  */
 export function buildSessionSummarizationPrompt(
   turns: readonly ConversationTurn[],
+  opts?: { readonly segment?: boolean },
 ): string {
-  const totalChars = turns.reduce((sum, t) => sum + t.content.length, 0);
+  const maxTurns = Math.max(1, Math.floor(MAX_PROMPT_CHARS / MIN_CHARS_PER_TURN));
+  const omitted = Math.max(0, turns.length - maxTurns);
+  const kept = omitted > 0 ? turns.slice(omitted) : turns;
+
+  const totalChars = kept.reduce((sum, t) => sum + t.content.length, 0);
   const needsTruncation = totalChars > MAX_PROMPT_CHARS;
   const maxPerTurn =
-    turns.length > 0
-      ? Math.floor(MAX_PROMPT_CHARS / turns.length)
+    kept.length > 0
+      ? Math.floor(MAX_PROMPT_CHARS / kept.length)
       : MAX_PROMPT_CHARS;
 
   const sections: string[] = [];
-  for (const turn of turns) {
+  for (const turn of kept) {
     let content = turn.content;
     if (needsTruncation && content.length > maxPerTurn) {
-      content =
-        content.slice(0, maxPerTurn) + "\n\n[...truncated due to length]";
+      content = truncateHeadTail(content, maxPerTurn);
     }
     sections.push(`### ${turn.role} (turn ${turn.turnIndex})\n\n${content}`);
   }
 
-  const instructions = `You are summarizing a completed conversation session into a structured memory entry.
+  const subject = opts?.segment
+    ? "a segment of an ongoing conversation session (the turns recorded since the previous checkpoint)"
+    : "a completed conversation session";
+  const notes: string[] = [];
+  if (omitted > 0) {
+    notes.push(
+      `Note: the ${omitted} earliest turn(s) were omitted; only the most recent ${kept.length} turns are shown.`,
+    );
+  }
+  if (needsTruncation) {
+    notes.push(
+      "Note: some turn content was truncated due to length (the start and the end of each cut turn are kept). Summarize what is available.",
+    );
+  }
+
+  const instructions = `You are summarizing ${subject} into a structured memory entry.
 Extract and organize the following from the turns below:
 
 ## User Preferences
@@ -101,7 +156,7 @@ List explicit commitments made by either party (deadlines, promised actions, fol
 Format your response as clean markdown with the exact section headers above.
 If a category has nothing, write "(none)" under it — do not omit the header.
 Be concise but preserve specific names, dates, and technical details.
-${needsTruncation ? "\nNote: Some turn content was truncated due to length. Summarize what is available." : ""}
+${notes.length > 0 ? "\n" + notes.join("\n") : ""}
 
 ---
 
@@ -437,6 +492,38 @@ export async function summarizeSession(
     }
   }
 
+  // WP1 (memory overhaul 2026-10-25) — the final summary supersedes every
+  // mid-session flush row of this session: delete them so they stop
+  // crowding search, dedup and the auto-linker. Runs whenever the summary
+  // row exists (even when markSummarized raced with another summarizer:
+  // either summary supersedes the checkpoints), through the store's
+  // delete path so vectors and links go with them. Non-fatal.
+  try {
+    const removed = deleteMidSessionRows(deps.memoryStore, sessionId);
+    if (removed.deleted > 0 || removed.failed > 0) {
+      deps.log.info(
+        {
+          agent: agentName,
+          session: sessionId,
+          memoryId,
+          deletedFlushRows: removed.deleted,
+          failedFlushRows: removed.failed,
+        },
+        "deleted mid-session flush rows superseded by the session summary",
+      );
+    }
+  } catch (err) {
+    deps.log.warn(
+      {
+        agent: agentName,
+        session: sessionId,
+        memoryId,
+        error: (err as Error).message,
+      },
+      "mid-session flush cleanup failed after summarization (non-fatal)",
+    );
+  }
+
   // 260419-q2z Fix A — emit a distinct info log for short-session summaries
   // so dashboards and log-filters can surface them separately from the
   // "session summarized" line fired by session-manager.ts on the Haiku path.
@@ -466,8 +553,92 @@ export async function summarizeSession(
 // Gap 3 (memory-persistence-gaps) — mid-session flush
 // ---------------------------------------------------------------------------
 
-/** Importance for mid-session flush entries — slightly lower than final summaries. */
-export const DEFAULT_FLUSH_IMPORTANCE = 0.65;
+/**
+ * Importance for mid-session flush entries.
+ *
+ * WP1 (memory overhaul 2026-10-25): 0.65 to 0.4. Flush rows are
+ * checkpoints that the final session summary supersedes and deletes; at
+ * 0.65 they outranked most saved facts in every importance-weighted path.
+ */
+export const DEFAULT_FLUSH_IMPORTANCE = 0.4;
+
+/**
+ * WP1 — minimum turns recorded since the previous flush before a new row
+ * is written. Below this the tick is a cheap skip (no Haiku call, no row).
+ */
+export const DEFAULT_FLUSH_MIN_NEW_TURNS = 4;
+
+/** Tag carried by every mid-session flush row. */
+export const MID_SESSION_TAG = "mid-session";
+
+/** WP1 — cursor tag on flush rows: `flush-through:<turnIndex>`. */
+export const FLUSH_THROUGH_TAG_PREFIX = "flush-through:";
+
+/** `session:<id>` tag shared by flush rows and the final session summary. */
+export function sessionTag(sessionId: string): string {
+  return `session:${sessionId}`;
+}
+
+/** WP1 — every mid-session flush row written for `sessionId`. */
+export function listMidSessionRows(
+  memoryStore: Pick<MemoryStore, "findByTag">,
+  sessionId: string,
+): readonly MemoryEntry[] {
+  return memoryStore
+    .findByTag(sessionTag(sessionId))
+    .filter((row) => row.tags.includes(MID_SESSION_TAG));
+}
+
+/**
+ * WP1 — the highest turnIndex already covered by a mid-session flush row
+ * of `sessionId`, or -1 when nothing has been flushed yet. Reads the
+ * `flush-through:N` tag and falls back to the row's sourceTurnIds (rows
+ * written before the tag existed), so a daemon restart or a legacy row
+ * never causes the whole session to be re-summarized.
+ */
+export function findLastFlushedTurnIndex(
+  memoryStore: Pick<MemoryStore, "findByTag">,
+  sessionId: string,
+  turns: readonly ConversationTurn[],
+): number {
+  const indexById = new Map<string, number>();
+  for (const turn of turns) indexById.set(turn.id, turn.turnIndex);
+
+  let cursor = -1;
+  for (const row of listMidSessionRows(memoryStore, sessionId)) {
+    for (const tag of row.tags) {
+      if (!tag.startsWith(FLUSH_THROUGH_TAG_PREFIX)) continue;
+      const n = Number(tag.slice(FLUSH_THROUGH_TAG_PREFIX.length));
+      if (Number.isInteger(n) && n > cursor) cursor = n;
+    }
+    for (const turnId of row.sourceTurnIds ?? []) {
+      const turnIndex = indexById.get(turnId);
+      if (turnIndex !== undefined && turnIndex > cursor) cursor = turnIndex;
+    }
+  }
+  return cursor;
+}
+
+/**
+ * WP1 — delete every mid-session flush row of `sessionId` through the
+ * store's delete path (vectors, links and the session FK go with it).
+ * Per-row failures are counted and skipped; only the lookup can throw.
+ */
+export function deleteMidSessionRows(
+  memoryStore: Pick<MemoryStore, "findByTag" | "delete">,
+  sessionId: string,
+): { readonly deleted: number; readonly failed: number } {
+  let deleted = 0;
+  let failed = 0;
+  for (const row of listMidSessionRows(memoryStore, sessionId)) {
+    try {
+      if (memoryStore.delete(row.id)) deleted++;
+    } catch {
+      failed++;
+    }
+  }
+  return Object.freeze({ deleted, failed });
+}
 
 /**
  * Write a non-terminating mid-session summary.
@@ -478,12 +649,21 @@ export const DEFAULT_FLUSH_IMPORTANCE = 0.65;
  *   - Does NOT call markSummarized — the session stays live.
  *   - Does NOT delete raw turns — they are still needed for future flushes
  *     and for the final session-boundary summary.
- *   - Writes a MemoryEntry tagged ["mid-session", `session:${id}`, `flush:${N}`]
- *     with `skipDedup: true` so multiple flushes coexist.
+ *   - Writes a MemoryEntry tagged ["mid-session", `session:${id}`,
+ *     `flush:${N}`, `flush-through:${turnIndex}`] with `skipDedup: true`
+ *     so multiple flushes coexist.
+ *
+ * WP1 (memory overhaul 2026-10-25) — the flush is incremental: only the
+ * turns recorded since the previous flush (cursor from
+ * `input.afterTurnIndex`, else recovered from the session's existing flush
+ * rows) are summarized, and a tick with fewer than `flushMinNewTurns`
+ * (default 4) new turns is skipped without a Haiku call. Previously every
+ * tick re-summarized the whole session, which on the production host
+ * produced 95 percent of all memory rows. The final summary deletes the
+ * flush rows (see summarizeSession).
  *
  * Pipeline mirrors summarizeSession (same prompt, same timeout, same fallback
- * semantics) so the two code paths produce compatible summaries. The only
- * behavioural difference is the terminal-ness check and the cleanup steps.
+ * semantics) so the two code paths produce compatible summaries.
  *
  * All paths are non-fatal: flushSessionMidway NEVER throws to its caller.
  * It is safe to wire to a setInterval without a catch block.
@@ -496,6 +676,8 @@ export async function flushSessionMidway(
   const timeoutMs = deps.config?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const minTurns = deps.config?.minTurns ?? DEFAULT_MIN_TURNS;
   const importance = deps.config?.importance ?? DEFAULT_FLUSH_IMPORTANCE;
+  const minNewTurns =
+    deps.config?.flushMinNewTurns ?? DEFAULT_FLUSH_MIN_NEW_TURNS;
 
   // Step 1 — load session
   const session = deps.conversationStore.getSession(sessionId);
@@ -529,16 +711,45 @@ export async function flushSessionMidway(
     });
   }
 
-  // Step 4-7 — content source (mirrors summarizeSession)
-  const shortSession = turns.length < minTurns;
+  // Step 3b (WP1) — only the turns after the previous flush's cursor.
+  const afterTurnIndex =
+    input.afterTurnIndex ??
+    findLastFlushedTurnIndex(deps.memoryStore, sessionId, turns);
+  const newTurns = turns.filter((t) => t.turnIndex > afterTurnIndex);
+  if (newTurns.length < minNewTurns) {
+    deps.log.debug(
+      {
+        agent: agentName,
+        session: sessionId,
+        flushSequence,
+        afterTurnIndex,
+        newTurnCount: newTurns.length,
+        minNewTurns,
+      },
+      "flush skipped: not enough new turns since the previous flush",
+    );
+    return Object.freeze({
+      skipped: true as const,
+      reason: "insufficient-new-turns" as const,
+      turnCount: turns.length,
+      newTurnCount: newTurns.length,
+    });
+  }
+  const lastTurnIndex = newTurns.reduce(
+    (max, t) => (t.turnIndex > max ? t.turnIndex : max),
+    afterTurnIndex,
+  );
+
+  // Step 4-7 — content source (mirrors summarizeSession) over the new turns
+  const shortSession = newTurns.length < minTurns;
   let summaryContent: string;
   let fallback: SummarizeSuccessFallback;
 
   if (shortSession) {
-    summaryContent = buildShortSessionSummary(turns);
+    summaryContent = buildShortSessionSummary(newTurns);
     fallback = "short-session";
   } else {
-    const prompt = buildSessionSummarizationPrompt(turns);
+    const prompt = buildSessionSummarizationPrompt(newTurns, { segment: true });
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -566,7 +777,7 @@ export async function flushSessionMidway(
         },
         "flush summarize failed — using raw-turn fallback",
       );
-      summaryContent = buildRawTurnFallback(turns);
+      summaryContent = buildRawTurnFallback(newTurns);
       fallback = "raw-turn";
     } finally {
       clearTimeout(timer);
@@ -596,17 +807,19 @@ export async function flushSessionMidway(
 
   // Step 9 — tags + insert. Note the distinct `mid-session` discriminator
   // so post-mortem queries can filter final summaries vs. intermediate
-  // checkpoints. `skipDedup: true` because repeated flushes intentionally
+  // checkpoints, and the `flush-through:N` cursor the next flush resumes
+  // from. `skipDedup: true` because repeated flushes intentionally
   // produce distinct memory rows.
   const baseTags: string[] = [
-    "mid-session",
-    `session:${sessionId}`,
+    MID_SESSION_TAG,
+    sessionTag(sessionId),
     `flush:${flushSequence}`,
+    `${FLUSH_THROUGH_TAG_PREFIX}${lastTurnIndex}`,
   ];
   if (fallback === "raw-turn") baseTags.push("raw-fallback");
   if (fallback === "short-session") baseTags.push("short");
   const tags = Object.freeze([...baseTags]);
-  const sourceTurnIds = Object.freeze(turns.map((t) => t.id));
+  const sourceTurnIds = Object.freeze(newTurns.map((t) => t.id));
 
   let memoryId: string;
   try {
@@ -646,7 +859,9 @@ export async function flushSessionMidway(
       memoryId,
       flushSequence,
       fallback,
-      turnCount: turns.length,
+      turnCount: newTurns.length,
+      afterTurnIndex,
+      lastTurnIndex,
     },
     "mid-session flush written",
   );
@@ -655,7 +870,8 @@ export async function flushSessionMidway(
     success: true as const,
     memoryId,
     fallback,
-    turnCount: turns.length,
+    turnCount: newTurns.length,
     flushSequence,
+    lastTurnIndex,
   });
 }
