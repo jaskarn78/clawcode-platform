@@ -171,6 +171,9 @@ export async function runDreamAction(
   log.info(
     {
       agent: response.agent,
+      // The model that really served the pass (the daemon reports it; it
+      // used to be Haiku whatever --model or dream.model said).
+      model: response.outcome.kind === "completed" ? response.outcome.model : undefined,
       tokensIn: response.outcome.kind === "completed" ? response.outcome.tokensIn : 0,
       tokensOut: response.outcome.kind === "completed" ? response.outcome.tokensOut : 0,
       durationMs: response.outcome.kind === "completed" ? response.outcome.durationMs : 0,

@@ -119,5 +119,7 @@ export const appendDreamWikilinks: AppendDreamWikilinksFn = async ({
 
   const next: DreamGraphEdgesFile = { edges };
   await atomicWrite(finalPath, JSON.stringify(next, null, 2) + "\n");
-  return { added: additions.length };
+  // Additions sit at the tail, so only a pass proposing more than the cap
+  // on its own loses any of them; report the ones that were persisted.
+  return { added: Math.min(additions.length, edges.length) };
 };

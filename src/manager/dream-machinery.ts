@@ -77,19 +77,29 @@ export function resolveDreamPolicy(
 export const LAST_TURN_SESSION_SCAN_LIMIT = 5;
 
 /**
- * Novelty-gate floor: an idle agent dreams at most once per 6 hours when
- * nothing new has been written, and never more often than the cron cadence
- * when something has. Replaces the "every idle tick" behavior (50 to 80
- * passes a day per idle agent on the live host).
+ * Novelty-gate floor: one pass per 6 hours per agent is guaranteed even when
+ * nothing new was written (a safety net, so a novelty signal that misses a
+ * write can never silence dreaming for good). Between floors a pass runs
+ * only when memory was written after the last applied pass. Replaces the
+ * "every idle tick" behavior (50 to 80 passes a day per idle agent on the
+ * live host).
  */
 export const DREAM_PASS_FLOOR_MS = 6 * 60 * 60 * 1000;
 
 /**
  * Rows scanned when looking for memory written after the last pass. The
  * store orders both lists newest-first, so the first row that is not a
- * dream artifact (chunks) or a periodic flush (memories) decides.
+ * dream artifact (chunks) or a periodic flush (memories) decides. Sized so
+ * a day's dream log (one chunk per section, all sharing one file mtime)
+ * cannot hide a newer real chunk behind it.
  */
-export const NOVELTY_SCAN_LIMIT = 50;
+export const NOVELTY_SCAN_LIMIT = 200;
+
+/**
+ * Over-fetch factor for the pass's own "recent chunks" input, so dropping
+ * the dream artifacts still leaves the full chunk budget of real memory.
+ */
+const RECENT_CHUNK_OVERFETCH = 4;
 
 /**
  * Tags on memories rows that are re-summaries of turns already captured
@@ -194,8 +204,8 @@ export interface DreamMachineryDeps {
   readonly resolveMemoryDir?: (agent: string) => string;
   /**
    * One-shot LLM call for the dream-pass prompt. Production wires
-   * `callHaikuDirect`; tests inject a stub. Mirrors the dispatch
-   * contract the dream-pass primitive expects.
+   * `callModelDirect` with the requested model; tests inject a stub.
+   * Mirrors the dispatch contract the dream-pass primitive expects.
    */
   readonly dispatch: (req: {
     readonly model: string;
@@ -206,6 +216,8 @@ export interface DreamMachineryDeps {
     readonly rawText: string;
     readonly tokensIn: number;
     readonly tokensOut: number;
+    /** Model that really served the call, when the dispatcher knows it. */
+    readonly model?: string;
   }>;
   readonly now: () => Date;
   readonly log: Logger;
@@ -339,25 +351,24 @@ export function buildDreamMachinery(
   // timing attribution is slightly off — acceptable for a diagnostic log.
   const passStartedAt = new Map<string, { iso: string; ms: number }>();
 
-  // Last APPLIED pass per agent (ms). Loaded lazily from the manager-dir
-  // record so the floor survives a daemon restart; written on every
-  // applied pass.
+  // Last APPLIED pass per agent (ms). The manager-dir record is the source
+  // of truth and is re-read on every gate check: the daemon builds one
+  // machinery for the cron and a fresh one per manual IPC call, so a value
+  // cached here would miss a manual pass. The in-memory map only covers a
+  // failed record write (the newer of the two wins).
   const lastPassMs = new Map<string, number>();
   const loadLastPassMs = async (agent: string): Promise<number | null> => {
-    const cached = lastPassMs.get(agent);
-    if (cached !== undefined) return cached;
     const { readLastDreamPass } = await import("./dream-last-pass.js");
     const iso = await readLastDreamPass(agent, deps.dreamRunLogDir);
-    if (iso === null) return null;
-    const ms = Date.parse(iso);
-    if (Number.isNaN(ms)) return null;
-    lastPassMs.set(agent, ms);
-    return ms;
+    const fromFile = iso === null ? Number.NaN : Date.parse(iso);
+    const inMemory = lastPassMs.get(agent);
+    if (Number.isNaN(fromFile)) return inMemory ?? null;
+    return inMemory === undefined ? fromFile : Math.max(fromFile, inMemory);
   };
-  const recordLastPass = async (agent: string, at: Date): Promise<void> => {
-    lastPassMs.set(agent, at.getTime());
+  const recordLastPass = async (agent: string, atMs: number): Promise<void> => {
+    lastPassMs.set(agent, Math.max(atMs, lastPassMs.get(agent) ?? atMs));
     const { writeLastDreamPass } = await import("./dream-last-pass.js");
-    await writeLastDreamPass(agent, at.toISOString(), deps.dreamRunLogDir);
+    await writeLastDreamPass(agent, new Date(atMs).toISOString(), deps.dreamRunLogDir);
   };
 
   const noveltyGate = async (agent: string): Promise<DreamNoveltyDecision> => {
@@ -404,7 +415,7 @@ export function buildDreamMachinery(
           // reflection digest) so the reflection daemon reads memory, not
           // its previous reflections.
           return memoryStore
-            .listRecentMemoryChunks(limit * 2)
+            .listRecentMemoryChunks(limit * RECENT_CHUNK_OVERFETCH)
             .filter((c) => !isDreamArtifactPath(c.path))
             .slice(0, limit);
         } catch (err) {
@@ -702,9 +713,11 @@ export function buildDreamMachinery(
           );
         }
       }
-      // Recorded after the digest write so the digest's own chunk (file
-      // mtime) never counts as novelty for the next tick.
-      await recordLastPass(agent, now());
+      // The record is the pass START (when it read memory), so anything
+      // written while the model was running still counts as novelty for
+      // the next tick. The pass's own outputs (dream log, reflection
+      // digest) are excluded from novelty by path, not by time.
+      await recordLastPass(agent, passStartedAt.get(agent)?.ms ?? now().getTime());
     }
 
     await recordDreamRun(agent, outcome, applied, undefined);

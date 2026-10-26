@@ -59,6 +59,27 @@ describe("dream-last-pass", () => {
     expect(await readLastDreamPass("beta", dir)).toBeNull();
   });
 
+  it("keeps every agent when many agents finish a pass at the same moment", async () => {
+    // All agents' crons fire on the same minute; the shared file must not
+    // lose an agent to a read-modify-write race.
+    const agents = Array.from({ length: 12 }, (_, i) => `agent-${i}`);
+    await Promise.all(
+      agents.map((a, i) =>
+        writeLastDreamPass(a, new Date(Date.UTC(2026, 9, 25, 10, i)).toISOString(), dir),
+      ),
+    );
+    for (const [i, a] of agents.entries()) {
+      expect(await readLastDreamPass(a, dir)).toBe(new Date(Date.UTC(2026, 9, 25, 10, i)).toISOString());
+    }
+  });
+
+  it("never moves a record backwards in time", async () => {
+    await writeLastDreamPass("atlas", "2026-10-25T12:00:00.000Z", dir);
+    // An overlapping manual pass that started earlier but finished later.
+    await writeLastDreamPass("atlas", "2026-10-25T11:00:00.000Z", dir);
+    expect(await readLastDreamPass("atlas", dir)).toBe("2026-10-25T12:00:00.000Z");
+  });
+
   it("never throws when the directory cannot be created", async () => {
     await expect(
       writeLastDreamPass("atlas", "2026-10-25T10:00:00.000Z", join(dir, "blocked", "\0bad")),

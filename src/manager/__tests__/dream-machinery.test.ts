@@ -314,11 +314,12 @@ describe("hasNewMemorySince", () => {
     throws?: boolean;
   }) {
     return {
-      listRecentMemoryChunks: () => {
+      // Honors `limit` like the real store, so the scan window is tested.
+      listRecentMemoryChunks: (limit: number) => {
         if (opts.throws) throw new Error("db closed");
-        return opts.chunks ?? [];
+        return (opts.chunks ?? []).slice(0, limit);
       },
-      listRecent: () => opts.memories ?? [],
+      listRecent: (limit: number) => (opts.memories ?? []).slice(0, limit),
     };
   }
 
@@ -378,9 +379,24 @@ describe("hasNewMemorySince", () => {
   it("fails open on a store error", () => {
     expect(hasNewMemorySince(store({ throws: true }), since)).toBe(true);
   });
+
+  it("looks past a day's worth of dream-log chunks to find a newer real chunk", () => {
+    // One chunk per dream-log section, all sharing the file's mtime, sorted
+    // ahead of a real daily-log chunk written after the last pass.
+    const dreamLog = Array.from({ length: 80 }, () => ({
+      path: "/w/memory/dreams/2026-10-25.md",
+      lastModified: new Date(since + 120_000),
+    }));
+    expect(
+      hasNewMemorySince(
+        store({ chunks: [...dreamLog, { path: "/w/memory/2026-10-25.md", lastModified: newer }] }),
+        since,
+      ),
+    ).toBe(true);
+  });
 });
 
-describe("buildDreamMachinery — novelty gate, last-pass record, digest, idle minutes (WP7)", () => {
+describe("buildDreamMachinery: novelty gate, last-pass record, digest, idle minutes (WP7)", () => {
   let tmpRoot: string;
   let runLogDir: string;
   let memoryRoot: string;
@@ -636,5 +652,74 @@ describe("buildDreamMachinery — novelty gate, last-pass record, digest, idle m
     expect(prompts[0]).toContain("REAL-DAILY-LOG");
     expect(prompts[0]).not.toContain("PRIOR-REFLECTION");
     expect(prompts[0]).not.toContain("PRIOR-DREAM-LOG");
+  });
+  it("gate: a pass recorded by another machinery instance (a manual IPC pass) is seen without a restart", async () => {
+    const rows: StoreRows = { chunks: [], memories: [] };
+    // The cron builds one machinery and keeps it; each manual IPC call
+    // builds its own. The cron instance must see the manual pass.
+    const cron = buildDreamMachinery(makeDeps(rows));
+    await cron.applyDreamResult("agent-a", outcome());
+    clock = new Date(T0.getTime() + 5 * 3_600_000);
+    const manual = buildDreamMachinery(makeDeps(rows));
+    await manual.applyDreamResult("agent-a", outcome());
+    // 5h after the first pass but only 1h after the manual one: the floor
+    // is measured from the manual pass.
+    clock = new Date(T0.getTime() + 6 * 3_600_000);
+    expect(await cron.noveltyGate("agent-a")).toEqual({
+      skip: true,
+      reason: "no-new-memory",
+      lastPassAt: new Date(T0.getTime() + 5 * 3_600_000).toISOString(),
+    });
+  });
+
+  it("gate: the record is the pass start, so memory written while the model ran still counts", async () => {
+    const rows: StoreRows = { chunks: [], memories: [] };
+    const dispatch: DreamMachineryDeps["dispatch"] = async () => {
+      // A user turn lands (daily-log chunk indexed) while the model runs.
+      rows.chunks.unshift({
+        id: "mid",
+        path: join(memoryDir, "2026-08-28.md"),
+        body: "written during the pass",
+        lastModified: new Date(T0.getTime() + 30_000),
+      });
+      clock = new Date(T0.getTime() + 60_000);
+      return {
+        rawText: JSON.stringify({
+          newWikilinks: [],
+          promotionCandidates: [],
+          themedReflection: "r",
+          suggestedConsolidations: [],
+        }),
+        tokensIn: 1,
+        tokensOut: 1,
+      };
+    };
+    const m = buildDreamMachinery(makeDeps(rows, { dispatch }));
+    const out = await m.runDreamPass("agent-a", "haiku");
+    expect(out.kind).toBe("completed");
+    expect((await m.applyDreamResult("agent-a", out)).kind).toBe("applied");
+    expect(await readLastDreamPass("agent-a", runLogDir)).toBe(T0.toISOString());
+    clock = new Date(T0.getTime() + 30 * 60_000);
+    expect(await m.noveltyGate("agent-a")).toMatchObject({ skip: false, reason: "new-memory" });
+  });
+
+  it("runDreamPass: the dispatcher's reported model reaches the outcome and the run log", async () => {
+    const dispatch: DreamMachineryDeps["dispatch"] = async (req) => ({
+      rawText: JSON.stringify({
+        newWikilinks: [],
+        promotionCandidates: [],
+        themedReflection: "r",
+        suggestedConsolidations: [],
+      }),
+      tokensIn: 1,
+      tokensOut: 1,
+      model: req.model,
+    });
+    const m = buildDreamMachinery(makeDeps({ chunks: [], memories: [] }, { dispatch }));
+    const out = await m.runDreamPass("agent-a", "opus");
+    expect(out.kind === "completed" && out.model).toBe("opus");
+    await m.applyDreamResult("agent-a", out);
+    const rows = await listRecentDreamRuns(10, runLogDir);
+    expect(rows[0]).toMatchObject({ status: "applied", model: "opus" });
   });
 });

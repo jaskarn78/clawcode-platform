@@ -171,6 +171,18 @@ describe("appendDreamWikilinks", () => {
     ]);
   });
 
+  it("reports only the additions that were persisted when one pass exceeds the cap", async () => {
+    const links = Array.from({ length: MAX_GRAPH_EDGES + 5 }, (_, i) => ({
+      from: `memory/n-${i}.md`,
+      to: `memory/m-${i}.md`,
+    }));
+    const result = await appendDreamWikilinks({ memoryRoot: dir, links, now: () => FIXED_NOW });
+    expect(result.added).toBe(MAX_GRAPH_EDGES);
+    const parsed = JSON.parse(await readFile(join(dir, "graph-edges.json"), "utf8"));
+    expect(parsed.edges).toHaveLength(MAX_GRAPH_EDGES);
+    expect(parsed.edges[0].from).toBe("memory/n-5.md");
+  });
+
   it("removes duplicates already on disk, keeping the first occurrence", async () => {
     const filePath = join(dir, "graph-edges.json");
     await writeFile(

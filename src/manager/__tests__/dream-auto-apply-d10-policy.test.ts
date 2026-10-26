@@ -591,7 +591,7 @@ describe("D-10 hybrid 5-row policy", () => {
     });
   });
 
-  describe("dream log entry — real idle minutes (WP7)", () => {
+  describe("dream log entry: real idle minutes (WP7)", () => {
     it("threads the caller's idleMinutes into the writeDreamLog entry", async () => {
       const writeDreamLog = vi.fn().mockResolvedValue({ logPath: "/tmp/x/dreams/d.md", appended: false });
       const vetoStore = {

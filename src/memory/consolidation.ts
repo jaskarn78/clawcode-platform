@@ -83,17 +83,20 @@ const MAX_PROMPT_CHARS = 30000;
 export const WEEKLY_CONSOLIDATION_GRACE_MS = 2 * 24 * 60 * 60 * 1000;
 
 /**
- * Weekly eligibility. The week must have ended more than
- * WEEKLY_CONSOLIDATION_GRACE_MS ago and hold at least
- * `min(weeklyThreshold, daysWithLogs)` daily files.
+ * Weekly eligibility. A past ISO week is eligible when it holds at least
+ * `min(weeklyThreshold, daysWithLogs)` daily files and it ended more than
+ * WEEKLY_CONSOLIDATION_GRACE_MS ago.
  *
  * WHY: the default threshold is 7 and files are grouped per ISO week (at
  * most 7), so an agent that does not log every single day never produced a
  * weekly digest and never archived its logs; dated conversation then left
  * automatic recall after the 14-day window with no digest to stand in for
- * it. Taking the minimum means the threshold can never ask for more days
- * than the week actually has, so a weekday-only agent consolidates once the
- * week is two days behind it.
+ * it. Capping the threshold at the days that actually have logs means it
+ * can never ask for more files than the week has, so any past week with at
+ * least one daily log is consolidated once the grace window has passed.
+ * The grace applies to every week, including full ones: a log dated in the
+ * agent's time zone can still be appended for hours after the host's ISO
+ * week has rolled over, and archiving moves the file.
  */
 export function isWeekEligibleForConsolidation(params: {
   readonly daysWithLogs: number;
@@ -102,7 +105,7 @@ export function isWeekEligibleForConsolidation(params: {
   readonly now: Date;
 }): boolean {
   if (params.daysWithLogs <= 0) return false;
-  const required = Math.min(params.weeklyThreshold, params.daysWithLogs);
+  const required = Math.max(1, Math.min(params.weeklyThreshold, params.daysWithLogs));
   if (params.daysWithLogs < required) return false;
   return params.now.getTime() - params.weekEnd.getTime() > WEEKLY_CONSOLIDATION_GRACE_MS;
 }
@@ -115,7 +118,9 @@ export function isWeekEligibleForConsolidation(params: {
 export function truncateHeadAndTail(content: string, maxChars: number): string {
   if (content.length <= maxChars) return content;
   const marker = "\n\n[...middle of this day truncated due to length...]\n\n";
-  const budget = Math.max(0, maxChars - marker.length);
+  // A budget too small to hold the marker keeps the head only.
+  if (maxChars <= marker.length) return content.slice(0, Math.max(0, maxChars));
+  const budget = maxChars - marker.length;
   const headChars = Math.ceil(budget / 2);
   const tailChars = budget - headChars;
   const head = content.slice(0, headChars);
@@ -177,8 +182,10 @@ export type ConsolidationDeps = {
 
 /**
  * Scan memoryDir for daily log files matching YYYY-MM-DD.md, group by
- * ISO week, and return groups with >= threshold files that have no
- * existing weekly digest.
+ * ISO week, and return the past weeks that have no weekly digest yet and
+ * pass isWeekEligibleForConsolidation (at least min(threshold, days with
+ * logs) files, ended more than two days ago). The in-progress week is
+ * never returned.
  *
  * CRITICAL: Uses getISOWeekYear() (not getFullYear()) so that dates like
  * Dec 29-31 are correctly attributed to the next year's week 1.
@@ -231,8 +238,8 @@ export function detectUnconsolidatedWeeks(
     const weekStart = startOfISOWeek(sampleDate);
     const weekEnd = endOfISOWeek(sampleDate);
 
-    // Past week with fewer than `threshold` logs: eligible once it is two
-    // days behind us (see isWeekEligibleForConsolidation).
+    // Eligible once the week is more than two days behind us, even with
+    // fewer than `threshold` logs (see isWeekEligibleForConsolidation).
     if (
       !isWeekEligibleForConsolidation({
         daysWithLogs: group.files.length,
@@ -783,7 +790,7 @@ export async function runConsolidation(
 
       if (isErrorSummary(llmContent)) {
         errors.push(
-          `Monthly consolidation skipped for ${monthKey}: summarize returned no usable content — ${describeUnusableSummary(llmContent)}`,
+          `Monthly consolidation skipped for ${monthGroup.year}-${String(monthGroup.month).padStart(2, "0")}: summarize returned no usable content — ${describeUnusableSummary(llmContent)}`,
         );
         continue;
       }

@@ -222,9 +222,13 @@ export function renderDreamReflectionSection(params: {
   const iso = params.timestamp.toISOString();
   const date = iso.slice(0, 10);
   const hhmm = iso.slice(11, 16);
+  // The scanner chunks by H2, so a markdown heading inside the model's
+  // narrative would split it into a chunk without the dated heading. Strip
+  // heading markers from the body; the text itself is kept.
+  const body = params.reflection.trim().replace(/^#{1,6}[ \t]+/gm, "");
   return (
     `## Dream reflection ${date} ${hhmm} UTC (${params.agentName}, model=${params.model})\n\n` +
-    `${params.reflection.trim()}\n`
+    `${body}\n`
   );
 }
 

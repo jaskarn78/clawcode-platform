@@ -13,6 +13,11 @@
  * agent name. Same `dirOverride` seam as dream-run-log.ts so tests never
  * touch the real manager dir. Writes are atomic (tmp + rename). Reads
  * tolerate a missing or malformed file (treated as "never dreamt").
+ *
+ * Every agent's cron fires on the same minute, so two agents can finish a
+ * pass at the same moment. The file is shared, so writes are serialized
+ * inside the process (one read-modify-write at a time) and a write never
+ * moves an agent's record backwards in time.
  */
 
 import { promises as fs } from "node:fs";
@@ -69,11 +74,13 @@ export async function readLastDreamPass(
 }
 
 /**
- * Record the agent's last applied dream pass. Never throws: a failed write
- * only means the next daemon boot starts from "never dreamt", which the
- * novelty gate treats as "run once".
+ * In-process write queue. All dream machinery instances (the per-agent cron
+ * wiring and each manual IPC call) share this module, so chaining every
+ * write here removes the lost-update race on the shared file.
  */
-export async function writeLastDreamPass(
+let writeQueue: Promise<void> = Promise.resolve();
+
+async function writeUnlocked(
   agent: string,
   lastPassAt: string,
   dirOverride?: string,
@@ -82,6 +89,14 @@ export async function writeLastDreamPass(
     const { dir, file } = resolvePath(dirOverride);
     await fs.mkdir(dir, { recursive: true });
     const current = await readFileTolerant(file);
+    // Never move a record backwards: an overlapping manual pass that
+    // started earlier but finished later must not shadow the newer one.
+    const prior = current.agents[agent]?.lastPassAt;
+    const priorMs = prior !== undefined ? Date.parse(prior) : Number.NaN;
+    const nextMs = Date.parse(lastPassAt);
+    if (!Number.isNaN(priorMs) && !Number.isNaN(nextMs) && priorMs >= nextMs) {
+      return;
+    }
     const next: LastPassFile = {
       version: 1,
       agents: { ...current.agents, [agent]: { lastPassAt } },
@@ -97,4 +112,19 @@ export async function writeLastDreamPass(
   } catch {
     // Deliberate swallow: bookkeeping must never break a dream pass.
   }
+}
+
+/**
+ * Record the agent's last applied dream pass. Never throws: a failed write
+ * only means the next daemon boot starts from "never dreamt", which the
+ * novelty gate treats as "run once".
+ */
+export function writeLastDreamPass(
+  agent: string,
+  lastPassAt: string,
+  dirOverride?: string,
+): Promise<void> {
+  const run = writeQueue.then(() => writeUnlocked(agent, lastPassAt, dirOverride));
+  writeQueue = run.catch(() => {});
+  return run;
 }

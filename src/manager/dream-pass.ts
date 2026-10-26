@@ -338,8 +338,11 @@ export async function runDreamPass(
     }
 
     const durationMs = currentTime(deps).getTime() - startedAt.getTime();
+    // Real model when the dispatcher reports one (it may have fallen back);
+    // otherwise the model that was requested.
+    const model = dispatchResp.model ?? deps.resolvedDreamConfig.model;
     deps.log.info(
-      `dream-pass: ${agentName} completed in ${durationMs}ms (in=${dispatchResp.tokensIn} out=${dispatchResp.tokensOut})`,
+      `dream-pass: ${agentName} completed in ${durationMs}ms (model=${model} in=${dispatchResp.tokensIn} out=${dispatchResp.tokensOut})`,
     );
     return {
       kind: "completed",
@@ -347,9 +350,7 @@ export async function runDreamPass(
       durationMs,
       tokensIn: dispatchResp.tokensIn,
       tokensOut: dispatchResp.tokensOut,
-      // Real model when the dispatcher reports one (it may have fallen
-      // back); otherwise the model that was requested.
-      model: dispatchResp.model ?? deps.resolvedDreamConfig.model,
+      model,
     };
   } catch (err) {
     // TOOL-04 verbatim pass-through (Phase 85): keep the err.message

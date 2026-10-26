@@ -252,7 +252,7 @@ describe("writeDreamLog — D-05 atomic markdown emission", () => {
   });
 });
 
-describe("appendDreamReflectionDigest — reflections as standing memory (WP7)", () => {
+describe("appendDreamReflectionDigest: reflections as standing memory (WP7)", () => {
   it("creates <memoryDir>/digests/dream-<date>.md with a self-describing H2 section", async () => {
     const memoryDir = join(await makeTmp(), "memory");
     const out = await appendDreamReflectionDigest({
@@ -307,6 +307,17 @@ describe("appendDreamReflectionDigest — reflections as standing memory (WP7)",
     await expect(readFile(`${memoryDir}/digests/dream-2026-04-25.md`, "utf8")).rejects.toMatchObject({
       code: "ENOENT",
     });
+  });
+
+  it("renderDreamReflectionSection strips markdown headings from the body so the section stays one chunk", () => {
+    const md = renderDreamReflectionSection({
+      agentName: "atlas",
+      timestamp: new Date("2026-01-05T03:07:42.000Z"),
+      model: "haiku",
+      reflection: "## Themes\nDeploy work.\n### Detail\nMore. A #hashtag stays.",
+    });
+    expect(md.match(/^#{1,6} /gm)).toEqual(["## "]);
+    expect(md).toContain("Themes\nDeploy work.\nDetail\nMore. A #hashtag stays.");
   });
 
   it("renderDreamReflectionSection puts date, time, agent and model in the heading", () => {

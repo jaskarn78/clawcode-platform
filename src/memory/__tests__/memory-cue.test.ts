@@ -77,7 +77,7 @@ describe("MEMORY_CUE_REGEX + detectCue (Phase 90 MEM-05)", () => {
   });
 });
 
-describe("detectCue — recall questions and the channel envelope (WP7)", () => {
+describe("detectCue: recall questions and the channel envelope (WP7)", () => {
   const envelope = (body: string) =>
     `<channel source="discord" chat_id="123" message_id="456" user="jas" ts="2026-10-25 09:00">\n${body}\n</channel>`;
 

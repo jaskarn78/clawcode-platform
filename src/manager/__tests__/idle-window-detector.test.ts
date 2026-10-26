@@ -93,7 +93,7 @@ describe("isAgentIdle — D-01 silence detector primitive", () => {
   });
 });
 
-describe("isAgentIdle — elapsedMinutes (real idle minutes for the dream log)", () => {
+describe("isAgentIdle: elapsedMinutes (real idle minutes for the dream log)", () => {
   it("reports whole minutes since lastTurnAt on every reason except no-prior-turn", () => {
     const thirtyFive = new Date(FIXED_NOW.getTime() - 35 * 60 * 1000 - 20 * 1000);
     expect(isAgentIdle({ lastTurnAt: thirtyFive, idleMinutes: 30, now })).toMatchObject({

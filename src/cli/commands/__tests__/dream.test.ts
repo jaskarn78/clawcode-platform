@@ -114,6 +114,20 @@ describe("clawcode dream — Phase 95 Plan 03 (CLI1-CLI7)", () => {
     expect(stdoutAll).toContain('"kind": "completed"');
   });
 
+  it("CLI1b: the completion log line names the model the daemon reports (WP7)", async () => {
+    const response = completedResponse();
+    const sendIpc = vi.fn<SendIpcFn>(async () => ({
+      ...response,
+      outcome: { ...response.outcome, model: "sonnet" },
+    }));
+    const info = vi.fn();
+    const log = { info } as unknown as NonNullable<RunDreamActionArgs["log"]>;
+    const code = await runDreamAction({ agent: "fin-client", model: "sonnet", sendIpc, log });
+    expect(code).toBe(0);
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(info.mock.calls[0]![0]).toMatchObject({ agent: "fin-client", model: "sonnet" });
+  });
+
   it("CLI2: --idle-bypass → idleBypass:true in IPC params", async () => {
     const sendIpc = vi.fn<SendIpcFn>(async () => completedResponse());
 

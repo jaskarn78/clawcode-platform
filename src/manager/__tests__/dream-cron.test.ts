@@ -105,6 +105,15 @@ function buildDeps(overrides: Partial<DreamCronDeps> = {}): DreamCronDeps {
     now: overrides.now ?? (() => FIXED_NOW),
     log: overrides.log ?? noopLog,
     cronFactory: overrides.cronFactory ?? stub.factory,
+    // Optional deps pass through only when a test supplies them, so the
+    // legacy cases keep exercising the gate-less, priority-less shape.
+    ...(overrides.noveltyGate ? { noveltyGate: overrides.noveltyGate } : {}),
+    ...(overrides.applyDreamResultPriority
+      ? { applyDreamResultPriority: overrides.applyDreamResultPriority }
+      : {}),
+    ...(overrides.truncationEventCounter
+      ? { truncationEventCounter: overrides.truncationEventCounter }
+      : {}),
   };
 }
 
@@ -255,7 +264,7 @@ describe("registerDreamCron — D-06 per-agent cron timer", () => {
   });
 });
 
-describe("registerDreamCron — novelty gate and real idle minutes (WP7)", () => {
+describe("registerDreamCron: novelty gate and real idle minutes (WP7)", () => {
   const completedOutcome: DreamPassOutcome = {
     kind: "completed",
     result: {

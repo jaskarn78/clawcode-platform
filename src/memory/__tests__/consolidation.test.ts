@@ -320,6 +320,10 @@ describe("Consolidation Pipeline", () => {
       expect(truncateHeadAndTail("short", 100)).toBe("short");
     });
 
+    it("keeps the head only when the budget cannot hold the marker", () => {
+      expect(truncateHeadAndTail("abcdefghij".repeat(10), 8)).toBe("abcdefgh");
+    });
+
     it("keeps both ends inside the budget", () => {
       const content = "HEAD" + "m".repeat(1000) + "TAIL";
       const out = truncateHeadAndTail(content, 200);
