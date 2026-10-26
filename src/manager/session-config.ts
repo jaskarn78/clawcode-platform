@@ -334,11 +334,12 @@ export type SessionConfigDeps = {
   };
   /**
    * WP6 (2026-10-25): fleet-wide `defaults.systemPromptDirectives` from
-   * clawcode.yaml. Threaded the same way as `advisorDefaults`. When absent
-   * (tests, bootstrap paths, SessionManager not yet wired), the schema's
-   * DEFAULT_SYSTEM_PROMPT_DIRECTIVES apply, which is what the zod default
-   * puts in `defaults.systemPromptDirectives` anyway. The per-agent override
-   * is read off `config.systemPromptDirectives` when the loader carries it.
+   * clawcode.yaml, meant to be threaded like `advisorDefaults`
+   * (SessionManager.configDeps() does not pass it yet). When absent, the
+   * schema's DEFAULT_SYSTEM_PROMPT_DIRECTIVES apply, which is also what the
+   * zod default puts in `defaults.systemPromptDirectives` when the YAML
+   * leaves it out. The per-agent override is read off
+   * `config.systemPromptDirectives` (see buildSessionConfig).
    */
   readonly systemPromptDirectiveDefaults?: Readonly<Record<string, SystemPromptDirective>>;
   /**
@@ -632,12 +633,16 @@ export async function buildSessionConfig(
   // Phase 115 Plan 03 sub-scope 1 — agent-name line + capability manifest
   // are composed into a single sub-source field so the assembler treats
   // them as one budget-able unit (mid-low importance — bullet-truncated).
-  // WP6 (2026-10-25): the line used to point at `memory_lookup` while the
-  // capability manifest teaches `clawcode_memory_search`; one prompt, two
-  // tool vocabularies. It now names the same tools the manifest does.
+  // WP6 (2026-10-25): the line used to say "When using memory_lookup, pass
+  // '<name>' as the agent parameter" while the capability manifest's memory
+  // protocol teaches `clawcode_memory_search`: one prompt, two tool
+  // vocabularies. It now names the explicit recall tools the manifest uses,
+  // and it is the only recall pointer for minimal agents whose manifest is
+  // empty. Both tools take an `agent` parameter.
   let identityCapabilityManifest =
     `Your name is ${config.name}. Pass '${config.name}' as the agent parameter to tools that ask for it. ` +
-    `For anything older than what is shown here, call clawcode_memory_search (your saved memory and notes) and search_documents (uploaded files).\n`;
+    "For anything older or more specific than what is shown here, search before assuming you remember or don't: " +
+    "`clawcode_memory_search` covers your saved memories and notes, `search_documents` covers files that were ingested.\n";
 
   // Phase 100 follow-up — capability manifest (after identity, before
   // MEMORY.md auto-load and MCP block). Sits in the cached stable prefix
@@ -1244,15 +1249,17 @@ export async function buildSessionConfig(
         })
       : undefined;
 
-  // WP6 (2026-10-25) — system-prompt directives. Phase 94 shipped the
+  // WP6 (2026-10-25): system-prompt directives. Phase 94 shipped the
   // resolver + renderer + the assembler field and documented the directives
   // as RELOADABLE, but no runtime caller ever rendered them: no-em-dashes,
   // mutate-verify, parallel-tool-calls and the rest were silently absent
-  // from every agent's prompt. Per-key merge of the agent override (read
-  // structurally, like `advisor`, because ResolvedAgentConfig does not
-  // declare the field yet) over the fleet defaults; "" when every directive
-  // is disabled so the stable prefix is byte-identical to the no-directives
-  // baseline (REG-ASSEMBLER-EMPTY-WHEN-DISABLED).
+  // from every agent's prompt. Per-key merge of the agent override over the
+  // fleet defaults; "" when every directive is disabled so the stable prefix
+  // is byte-identical to the no-directives baseline
+  // (REG-ASSEMBLER-EMPTY-WHEN-DISABLED). The override is read structurally:
+  // ResolvedAgentConfig does not declare `systemPromptDirectives` and
+  // resolveAgentConfig (config/loader.ts) does not copy it from the agent
+  // block yet, so in production it is undefined until the loader carries it.
   const agentDirectiveOverrides = (
     config as unknown as {
       systemPromptDirectives?: Record<string, { enabled?: boolean; text?: string }>;

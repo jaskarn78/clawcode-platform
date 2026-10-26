@@ -66,6 +66,13 @@ export type ContextSources = {
    *
    * Optional for back-compat: existing callers without this field see no
    * behavior change.
+   *
+   * Memory overhaul WP6 (2026-10-25): session-config.ts now actually sets
+   * this field (before WP6 nothing did). The block is operator-sized fixed
+   * text (about 3,000 tokens with the shipped defaults), so it is exempt
+   * from STABLE_PREFIX_MAX_TOKENS: the outer cap is raised by the block's
+   * own token count and the identity room computation ignores it. Turning
+   * the directives on therefore never squeezes MEMORY.md / USER.md.
    */
   readonly systemPromptDirectives?: string;
   /**
@@ -357,19 +364,27 @@ export const INJECTED_USER_MAX_CHARS = 4_000;
  *
  * P1 *delivery* targets are softer (10K fleet p95, 12K fin-client) — those
  * are observed-load goals; the 8K cap is the structural enforcement floor.
+ *
+ * WP6 (2026-10-25): the system-prompt directive block is NOT counted against
+ * this cap. The assembler raises the cap by the directive block's own token
+ * count, so this constant keeps bounding exactly what it bounded before the
+ * directives were wired (identity, tools, hot tier, steers).
  */
 export const STABLE_PREFIX_MAX_TOKENS = 8_000;
 
 /**
- * Memory overhaul WP6 (2026-10-25). The identity section's budget yields to
- * the fixed, identity-independent parts of the stable prefix (system-prompt
- * directives, tools, hot tier, Discord steers) so the per-section budgets
- * can no longer sum past STABLE_PREFIX_MAX_TOKENS. The directives alone are
- * about 3,000 tokens; before this the 8K emergency head-tail cut MEMORY.md,
- * USER.md and the tool table out of the middle of the prompt with a generic
- * marker. The identity budget never drops below this floor (SOUL fingerprint,
- * IDENTITY.md head and the agent-name line still fit); if the fixed parts
- * alone leave less than this, the emergency fallback remains the last resort.
+ * Memory overhaul WP6 (2026-10-25). The carved identity section's budget
+ * yields to the other fixed parts of the stable prefix (tools, hot tier,
+ * filesystem block, delegates, Discord steers) so the per-section budgets can
+ * no longer sum past STABLE_PREFIX_MAX_TOKENS. Before this, a fully populated
+ * agent could trip the 8K emergency head-tail cut, which drops a slice out of
+ * the middle of the joined prompt (MEMORY.md, USER.md, the tool table) behind
+ * a generic marker. The directive block is exempt (see ContextSources
+ * .systemPromptDirectives), so for typical agents the room left is above the
+ * configured identity budget and nothing changes. The identity budget never
+ * drops below this floor (SOUL fingerprint, IDENTITY.md head and the
+ * agent-name line still fit); if the fixed parts alone leave less than this,
+ * the emergency fallback remains the last resort.
  */
 export const IDENTITY_BUDGET_FLOOR_TOKENS = 800;
 
@@ -1475,11 +1490,16 @@ function assembleContextInternal(
   //
   // Each of these is placed below exactly as before; rendering them here
   // lets the carved identity budget be sized against the room they leave
-  // under STABLE_PREFIX_MAX_TOKENS (see IDENTITY_BUDGET_FLOOR_TOKENS).
+  // under STABLE_PREFIX_MAX_TOKENS (see IDENTITY_BUDGET_FLOOR_TOKENS). The
+  // directive block is rendered here too but is exempt from the cap.
   const directivesBlock =
     sources.systemPromptDirectives && sources.systemPromptDirectives.length > 0
       ? sources.systemPromptDirectives
       : "";
+  // Counted with its "\n\n" join separator: this is exactly what the block
+  // adds to the joined stable prefix.
+  const directiveTokens = directivesBlock ? countTokens(directivesBlock + "\n\n") : 0;
+  const discordBlock = sources.discordBindings ?? "";
   const currentHotToken = computeHotStableToken(hotInput.rendered);
   const hotBlock = hotInput.rendered ? "## Key Memories\n\n" + hotInput.rendered : "";
   const priorHotToken = opts?.priorHotStableToken;
@@ -1504,17 +1524,18 @@ function assembleContextInternal(
     : "";
 
   // 1. identity (Phase 115 sub-scope 1 / D-03), sized by WP6 against the cap.
+  //    The directive block is left out of the fixed overhead on purpose: it
+  //    is exempt from the cap (the cap is raised by directiveTokens below).
   let identityBudget = phaseBudgets.identity;
   if (useCarvedIdentity) {
     const fixedOverheadTokens = countTokens(
       [
-        directivesBlock,
         soulOut,
         hotInMutable ? "" : hotBlock,
         toolsBlock,
         fsBlock,
         delegatesBlock,
-        sources.discordBindings,
+        discordBlock,
         graphBlock,
         CACHE_BREAKPOINT_MARKER,
       ]
@@ -1825,10 +1846,15 @@ function assembleContextInternal(
   // own bordering whitespace). joining with "\n\n" between produces an
   // extra "\n\n" pair around the marker — by design, the marker sits in a
   // visually-clear paragraph break.
+  //
+  // WP6 (2026-10-25): the cap is raised by the directive block's own token
+  // count so the operator directives (wired for the first time by WP6) do
+  // not push every agent over the cap. If the fallback still fires, the
+  // directives sit at the head of the prefix and land in the kept 70% head.
   const joinedStable = stableParts.join("\n\n");
   const stablePrefix = enforceTotalStablePrefixBudget(
     joinedStable,
-    STABLE_PREFIX_MAX_TOKENS,
+    STABLE_PREFIX_MAX_TOKENS + directiveTokens,
     opts?.log,
     opts?.agentName,
   );
@@ -1873,7 +1899,8 @@ function assembleContextInternal(
  * Phase 53 Plan 02 — per-section budget enforcement:
  *   When `opts.memoryAssemblyBudgets` is supplied, over-budget sections fire
  *   `opts.onBudgetWarning(event)` and apply their section-specific strategy:
- *     identity/soul → warn-and-keep | hot_tier → drop-lowest-importance
+ *     identity/soul → drop-lowest-importance (Phase 115 D-03 replaced the
+ *     old warn-and-keep no-op) | hot_tier → drop-lowest-importance
  *     skills_header → truncate-bullets
  *   Per-section counts are measured regardless of budget state and can be
  *   surfaced via `assembleContextTraced` on the `context_assemble` span.

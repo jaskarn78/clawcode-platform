@@ -1,7 +1,7 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
 exports[`Phase 999.13 — back-compat byte-stability > back-compat-byte-identical: agent without delegates and without timezone produces stable systemPrompt > back-compat-byte-identical-systemPrompt 1`] = `
-"Your name is back-compat-fixture-agent. When using memory_lookup, pass 'back-compat-fixture-agent' as the agent parameter.
+"Your name is back-compat-fixture-agent. Pass 'back-compat-fixture-agent' as the agent parameter to tools that ask for it. For anything older or more specific than what is shown here, search before assuming you remember or don't: \`clawcode_memory_search\` covers your saved memories and notes, \`search_documents\` covers files that were ingested.
 
 
 ## Available Tools

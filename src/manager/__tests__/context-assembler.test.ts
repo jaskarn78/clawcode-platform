@@ -582,10 +582,12 @@ describe("computeHotStableToken / computePrefixHash (Phase 52)", () => {
 
 import {
   DEFAULT_PHASE53_BUDGETS,
+  renderHotMemoryLine,
   type MemoryAssemblyBudgets,
   type BudgetWarningEvent,
 } from "../context-assembler.js";
 import type { MemoryEntry } from "../../memory/types.js";
+import { countTokens } from "../../performance/token-count.js";
 
 function makeMemoryEntry(
   overrides: Partial<MemoryEntry> & Pick<MemoryEntry, "content" | "importance">,
@@ -659,10 +661,12 @@ describe("assembleContext budget enforcement (Phase 53)", () => {
   });
 
   it("Test 3: hot_tier over budget drops LOWEST-importance rows", () => {
-    // Each `- alpha aaaaaa aaaaaa aaaaaa aaaaaa` bullet is ~14 tokens.
-    // Budget 32 fits two bullets (14 + 14 = 28 <= 32) but blocks the third
-    // (28 + 14 = 42 > 32), which triggers drop-lowest-importance keeping
-    // the two highest-importance entries.
+    // Budget fits exactly the two highest-importance bullets and blocks the
+    // third, which triggers drop-lowest-importance keeping alpha and beta.
+    // WP6 (2026-10-25): bullets now carry their created date
+    // ("- <content> (saved YYYY-MM-DD)"), so the budget is derived from the
+    // rendered lines instead of the old hard-coded 32 (which fit two
+    // undated bullets of ~14 tokens each).
     const entries: readonly MemoryEntry[] = [
       makeMemoryEntry({ content: "alpha aaaaaa aaaaaa aaaaaa aaaaaa", importance: 0.9 }),
       makeMemoryEntry({ content: "beta bbbbbb bbbbbb bbbbbb bbbbbb", importance: 0.8 }),
@@ -670,14 +674,17 @@ describe("assembleContext budget enforcement (Phase 53)", () => {
       makeMemoryEntry({ content: "delta dddddd dddddd dddddd dddddd", importance: 0.6 }),
       makeMemoryEntry({ content: "epsilon eeeeee eeeeee eeeeee eeeeee", importance: 0.5 }),
     ];
-    const hotRendered = entries.map((m) => `- ${m.content}`).join("\n");
+    const hotRendered = entries.map((m) => renderHotMemoryLine(m)).join("\n");
     const warnings: BudgetWarningEvent[] = [];
+    const twoBulletBudget =
+      countTokens(renderHotMemoryLine(entries[0]!)) +
+      countTokens(renderHotMemoryLine(entries[1]!));
 
     const result = assembleContext(
       makeSources({ identity: "id", hotMemories: hotRendered, hotMemoriesEntries: entries }),
       DEFAULT_BUDGETS,
       {
-        memoryAssemblyBudgets: { hot_tier: 32 },
+        memoryAssemblyBudgets: { hot_tier: twoBulletBudget },
         onBudgetWarning: (e) => warnings.push(e),
       },
     ) as unknown as { stablePrefix: string; mutableSuffix: string };

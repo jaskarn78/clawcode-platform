@@ -55,6 +55,14 @@ function makeConfig(
     threads: { idleTimeoutMinutes: 30, maxThreadSessions: 10 },
     reactions: false,
     slashCommands: [],
+    // buildSessionConfig reads `sandbox.enabled` (buildSandboxPlan) and
+    // `mcpServers.length` (capability manifest) unconditionally and resolves
+    // the resume summary under `memoryPath`; this fixture predates all three
+    // and every test here threw a TypeError on a clean checkout. Added by
+    // WP6 (2026-10-25).
+    memoryPath: workspace,
+    sandbox: { enabled: false, allowRuntimeOp: false },
+    mcpServers: [],
     ...overrides,
   } as ResolvedAgentConfig;
 }

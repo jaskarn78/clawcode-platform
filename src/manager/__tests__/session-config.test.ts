@@ -13,6 +13,7 @@ import * as briefModule from "../../memory/conversation-brief.js";
 // Phase 75 SHARED-02 — named import so the file-scoped loadLatestSummary mock
 // can be accessed via vi.mocked(loadLatestSummary) in the regression test below.
 import { loadLatestSummary } from "../../memory/context-summary.js";
+import { resolveModelId, resolveAdvisorModel } from "../model-resolver.js";
 // Phase 78 CONF-01 — named import so the file-scoped readFile mock can be
 // reconfigured per-test via vi.mocked(readFile).mockImplementation to simulate
 // soulFile → workspace/SOUL.md → inline precedence scenarios.
@@ -148,16 +149,23 @@ describe("buildSessionConfig — subagent thread skill guidance", () => {
     expect(result.systemPrompt).toContain("over the raw Agent tool");
   });
 
+  // WP6 (2026-10-25): the fleet-default `subagent-routing` system-prompt
+  // directive now reaches every agent's prompt and names the
+  // spawn_subagent_thread tool, so these negative checks pin the absence of
+  // the skill-guidance block itself (its own sentences), not of the bare
+  // tool name.
   it("does NOT include subagent thread guidance when skill not assigned", async () => {
     const config = makeConfig({ skills: [] });
     const result = await buildSessionConfig(config, makeDeps());
-    expect(result.systemPrompt).not.toContain("spawn_subagent_thread");
+    expect(result.systemPrompt).not.toContain("You have the **subagent-thread** skill");
+    expect(result.systemPrompt).not.toContain("prefer the `spawn_subagent_thread` MCP tool");
   });
 
   it("does NOT include guidance when agent has other skills but not subagent-thread", async () => {
     const config = makeConfig({ skills: ["some-other-skill"] });
     const result = await buildSessionConfig(config, makeDeps());
-    expect(result.systemPrompt).not.toContain("spawn_subagent_thread");
+    expect(result.systemPrompt).not.toContain("You have the **subagent-thread** skill");
+    expect(result.systemPrompt).not.toContain("prefer the `spawn_subagent_thread` MCP tool");
   });
 
   it("mentions spawn_subagent_thread MCP tool in guidance", async () => {
@@ -339,13 +347,19 @@ The full context of its creation spans multiple paragraphs of detail.
     expect(result.systemPrompt).not.toContain("Memory five");
   });
 
-  it("includes memory_lookup instruction with agent name", async () => {
+  it("includes the recall instruction with agent name (WP6: clawcode_memory_search + search_documents)", async () => {
+    // WP6 (2026-10-25): the line used to say "When using memory_lookup, pass
+    // 'my-agent' as the agent parameter" while the capability manifest
+    // teaches clawcode_memory_search. It now names the manifest's tools.
     const config = makeConfig({ name: "my-agent" });
     const result = await buildSessionConfig(config, makeDeps());
     expect(result.systemPrompt).toContain("Your name is my-agent");
     expect(result.systemPrompt).toContain(
-      "When using memory_lookup, pass 'my-agent' as the agent parameter"
+      "Pass 'my-agent' as the agent parameter to tools that ask for it",
     );
+    expect(result.systemPrompt).toContain("`clawcode_memory_search`");
+    expect(result.systemPrompt).toContain("`search_documents`");
+    expect(result.systemPrompt).not.toContain("When using memory_lookup");
   });
 
   it("applies custom contextBudgets from config to truncate sources (non-identity)", async () => {
@@ -368,6 +382,10 @@ The full context of its creation spans multiple paragraphs of detail.
         makeConfig({ name: "other-agent" }),
         { ...makeConfig({ name: "test-agent" }), identity: "X" } as any,
       ],
+      // WP6: the ~12K-char fleet directive block (wired by WP6) is fixed
+      // operator text outside every per-section budget; turn it off so this
+      // size check still measures only the budgeted sources.
+      systemPromptDirectiveDefaults: {},
     }));
     // Total prompt still small (budget enforcement on tool/admin path)
     expect(result.systemPrompt.length).toBeLessThan(longToolDefs.length + 500);
@@ -396,7 +414,12 @@ The full context of its creation spans multiple paragraphs of detail.
       ["content-engine", { name: "content-engine", version: "1.0", description: "Content creation", path: "/tmp/skills/content-engine" }],
     ]);
 
-    const result = await buildSessionConfig(config, makeDeps({ tierManagers, skillsCatalog }));
+    const result = await buildSessionConfig(
+      config,
+      // WP6: directives off so the pin keeps measuring the v1.4-comparable
+      // sources (the directive block is pinned by its own tests).
+      makeDeps({ tierManagers, skillsCatalog, systemPromptDirectiveDefaults: {} }),
+    );
     // v1.4 equivalent for this config was approximately 1200 chars
     // v1.5 should be equal or smaller due to budget enforcement
     // Phase 100-fu (2026-04-26): comprehensive capability manifest
@@ -417,7 +440,15 @@ The full context of its creation spans multiple paragraphs of detail.
     // intended-growth event as the #3a move above. The steer is paid ONCE
     // (cached stable prefix), not per-turn; it forces agents onto the
     // delivered schedule_recurring primitive (Plan 01).
-    expect(result.systemPrompt.length).toBeLessThanOrEqual(5200);
+    // WP6 (2026-10-25): INTENDED pin flip. The pin was already stale on
+    // bc95fb2 (this config measured 5449 chars: the 2026-08-27 markdown-table
+    // steer and capability-manifest growth landed without moving it). WP6
+    // adds the dated hot-memory bullets (" (saved YYYY-MM-DD)", 19 chars
+    // each) and a longer recall line naming clawcode_memory_search /
+    // search_documents: the config now measures 5727 chars (directives off;
+    // they are fixed operator text outside this comparison). Ceiling raised
+    // 5200 to 5800.
+    expect(result.systemPrompt.length).toBeLessThanOrEqual(5800);
   });
 
   it("bootstrap agents still get bootstrap prompt without fingerprint", async () => {
@@ -605,7 +636,11 @@ describe("resume summary budget (Phase 53)", () => {
 
     const identityWarn = warnings.find((w) => (w as any).section === "identity");
     expect(identityWarn).toBeDefined();
-    expect((identityWarn as any).strategy).toBe("warn-and-keep");
+    // Phase 115 D-03 replaced the Phase 53 warn-and-keep no-op with real
+    // truncation (enforceDropLowestImportance); this pin was left at the
+    // old strategy name. Updated by WP6 (2026-10-25).
+    expect((identityWarn as any).strategy).toBe("drop-lowest-importance");
+    expect((identityWarn as any).budgetTokens).toBe(10);
   });
 
   it("Test 11: onBudgetWarning logger callback receives full event payload", async () => {
@@ -949,6 +984,13 @@ describe("buildSessionConfig — Phase 73 brief cache wiring", () => {
         "UPDATE conversation_sessions SET id = ?, started_at = ?, ended_at = ?, status = 'ended' WHERE id = ?",
       )
       .run(id, startedAt, endedAt, session.id);
+    // listRecentTerminatedSessions only returns sessions that still carry at
+    // least one turn row (EXISTS clause, conversation-store.ts). Without a
+    // turn the fingerprint was sha256 of an empty id list and the two
+    // fingerprint tests below failed on a clean checkout. Seeding one turn
+    // keeps them valid both for the current query and for a query that
+    // also counts summarized-and-pruned sessions.
+    convStore.recordTurn({ sessionId: id, role: "user", content: "seed turn" });
   }
 
   it("cache MISS → calls assembleConversationBrief and populates the cache", async () => {
@@ -1350,10 +1392,13 @@ describe("buildSessionConfig — MEM-01 MEMORY.md auto-inject (Phase 90)", () =>
     expect(idxMemoryBody).toBeLessThan(idxMcp);
   });
 
-  it("MEM-01-C2: 50KB cap — 60KB MEMORY.md truncates to 50KB + marker", async () => {
-    // Build a 60KB payload that starts with a distinctive prefix, so we can
-    // assert the prefix survives and the tail gets truncated.
-    const big = "A".repeat(60 * 1024);
+  it("MEM-01-C2: 16K char cap (Phase 115 D-01), 60KB MEMORY.md is head-tail truncated with the dream-pass marker", async () => {
+    // Phase 115 D-01 replaced the 50KB byte cap with INJECTED_MEMORY_MAX_CHARS
+    // (16,000 chars, 70% head + 20% tail around an agent-actionable marker).
+    // This test still pinned the 50KB marker and slice length; updated by
+    // WP6 (2026-10-25), which also keeps the marker alive through the
+    // identity-budget pass (headTailTruncateKeepingMarker).
+    const big = "H".repeat(30 * 1024) + "T".repeat(30 * 1024);
     mockFiles({ "/tmp/ws/MEMORY.md": big });
     const config = makeConfig({
       workspace: "/tmp/ws",
@@ -1368,18 +1413,22 @@ describe("buildSessionConfig — MEM-01 MEMORY.md auto-inject (Phase 90)", () =>
     autoStart: true, // Phase 100 follow-up
     });
     const result = await buildSessionConfig(config, makeDeps());
-    expect(result.systemPrompt).toContain("## Long-term memory");
-    expect(result.systemPrompt).toContain("…(truncated at 50KB cap)");
-    // The truncated body contains exactly 50KB of 'A' characters — count by
-    // searching the body within the prompt.
-    const startIdx = result.systemPrompt.indexOf("AAAA");
-    const endIdx = result.systemPrompt.indexOf("…(truncated at 50KB cap)");
-    expect(startIdx).toBeGreaterThan(0);
-    expect(endIdx).toBeGreaterThan(startIdx);
-    // ~50KB of A's (Buffer byteLength on ASCII = char count).
-    const aSlice = result.systemPrompt.slice(startIdx, endIdx).replace(/\n/g, "");
-    // Tolerance: exact 50KB slice length == 50 * 1024 = 51200 characters.
-    expect(aSlice.length).toBe(50 * 1024);
+    const prompt = result.systemPrompt;
+    expect(prompt).toContain("## Long-term memory");
+    expect(prompt).not.toContain("…(truncated at 50KB cap)");
+    // The agent-actionable read-site marker survives, between head and tail.
+    const markerMatch = /\[TRUNCATED \S+ (\d+) chars dropped, dream-pass priority requested\]/.exec(prompt);
+    expect(markerMatch).not.toBeNull();
+    const headIdx = prompt.indexOf("HHHH");
+    const tailIdx = prompt.indexOf("TTTT");
+    expect(headIdx).toBeGreaterThan(0);
+    expect(headIdx).toBeLessThan(markerMatch!.index);
+    expect(tailIdx).toBeGreaterThan(markerMatch!.index);
+    // At most the 16K cap's 90% (head 70% + tail 20%) of the body survives,
+    // and the marker accounts for everything else.
+    const kept = (prompt.match(/H{10,}|T{10,}/g) ?? []).reduce((n, run) => n + run.length, 0);
+    expect(kept).toBeLessThanOrEqual(Math.floor(16_000 * 0.9));
+    expect(Number(markerMatch![1]) + kept).toBe(60 * 1024);
   });
 
   it("MEM-01-C3: opt-out via memoryAutoLoad=false — MEMORY.md never read, heading absent", async () => {
@@ -1569,7 +1618,14 @@ describe("Phase 999.13 — back-compat byte-stability", () => {
       // resolver field on AgentConfig but absence must remain back-compat).
     });
 
-    const result = await buildSessionConfig(config, makeDeps());
+    // WP6 (2026-10-25): directives off. The fleet directive block is fixed
+    // operator text owned by config/schema.ts and is pinned by its own tests;
+    // keeping it out of this snapshot stops every directive wording edit from
+    // breaking the delegates / timezone back-compat pin.
+    const result = await buildSessionConfig(
+      config,
+      makeDeps({ systemPromptDirectiveDefaults: {} }),
+    );
     // Snapshot the systemPrompt verbatim. On main: snapshot is created.
     // After Plans 01+02 deploy: same fixture must still match — any drift
     // to the no-delegates / no-timezone baseline fails loud.
@@ -1635,10 +1691,18 @@ describe("Phase 115 Plan 04 — cacheBreakpointPlacement config wiring", () => {
 
 describe("buildSessionConfig — native advisor pairing guard (2026-08-28)", () => {
   const advisorBudget = { canCall: () => true } as never;
+  // The literal ids these tests pinned (claude-fable-5 / claude-opus-5) went
+  // stale when the alias map moved to newer model versions. Expected ids now
+  // come from the same resolver session-config uses (updated by WP6,
+  // 2026-10-25, to make the suite green; behavior under test is unchanged).
+  const FABLE_ID = resolveModelId("fable");
+  const FABLE_ADVISOR_ID = resolveAdvisorModel("fable");
+  const OPUS_ADVISOR_ID = resolveAdvisorModel("opus");
   it("fable executor + fable advisor → advisorModel is the concrete fable id", async () => {
     const config = makeConfig({ name: "fin-client", model: "fable", advisor: { backend: "native", model: "fable" } } as never);
     const result = await buildSessionConfig(config, makeDeps({ advisorDefaults: { backend: "native", model: "opus" }, advisorBudget } as never));
-    expect(result.advisorModel).toBe("claude-fable-5");
+    expect(result.advisorModel).toBe(FABLE_ADVISOR_ID);
+    expect(FABLE_ADVISOR_ID).toMatch(/^claude-fable-/);
   });
   it("fable executor + the fleet-default opus advisor → advisor OMITTED and the operator warned", async () => {
     const warn = vi.fn();
@@ -1649,7 +1713,7 @@ describe("buildSessionConfig — native advisor pairing guard (2026-08-28)", () 
     );
     expect(result.advisorModel).toBeUndefined();
     expect(warn).toHaveBeenCalledTimes(1);
-    expect(warn.mock.calls[0]?.[0]).toMatchObject({ agent: "fin-client", executor: "claude-fable-5", advisor: "claude-opus-5" });
+    expect(warn.mock.calls[0]?.[0]).toMatchObject({ agent: "fin-client", executor: FABLE_ID, advisor: OPUS_ADVISOR_ID });
     expect(String(warn.mock.calls[0]?.[1])).toContain("pairing");
   });
   it("sonnet executor + opus advisor (the common fleet pair) stays enabled; fork backend never sets it", async () => {
@@ -1657,7 +1721,8 @@ describe("buildSessionConfig — native advisor pairing guard (2026-08-28)", () 
       makeConfig({ model: "sonnet", advisor: { backend: "native" } } as never),
       makeDeps({ advisorDefaults: { backend: "native", model: "opus" }, advisorBudget } as never),
     );
-    expect(ok.advisorModel).toBe("claude-opus-5");
+    expect(ok.advisorModel).toBe(OPUS_ADVISOR_ID);
+    expect(OPUS_ADVISOR_ID).toMatch(/^claude-opus-/);
     const fork = await buildSessionConfig(
       makeConfig({ model: "fable", advisor: { backend: "fork", model: "fable" } } as never),
       makeDeps({ advisorDefaults: { backend: "fork", model: "opus" }, advisorBudget } as never),
